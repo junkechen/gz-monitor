@@ -1,0 +1,962 @@
+[
+  {
+    "subname": "彩涂5#排放口",
+    "ent_name": "山东冠洲鼎鑫板材科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 22.7325,
+    "level": "红色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:06:32",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "彩涂5#排放口",
+    "ent_name": "山东冠洲鼎鑫板材科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 40.7247,
+    "level": "红色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:07:32",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "彩涂5#排放口",
+    "ent_name": "山东冠洲鼎鑫板材科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 139.1131,
+    "level": "红色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:07:32",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "彩涂5#排放口",
+    "ent_name": "山东冠洲鼎鑫板材科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 15.6302,
+    "level": "黄色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:08:32",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "彩涂5#排放口",
+    "ent_name": "山东冠洲鼎鑫板材科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 41.23,
+    "level": "红色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:08:32",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 33.5559,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-27 18:33:31",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "DA001工艺废气排气筒",
+    "ent_name": "聊城东舜涂料科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 15.8557,
+    "level": "黄色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:35:31",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "DA001工艺废气排气筒",
+    "ent_name": "聊城东舜涂料科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 17.5236,
+    "level": "橙色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:35:31",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "DA001工艺废气排气筒",
+    "ent_name": "聊城东舜涂料科技有限公司",
+    "param": "非甲烷总烃",
+    "value": 15.5364,
+    "level": "黄色预警",
+    "threshold": 15.0,
+    "datetime": "2026-03-27 18:36:31",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "颗粒物",
+    "value": 4.939555555555556,
+    "level": "黄色预警",
+    "threshold": 4.7,
+    "datetime": "2026-03-28 10:11:41",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "颗粒物",
+    "value": 4.899636363636364,
+    "level": "黄色预警",
+    "threshold": 4.7,
+    "datetime": "2026-03-28 10:12:11",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 46.1504,
+    "level": "黄色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:12:11",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "颗粒物",
+    "value": 4.899636363636364,
+    "level": "黄色预警",
+    "threshold": 4.7,
+    "datetime": "2026-03-28 10:12:44",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 46.1504,
+    "level": "黄色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:12:44",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "颗粒物",
+    "value": 4.876363636363636,
+    "level": "黄色预警",
+    "threshold": 4.7,
+    "datetime": "2026-03-28 10:13:44",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 45.3254,
+    "level": "黄色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:13:44",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 88.9773,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:13:44",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "颗粒物",
+    "value": 4.855384615384615,
+    "level": "黄色预警",
+    "threshold": 4.7,
+    "datetime": "2026-03-28 10:14:44",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 51.5492,
+    "level": "橙色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:14:44",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 103.2495,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:14:44",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "颗粒物",
+    "value": 4.855384615384615,
+    "level": "黄色预警",
+    "threshold": 4.7,
+    "datetime": "2026-03-28 10:14:47",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 51.5492,
+    "level": "橙色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:14:47",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 103.2495,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:14:47",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 88.5573,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:15:19",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 210.7608,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:15:19",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 88.5573,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:15:44",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "DA001废气总排口",
+    "ent_name": "山东冠县冠锌金属材料科技有限公司",
+    "param": "氮氧化物",
+    "value": 210.7608,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:15:44",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.2287,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.6299,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 47.1492,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 55.5915,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 7.8454,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 47.2684,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 189.7823,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:52:00",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.1548,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.5052,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 46.9847,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 56.3537,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 8.2829,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 50.9033,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 208.0597,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:53:03",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.2624,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.6943,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 47.238,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 53.9773,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 8.2829,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 50.9033,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 208.0597,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:53:08",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.2624,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.6943,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 47.238,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 53.9773,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 9.0143,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 58.2974,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 249.5319,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:04",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.3596,
+    "level": "橙色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.8219,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 47.3884,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 53.6584,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 9.4176,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 61.8373,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 268.3543,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:40",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.3596,
+    "level": "橙色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.8219,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 47.3884,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 53.6584,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 9.4176,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 61.8373,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 268.3543,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:54:45",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 36.3596,
+    "level": "橙色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 42.8219,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 47.3884,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氮氧化物",
+    "value": 53.6584,
+    "level": "红色预警",
+    "threshold": 44.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 9.4176,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 61.8373,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 268.3543,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:55:04",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 40.1237,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:59:41",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 49.0721,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:59:41",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 55.6385,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:59:41",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 11.5636,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:59:41",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 84.6124,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:59:41",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 405.3172,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:59:41",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 40.1237,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:59:55",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 49.0721,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:59:55",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 55.6385,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 10:59:55",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 11.5636,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:59:55",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 84.6124,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:59:55",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 405.3172,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 10:59:55",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 33.8767,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 11:27:27",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 34.0429,
+    "level": "黄色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 11:56:46",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 38.1558,
+    "level": "橙色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 11:56:46",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "1-2号机组",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "二氧化硫",
+    "value": 40.9217,
+    "level": "红色预警",
+    "threshold": 33.0,
+    "datetime": "2026-03-28 11:56:46",
+    "type": "prediction_+3小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 7.91,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 14:27:17",
+    "type": "prediction_当前小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 7.91,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 14:27:17",
+    "type": "prediction_+1小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 7.91,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 14:27:17",
+    "type": "prediction_+2小时"
+  },
+  {
+    "subname": "恒润热电排污口",
+    "ent_name": "冠县恒润热电有限公司",
+    "param": "氨氮",
+    "value": 7.91,
+    "level": "红色预警",
+    "threshold": 5.0,
+    "datetime": "2026-03-28 14:27:17",
+    "type": "prediction_+3小时"
+  }
+]
