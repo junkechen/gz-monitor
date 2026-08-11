@@ -1,6 +1,17 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.19（2026-08-11）✅ 当前版本
+## v5.19.1（2026-08-12）✅ 当前版本
+
+### 🔧 热修复
+- **Bug**: v5.19 启动崩溃。登录后创建主窗口失败，错误 `AttributeError: 'MainWindow' object has no attribute '_pred_chart_mode'`
+- **根因**: T01+T02 新增的 `_pred_chart_mode`、`_pred_chart_normalize`、`_history_cache`、`_hist_worker`、`_hist_results`、`_last_pred_horizon`、`_refresh_last_flush`、`_refresh_timer_coalesce` 等状态字段被放在 `__init__` 末尾（在 `_init_ui()` **之后**），但 `_init_ui()` 内部的 `pred_mode_combo.setCurrentText(self._pred_chart_mode)` 需要立即读取 `_pred_chart_mode`，主窗口创建阶段即崩溃。**v5.19 全版本均无法启动**
+- **修复**: 把依赖 widget 的 `_rt_diff = TableDiff(self.realtime_table)` 之外的纯状态字段，全部上移到 `_init_ui()` 之前初始化；`TableDiff` 仍保留在 `_init_ui()` 之后（依赖 `_init_ui` 中创建的 `realtime_table`）
+- **提交**: `e41f994`
+- **产物**: `dist\GZ_Monitor_v5.19.1_Win7.exe`
+
+---
+
+## v5.19（2026-08-11）
 
 ### ✨ 新增（三项核心优化）
 - **多指标对比（T01+T02）**：预测趋势图参数下拉框改为可勾选 `QListWidget`，支持同时选中并对比多个参数指标；新增 全选 / 反选 / 清空 快捷操作、单轴 / 双轴模式切换、归一化对比按钮
