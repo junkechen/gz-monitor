@@ -4541,29 +4541,81 @@ class MainWindow(QMainWindow):
         else:
             self.pred_chart.clear()
 
+    def _get_supported_params_for_visible_subs(self):
+        """收集当前可见排口（subs）真正支持的参数名称（去重，按 CODE_TO_NAME 的 key 顺序排列）。
+
+        下拉框应展示当前企业所有排口支持的完整参数列表，而不只是已被预测过的参数。
+        返回空列表表示无法获取（交由调用方兜底）。
+        """
+        if not getattr(self, 'current_grouped_data', None):
+            return []
+
+        supported = set()
+        cache = getattr(self, '_sub_itemcodes_cache', {}) or {}
+        for uk, sd in self.current_grouped_data.items():
+            subid = sd.get('subid', uk)
+            sub_type = sd.get('subtype', '')
+            subtype_code = get_subtype_code(sub_type)
+            subname = sd.get('subname', '')
+
+            # 优先使用已缓存的监测项目代码，避免重复 API 调用
+            cache_key = f"{subid}_{subtype_code}"
+            codes = cache.get(cache_key) if isinstance(cache, dict) else None
+            if not codes:
+                try:
+                    codes = self._get_sub_itemcodes(subid, subname, subtype_code)
+                except Exception:
+                    codes = ''
+            if not codes:
+                continue
+
+            code_list = [c.strip() for c in codes.split(',') if c.strip()]
+            for code in code_list:
+                name = CODE_TO_NAME.get(code)
+                if name:
+                    supported.add(name)
+
+        if not supported:
+            return []
+
+        # 按 CODE_TO_NAME 的 key 顺序输出（同名参数只取首次出现的 code，完成去重）
+        ordered = []
+        seen = set()
+        for code in CODE_TO_NAME.keys():
+            name = CODE_TO_NAME[code]
+            if name in supported and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        return ordered
+
     def _show_prediction_chart(self, predictions, title):
-        """显示预测趋势图 —— 缓存全量预测数据，更新参数下拉框，然后按选中参数绘图"""
+        """显示预测趋势图 —— 缓存全量预测数据，更新参数下拉框（展示全部支持参数），然后按选中参数绘图"""
         # 缓存全量预测结果和标题，供下拉框切换时复用
         self._pred_chart_all_predictions = predictions
         self._pred_chart_title = title
 
-        # ── 更新下拉框：收集所有出现过的参数（去重，保持顺序）──────────────
-        seen_params = []
-        for p in predictions:
-            pname = p.get('param', '')
-            if pname and pname not in seen_params:
-                seen_params.append(pname)
+        # ── 更新下拉框：展示当前可见排口真正支持的全部参数（不论是否被预测）────
+        supported_params = self._get_supported_params_for_visible_subs()
+        if not supported_params:
+            # 兜底：按原逻辑仅展示被预测过的参数，避免下拉框为空
+            supported_params = []
+            for p in predictions:
+                pname = p.get('param', '')
+                if pname and pname not in supported_params:
+                    supported_params.append(pname)
 
         # 阻断信号，避免 addItem 触发 currentIndexChanged
         self.pred_chart_param_combo.blockSignals(True)
         prev_param = self.pred_chart_param_combo.currentText()
         self.pred_chart_param_combo.clear()
-        for pname in seen_params:
+        for pname in supported_params:
             self.pred_chart_param_combo.addItem(pname)
 
-        # 尝试恢复之前选中的参数
-        if prev_param in seen_params:
+        # 尝试恢复之前选中的参数（理论上仍在该排口支持的参数列表中）
+        if prev_param and prev_param in supported_params:
             self.pred_chart_param_combo.setCurrentText(prev_param)
+        elif supported_params:
+            self.pred_chart_param_combo.setCurrentIndex(0)
         self.pred_chart_param_combo.blockSignals(False)
 
         # 绘制当前选中参数的图表
@@ -4576,19 +4628,29 @@ class MainWindow(QMainWindow):
             self._draw_pred_chart_for_param(param)
 
     def _draw_pred_chart_for_param(self, param_name):
-        """按指定参数，把所有排放口的历史曲线 + 预测值画在同一张图上"""
-        predictions = getattr(self, '_pred_chart_all_predictions', [])
+        """按指定参数，把所有支持该参数的排放口的历史曲线 + 预测值画在同一张图上。
+
+        若该参数尚未被预测（例如用户在"选择预测指标"中只勾选了部分参数），
+        则实时触发按需预测（不影响用户已选指标与预测表）：先展示历史曲线，
+        预测完成后自动刷新并加入预测点。
+        """
+        predictions = getattr(self, '_pred_chart_all_predictions', []) or []
         title       = getattr(self, '_pred_chart_title', '预测趋势图')
 
-        if not predictions or not param_name:
+        if not param_name:
             self.pred_chart.clear()
             return
 
-        # 筛选出该参数的所有排放口预测记录
-        param_preds = [p for p in predictions if p.get('param') == param_name]
-        if not param_preds:
-            self.pred_chart.clear()
-            return
+        # 建立 (ent_name, subname) -> 预测记录 的索引，便于按排放口取预测值
+        pred_by_sub = {}
+        for p in predictions:
+            if p.get('param') == param_name:
+                key = (p.get('ent_name', ''), p.get('subname', ''))
+                pred_by_sub[key] = p
+
+        # 该参数没有任何预测结果，但存在可见排口 => 按需发起后台预测
+        if not pred_by_sub and getattr(self, 'current_grouped_data', None):
+            self._request_on_demand_prediction(param_name)
 
         from datetime import datetime, timedelta
 
@@ -4597,26 +4659,16 @@ class MainWindow(QMainWindow):
         start_str  = start_time.strftime("%Y-%m-%d %H:%M")
         end_str    = end_time.strftime("%Y-%m-%d %H:%M")
 
-        # 为每个排放口获取历史数据，组成一条曲线
-        series_list    = []
-        common_times   = None   # 用第一个排放口的时间轴作为公共 X 轴
+        # 遍历所有支持该参数的排放口，组成一条曲线
+        series_list  = []
+        common_times = None   # 用最长的时间轴作为公共 X 轴
 
-        for pred in param_preds:
-            subname  = pred.get('subname', '')
-            ent_name = pred.get('ent_name', '')
-
-            # 找到对应的 unique_key / subid
-            matched_key = None
-            for uk, sd in self.current_grouped_data.items():
-                if sd.get('subname') == subname and sd.get('ent_name') == ent_name:
-                    matched_key = uk
-                    break
-            if matched_key is None:
-                continue
-
-            sub_data     = self.current_grouped_data[matched_key]
-            subid        = sub_data.get('subid', matched_key)
-            sub_type     = sub_data.get('subtype', '')
+        grouped = getattr(self, 'current_grouped_data', {}) or {}
+        for uk, sd in grouped.items():
+            subname  = sd.get('subname', '')
+            ent_name = sd.get('ent_name', '')
+            subid    = sd.get('subid', uk)
+            sub_type = sd.get('subtype', '')
             subtype_code = get_subtype_code(sub_type)
 
             # 获取该排放口的监测项目代码
@@ -4627,7 +4679,7 @@ class MainWindow(QMainWindow):
             if not codes:
                 continue
 
-            # 找出 param_name 对应的 code
+            # 找出 param_name 对应的 code（该排口不支持此参数则跳过）
             code_list    = [c.strip() for c in codes.split(',') if c.strip()]
             code_to_name = {code: CODE_TO_NAME.get(code, code) for code in code_list}
             target_code  = None
@@ -4657,20 +4709,23 @@ class MainWindow(QMainWindow):
             val_key = f"val_{target_code}"
 
             if history_rows:
-                times_this   = [r.get('DateTime', '') for r in history_rows]
-                values_hist  = [float(r.get(val_key)) if r.get(val_key) else None for r in history_rows]
+                times_this  = [r.get('DateTime', '') for r in history_rows]
+                values_hist = [float(r.get(val_key)) if r.get(val_key) else None
+                               for r in history_rows]
             else:
-                times_this   = []
-                values_hist  = []
+                times_this  = []
+                values_hist = []
 
-            # 获取预测值（取最近一个预测点）
-            pred_val = pred.get('predicted') if pred.get('predicted') is not None else pred.get('cur_pred')
+            # 预测值（命中缓存则取，否则待按需预测完成后刷新）
+            pred = pred_by_sub.get((ent_name, subname))
+            pred_val = None
+            if pred:
+                pred_val = pred.get('predicted') if pred.get('predicted') is not None else pred.get('cur_pred')
 
             # 拼接时间轴和数据（历史 + "预测"标注点）
-            times_with_pred  = times_this  + ["预测"]
+            times_with_pred  = times_this + ["预测"]
             values_with_pred = values_hist + [pred_val]
 
-            # 以最长的时间轴作为公共 X 轴（一般各排放口时间轴相同）
             if common_times is None or len(times_with_pred) > len(common_times):
                 common_times = times_with_pred
 
@@ -4684,6 +4739,7 @@ class MainWindow(QMainWindow):
             })
 
         if not series_list:
+            # 无历史、无预测：清空图表
             self.pred_chart.clear()
             return
 
@@ -4697,6 +4753,9 @@ class MainWindow(QMainWindow):
             common_times = common_times + [""] * (max_len - len(common_times))
 
         chart_title = f"{title} — {param_name}（各排放口对比）"
+        if not pred_by_sub:
+            # 预测生成中，标题追加提示
+            chart_title += "（预测生成中…）"
         try:
             self.pred_chart.plot_series(
                 times=common_times or [],
@@ -4705,6 +4764,67 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             print(f"[ERROR] 绘制预测趋势图失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _request_on_demand_prediction(self, param_name):
+        """对下拉框中选中的、尚未预测的参数发起后台按需预测。
+
+        仅刷新趋势图缓存，不会修改 self.prediction_params（用户已选指标），
+        也不会重建预测表，从而满足"不选择则预测所有参数"的既有逻辑不被破坏。
+        """
+        if not getattr(self, 'current_grouped_data', None):
+            return
+        # 避免对同一参数重复发起后台任务
+        if (getattr(self, '_on_demand_param', None) == param_name
+                and getattr(self, '_pred_ondemand_worker', None) is not None):
+            try:
+                if self._pred_ondemand_worker.isRunning():
+                    return
+            except RuntimeError:
+                self._pred_ondemand_worker = None
+
+        pred_type = getattr(self, '_pred_chart_title', '小时数据预测') or '小时数据预测'
+        self._on_demand_param = param_name
+
+        worker = PredictionWorker(
+            grouped_data=self.current_grouped_data,
+            multi_client=self.multi_client,
+            prediction_horizon=self.prediction_horizon,
+            prediction_params=[param_name],
+            pred_type=pred_type,
+            thresholds=self.thresholds,
+            sub_itemcodes_cache=self._sub_itemcodes_cache,
+            api_data_cache=self._api_data_cache,
+            thresholds_cache=getattr(self, '_thresholds_cache', {}),
+            get_subtype_code_fn=get_subtype_code,
+            is_water_sub_fn=is_water_sub,
+            code_to_name_map=CODE_TO_NAME,
+            intervention_sm=getattr(self, '_intervention_sm', None),
+            get_sub_itemcodes_fn=self._get_sub_itemcodes,
+        )
+        worker.prediction_done.connect(
+            lambda preds: self._on_ondemand_prediction_done(preds, param_name)
+        )
+        worker.finished.connect(worker.deleteLater)
+        self._pred_ondemand_worker = worker
+        worker.start()
+        print(f"[PRED] 按需预测已发起: {param_name}")
+
+    def _on_ondemand_prediction_done(self, new_preds, param_name):
+        """按需预测完成：合并进趋势图缓存并重绘（仅刷新趋势图，不影响预测表）。"""
+        try:
+            existing = getattr(self, '_pred_chart_all_predictions', []) or []
+            # 用新结果替换该参数的旧预测，避免重复
+            merged = [p for p in existing if p.get('param') != param_name]
+            merged.extend(new_preds)
+            self._pred_chart_all_predictions = merged
+
+            # 仅当用户仍停留在该参数时才重绘，避免覆盖当前视图
+            if self.pred_chart_param_combo.currentText() == param_name:
+                self._draw_pred_chart_for_param(param_name)
+        except Exception as e:
+            print(f"[ERROR] 按需预测结果处理失败: {e}")
             import traceback
             traceback.print_exc()
 
