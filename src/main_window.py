@@ -970,6 +970,10 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._refresh_data()  # 初始加载数据
 
+        # 三项优化 T04：启动预测自动更新定时器（预测由 60s 定时器统一触发，避免与首屏刷新聚集）
+        if self.auto_update_prediction and not self.prediction_timer.isActive():
+            self.prediction_timer.start(self.prediction_update_interval)
+
         # 设置自动刷新定时器（三项优化 T01：统一走 _schedule_refresh 入口）
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self._schedule_refresh)
@@ -2541,13 +2545,19 @@ class MainWindow(QMainWindow):
                 pass
 
     def _schedule_refresh(self):
-        """刷新统一入口（三项优化 T01 占位：直接转发到受保护的刷新流程）。
+        """刷新统一入口（三项优化 T04：250ms 节流合并）。
 
-        T04 将在此方法内加入 250ms 节流合并，再调用 ``_flush_refresh()`` →
-        ``_do_refresh_data()``。当前实现保持与原有 refresh_timer → _refresh_data 一致的行为，
-        是后续所有手动/定时器刷新的唯一入口。
+        所有手动/定时器刷新都走这里。250ms 内的多次调用会被合并为一次，
+        避免刷新风暴导致界面卡顿。真正的刷新在 ``_flush_refresh()`` 中执行。
         """
-        # 本批直接转发；T04 会改为节流后调用 self._flush_refresh()
+        if self._refresh_timer_coalesce is None:
+            self._refresh_timer_coalesce = QTimer()
+            self._refresh_timer_coalesce.setSingleShot(True)
+            self._refresh_timer_coalesce.timeout.connect(self._flush_refresh)
+        self._refresh_timer_coalesce.start(THROTTLE_MS)
+
+    def _flush_refresh(self):
+        """节流合并后真正执行的刷新（T04）"""
         self._refresh_data()
 
     def _do_refresh_data(self):
@@ -2591,13 +2601,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'selected_subid'):
             self._show_sub_realtime(self.selected_subid)
 
-        # 自动刷新预测数据
-        self._auto_refresh_prediction()
+        # 三项优化 T04：预测改由 prediction_timer(60s) 统一触发，
+        # 不再在每次数据刷新内叠加调用，避免重复预测导致卡顿
 
         logger.info(f"数据刷新完成，共 {len(grouped_data)} 个排放口")
 
     def _update_sub_list(self, grouped_data):
         """更新排放口列表（支持多企业）"""
+        self.sub_list.setUpdatesEnabled(False)
         self.sub_list.setRowCount(len(grouped_data))
         for idx, (unique_key, data) in enumerate(grouped_data.items()):
             ent_name = data.get('ent_name', '')
@@ -2615,6 +2626,7 @@ class MainWindow(QMainWindow):
             exists = self.history_sub_combo.findData(unique_key)
             if exists == -1:
                 self.history_sub_combo.addItem(display_text, unique_key)
+        self.sub_list.setUpdatesEnabled(True)
 
     def _on_sub_selected(self, item):
         """排放口选择事件"""
@@ -2862,8 +2874,17 @@ class MainWindow(QMainWindow):
                     '_hist_time': hist_latest_time.get(code, ''),
                 })
 
-        # ── 渲染表格 ────────────────────────────────────────────────────
+        # ── 渲染表格（三项优化 T03：差量更新包裹，消除整表重绘闪烁）──────
         # 列顺序: 0=监测参数, 1=实测浓度, 2=折算浓度, 3=单位, 4=排放标准, 5=折算状态, 6=监测状态
+        self.realtime_table.setUpdatesEnabled(False)
+        if not filtered_params:
+            # 三项优化 T05：空状态占位，避免整表空白造成"卡死"误判
+            self.realtime_table.setRowCount(1)
+            ph = QTableWidgetItem(EMPTY_PLACEHOLDER)
+            ph.setForeground(QColor("#888888"))
+            self.realtime_table.setItem(0, 0, ph)
+            self.realtime_table.setUpdatesEnabled(True)
+            return
         self.realtime_table.setRowCount(len(filtered_params))
         for row, param in enumerate(filtered_params):
             name       = param.get('name', '')
@@ -2999,6 +3020,7 @@ class MainWindow(QMainWindow):
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(status_color)
             self.realtime_table.setItem(row, 6, status_item)
+        self.realtime_table.setUpdatesEnabled(True)
 
     def _on_time_type_changed(self, index):
         """数据类型切换时，智能显示/隐藏时分控件，并调整默认时间范围"""
@@ -3616,6 +3638,7 @@ class MainWindow(QMainWindow):
         for i in range(1, total_cols):
             self.history_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
 
+        self.history_table.setUpdatesEnabled(False)
         self.history_table.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             self.history_table.setItem(row_idx, 0, QTableWidgetItem(row.get('DateTime', '')))
@@ -3634,6 +3657,7 @@ class MainWindow(QMainWindow):
                     val_key = f"val_{code}"
                     val = row.get(val_key)
                     self.history_table.setItem(row_idx, col_idx, QTableWidgetItem(str(val) if val else "--"))
+        self.history_table.setUpdatesEnabled(True)
 
 
     def _display_history_chart(self, rows, display_params, codes_str):
@@ -4510,18 +4534,28 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QTableWidgetItem
         from PyQt5.QtCore import Qt
 
+        self.pred_table.setUpdatesEnabled(False)
         self.pred_table.setRowCount(0)
 
         if not predictions:
+            self.pred_table.setUpdatesEnabled(True)
             self.pred_result_label.setText("暂无预测结果")
             return
 
-        # ── 1. 构建列头 ──────────────────────────────────────────────────────
+        # ── 1. 构建列头（三项优化 T03：仅当 horizon 变化时才重建列结构）──
         if horizon > 0:
-            pred_labels = self._rebuild_pred_table_columns(horizon)
+            if horizon != self._last_pred_horizon:
+                pred_labels = self._rebuild_pred_table_columns(horizon)
+                self._last_pred_horizon = horizon
+            else:
+                pred_labels = ["当前小时"] + [f"+{i}小时" for i in range(1, horizon + 1)]
         else:
             # 日均预测：只有1个预测列
-            pred_labels = self._rebuild_pred_table_columns(0)
+            if 0 != self._last_pred_horizon:
+                pred_labels = self._rebuild_pred_table_columns(0)
+                self._last_pred_horizon = 0
+            else:
+                pred_labels = ["当前小时"]
             # 将"当前小时"列头改为"当日均值预测"
             self.pred_table.setHorizontalHeaderItem(
                 2, QTableWidgetItem("当日均值预测"))
@@ -4625,6 +4659,7 @@ class MainWindow(QMainWindow):
         else:
             summary = f"共 {total} 条预测，未来 {horizon if horizon else 0} 小时内全部正常 ✅"
         self.pred_result_label.setText(summary)
+        self.pred_table.setUpdatesEnabled(True)
 
     def _show_hour_prediction_table(self, predictions):
         """显示小时预测结果（动态多小时列）"""
