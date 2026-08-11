@@ -965,6 +965,21 @@ class MainWindow(QMainWindow):
         # 未来小时预测数（小时数据预测时向后预测几个小时，默认3小时）
         self.prediction_horizon = 3
 
+        # ── 三项优化（T01）：历史缓存 / 对比图状态 ──────────────────
+        # 必须放在 _init_ui() 之前：_init_ui 内部会读取 self._pred_chart_mode（同排口多参数 同参数多排口）
+        self._history_cache = {}                  # 历史数据缓存（24h TTL），供后台 worker 共享写回
+        self._pred_chart_mode = "同排口多参数"     # 对比模式：同排口多参数 / 同参数多排口
+        self._pred_chart_normalize = False        # 是否归一化
+        self._pred_chart_loading = False          # 预测图加载态
+        self._pred_chart_dirty = False            # 预测图按需重绘脏标记
+        self._pred_chart_visible = False          # 预测图所在 tab 是否可见
+        self._prediction_dirty = False            # 预测触发脏标记（T04 消费）
+        self._last_pred_horizon = -1              # 上次预测 horizon（用于预测表列重建判断）
+        self._refresh_last_flush = 0.0            # 上次真正刷新时间（节流用，T04）
+        self._refresh_timer_coalesce = None       # 节流合并定时器（T04）
+        self._hist_worker = None                  # 后台历史取数 worker
+        self._hist_results = {}                   # 历史取数结果累加 {subid: {...}}
+
         self._init_ui()
         self._setup_warning()
         self._setup_menu()
@@ -979,20 +994,8 @@ class MainWindow(QMainWindow):
         self.refresh_timer.timeout.connect(self._schedule_refresh)
         self.refresh_timer.start(self.refresh_interval)
 
-        # ── 三项优化（T01）：历史缓存 / 对比图状态 / 差量器 ──────────────────
-        self._history_cache = {}                  # 历史数据缓存（24h TTL），供后台 worker 共享写回
-        self._pred_chart_mode = "同排口多参数"     # 对比模式：同排口多参数 / 同参数多排口
-        self._pred_chart_normalize = False        # 是否归一化
-        self._pred_chart_loading = False          # 预测图加载态
-        self._pred_chart_dirty = False            # 预测图按需重绘脏标记
-        self._pred_chart_visible = False          # 预测图所在 tab 是否可见
-        self._prediction_dirty = False            # 预测触发脏标记（T04 消费）
-        self._last_pred_horizon = -1              # 上次预测 horizon（用于预测表列重建判断）
-        self._refresh_last_flush = 0.0            # 上次真正刷新时间（节流用，T04）
-        self._refresh_timer_coalesce = None       # 节流合并定时器（T04）
-        self._hist_worker = None                  # 后台历史取数 worker
-        self._hist_results = {}                   # 历史取数结果累加 {subid: {...}}
-        self._rt_diff = TableDiff(self.realtime_table)  # 实时表差量渲染器
+        # 实时表差量渲染器（必须在 _init_ui 之后，依赖 _init_ui 中创建的 realtime_table）
+        self._rt_diff = TableDiff(self.realtime_table)
 
     def _init_ui(self):
         self.setWindowTitle(f"GZ安环监测系统 - {self.username}")
