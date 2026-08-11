@@ -46,7 +46,7 @@ def log_performance(func):
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QLineEdit, QPushButton, QComboBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QGroupBox, QFormLayout, QMessageBox,
+    QTableWidgetItem, QListWidget, QListWidgetItem, QHeaderView, QGroupBox, QFormLayout, QMessageBox,
     QDateEdit, QTimeEdit, QFileDialog, QSplitter, QFrame, QScrollArea,
     QDialog, QDialogButtonBox, QSpinBox, QCheckBox, QProgressBar,
     QMenuBar, QMenu, QSizePolicy
@@ -65,7 +65,10 @@ from data_processor import (
 )
 from warning_system import WarningSystem, PredictionWarning
 from chart_widget import ChartWidget
-from config import COLORS, WATER_DISPLAY_PARAMS, GAS_DISPLAY_PARAMS
+from config import (COLORS, WATER_DISPLAY_PARAMS, GAS_DISPLAY_PARAMS, RIGHT_AXIS_PARAMS,
+                    HISTORY_TTL, HISTORY_INDEX, SERIES_CAP, FIG_DPI, THROTTLE_MS, EMPTY_PLACEHOLDER)
+from refresh_utils import TableDiff, classify_axis
+from history_fetch_worker import HistoryFetchWorker, make_history_cache_key
 import traceback
 
 
@@ -967,10 +970,25 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._refresh_data()  # 初始加载数据
 
-        # 设置自动刷新定时器
+        # 设置自动刷新定时器（三项优化 T01：统一走 _schedule_refresh 入口）
         self.refresh_timer = QTimer()
-        self.refresh_timer.timeout.connect(self._refresh_data)
+        self.refresh_timer.timeout.connect(self._schedule_refresh)
         self.refresh_timer.start(self.refresh_interval)
+
+        # ── 三项优化（T01）：历史缓存 / 对比图状态 / 差量器 ──────────────────
+        self._history_cache = {}                  # 历史数据缓存（24h TTL），供后台 worker 共享写回
+        self._pred_chart_mode = "同排口多参数"     # 对比模式：同排口多参数 / 同参数多排口
+        self._pred_chart_normalize = False        # 是否归一化
+        self._pred_chart_loading = False          # 预测图加载态
+        self._pred_chart_dirty = False            # 预测图按需重绘脏标记
+        self._pred_chart_visible = False          # 预测图所在 tab 是否可见
+        self._prediction_dirty = False            # 预测触发脏标记（T04 消费）
+        self._last_pred_horizon = -1              # 上次预测 horizon（用于预测表列重建判断）
+        self._refresh_last_flush = 0.0            # 上次真正刷新时间（节流用，T04）
+        self._refresh_timer_coalesce = None       # 节流合并定时器（T04）
+        self._hist_worker = None                  # 后台历史取数 worker
+        self._hist_results = {}                   # 历史取数结果累加 {subid: {...}}
+        self._rt_diff = TableDiff(self.realtime_table)  # 实时表差量渲染器
 
     def _init_ui(self):
         self.setWindowTitle(f"GZ安环监测系统 - {self.username}")
@@ -1922,31 +1940,9 @@ class MainWindow(QMainWindow):
         pred_chart_title = QLabel("📈 预测趋势图")
         pred_chart_title.setStyleSheet("color: white; font-weight: bold; font-size: 13px; background: transparent;")
 
-        # 指标选择下拉框（用于切换图表中显示的参数）
-        pred_chart_param_lbl = QLabel("选择指标:")
-        pred_chart_param_lbl.setStyleSheet("color: white; font-size: 12px; background: transparent;")
-        self.pred_chart_param_combo = QComboBox()
-        self.pred_chart_param_combo.setMinimumWidth(140)
-        self.pred_chart_param_combo.setFixedHeight(22)
-        self.pred_chart_param_combo.setStyleSheet("""
-            QComboBox {
-                background: rgba(255,255,255,0.15);
-                color: white;
-                border: 1px solid rgba(255,255,255,0.4);
-                border-radius: 4px;
-                padding: 0 6px;
-                font-size: 12px;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox QAbstractItemView {
-                background: #2c3e50;
-                color: white;
-                selection-background-color: #3498db;
-            }
-        """)
-        self.pred_chart_param_combo.currentIndexChanged.connect(self._on_pred_chart_param_changed)
+        # 三项优化 T02：原单参数下拉框 pred_chart_param_combo 已移除，
+        # 改为下方内容区的可勾选"对比参数"面板（多指标叠加，见 pred_compare_panel）。
+
 
         self.pred_chart_toggle_btn = QPushButton("▲ 收起")
         self.pred_chart_toggle_btn.setFixedSize(70, 22)
@@ -1966,8 +1962,6 @@ class MainWindow(QMainWindow):
         self.pred_chart_toggle_btn.clicked.connect(self._toggle_pred_chart)
         pred_chart_header_layout.addWidget(pred_chart_title)
         pred_chart_header_layout.addSpacing(12)
-        pred_chart_header_layout.addWidget(pred_chart_param_lbl)
-        pred_chart_header_layout.addWidget(self.pred_chart_param_combo)
         pred_chart_header_layout.addStretch()
         pred_chart_header_layout.addWidget(self.pred_chart_toggle_btn)
 
@@ -1977,6 +1971,105 @@ class MainWindow(QMainWindow):
         pred_chart_content_layout = QVBoxLayout(self.pred_chart_content)
         pred_chart_content_layout.setContentsMargins(0, 4, 0, 0)
         pred_chart_content_layout.setSpacing(0)
+
+        # ── 三项优化 T02：多指标对比参数面板（可勾选 QListWidget）────────────
+        self.pred_compare_panel = QWidget()
+        compare_layout = QHBoxLayout(self.pred_compare_panel)
+        compare_layout.setContentsMargins(4, 4, 4, 4)
+        compare_layout.setSpacing(8)
+
+        param_lbl = QLabel("对比参数:")
+        param_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 12px;")
+        compare_layout.addWidget(param_lbl)
+
+        self.pred_param_list = QListWidget()
+        self.pred_param_list.setFlow(QListWidget.LeftToRight)
+        self.pred_param_list.setWrapping(False)
+        self.pred_param_list.setSpacing(4)
+        self.pred_param_list.setFixedHeight(40)
+        self.pred_param_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.pred_param_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pred_param_list.setSelectionMode(QListWidget.NoSelection)
+        self.pred_param_list.setStyleSheet(f"""
+            QListWidget {{
+                background: {COLORS['bg_input']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+            }}
+            QListWidget::item {{ color: {COLORS['text_primary']}; spacing: 4px; }}
+        """)
+        self.pred_param_list.itemChanged.connect(self._on_compare_params_changed)
+        compare_layout.addWidget(self.pred_param_list, 1)
+
+        # 全选 / 反选 / 清空
+        self.pred_select_all_btn = QPushButton("全选")
+        self.pred_invert_btn = QPushButton("反选")
+        self.pred_clear_btn = QPushButton("清空")
+        for _b in (self.pred_select_all_btn, self.pred_invert_btn, self.pred_clear_btn):
+            _b.setFixedHeight(26)
+            _b.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['bg_input']};
+                    color: {COLORS['text_primary']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 4px;
+                    font-size: 12px;
+                    padding: 0 8px;
+                }}
+                QPushButton:hover {{ background: {COLORS['secondary']}; }}
+            """)
+        self.pred_select_all_btn.clicked.connect(self._select_all_params)
+        self.pred_invert_btn.clicked.connect(self._invert_params)
+        self.pred_clear_btn.clicked.connect(self._clear_params)
+        compare_layout.addWidget(self.pred_select_all_btn)
+        compare_layout.addWidget(self.pred_invert_btn)
+        compare_layout.addWidget(self.pred_clear_btn)
+
+        # 模式开关：同排口多参数 / 同参数多排口
+        mode_lbl = QLabel("模式:")
+        mode_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 12px;")
+        compare_layout.addWidget(mode_lbl)
+        self.pred_mode_combo = QComboBox()
+        self.pred_mode_combo.addItems(["同排口多参数", "同参数多排口"])
+        self.pred_mode_combo.setCurrentText(self._pred_chart_mode)
+        self.pred_mode_combo.setFixedHeight(26)
+        self.pred_mode_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {COLORS['bg_input']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 0 6px;
+                font-size: 12px;
+            }}
+        """)
+        self.pred_mode_combo.currentTextChanged.connect(self._on_pred_mode_changed)
+        compare_layout.addWidget(self.pred_mode_combo)
+
+        # 归一化按钮
+        self.pred_normalize_btn = QPushButton("归一化: 关")
+        self.pred_normalize_btn.setCheckable(True)
+        self.pred_normalize_btn.setFixedHeight(26)
+        self.pred_normalize_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['bg_input']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                font-size: 12px;
+                padding: 0 8px;
+            }}
+            QPushButton:checked {{
+                background: {COLORS['primary']};
+                color: white;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {COLORS['secondary']}; }}
+        """)
+        self.pred_normalize_btn.toggled.connect(self._on_normalize_toggled)
+        compare_layout.addWidget(self.pred_normalize_btn)
+
+        pred_chart_content_layout.addWidget(self.pred_compare_panel)
 
         chart_group = QGroupBox()
         chart_group.setStyleSheet(f"""
@@ -2447,11 +2540,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _schedule_refresh(self):
+        """刷新统一入口（三项优化 T01 占位：直接转发到受保护的刷新流程）。
+
+        T04 将在此方法内加入 250ms 节流合并，再调用 ``_flush_refresh()`` →
+        ``_do_refresh_data()``。当前实现保持与原有 refresh_timer → _refresh_data 一致的行为，
+        是后续所有手动/定时器刷新的唯一入口。
+        """
+        # 本批直接转发；T04 会改为节流后调用 self._flush_refresh()
+        self._refresh_data()
+
     def _do_refresh_data(self):
         """实际的数据刷新逻辑（从_refresh_data拆出）"""
         self.last_update_label.setText(f"最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self._update_status_bar()
-        QApplication.processEvents()
 
         # ── 内存管理：定期执行垃圾回收 ───────────────────────────────────────
         self._gc_counter += 1
@@ -4604,28 +4706,11 @@ class MainWindow(QMainWindow):
                 if pname and pname not in supported_params:
                     supported_params.append(pname)
 
-        # 阻断信号，避免 addItem 触发 currentIndexChanged
-        self.pred_chart_param_combo.blockSignals(True)
-        prev_param = self.pred_chart_param_combo.currentText()
-        self.pred_chart_param_combo.clear()
-        for pname in supported_params:
-            self.pred_chart_param_combo.addItem(pname)
+        # 三项优化 T02：用可勾选"对比参数"面板替代原单参数下拉框
+        self._populate_compare_list(supported_params)
 
-        # 尝试恢复之前选中的参数（理论上仍在该排口支持的参数列表中）
-        if prev_param and prev_param in supported_params:
-            self.pred_chart_param_combo.setCurrentText(prev_param)
-        elif supported_params:
-            self.pred_chart_param_combo.setCurrentIndex(0)
-        self.pred_chart_param_combo.blockSignals(False)
-
-        # 绘制当前选中参数的图表
-        self._draw_pred_chart_for_param(self.pred_chart_param_combo.currentText())
-
-    def _on_pred_chart_param_changed(self, index):
-        """下拉框切换预测参数时，重新绘图"""
-        param = self.pred_chart_param_combo.currentText()
-        if param:
-            self._draw_pred_chart_for_param(param)
+        # 触发多指标对比绘制（保留单次预测点叠加逻辑）
+        self._draw_pred_chart_multi(self._get_checked_compare_params(), self._pred_chart_mode)
 
     def _draw_pred_chart_for_param(self, param_name):
         """按指定参数，把所有支持该参数的排放口的历史曲线 + 预测值画在同一张图上。
@@ -4820,11 +4905,404 @@ class MainWindow(QMainWindow):
             merged.extend(new_preds)
             self._pred_chart_all_predictions = merged
 
-            # 仅当用户仍停留在该参数时才重绘，避免覆盖当前视图
-            if self.pred_chart_param_combo.currentText() == param_name:
-                self._draw_pred_chart_for_param(param_name)
+            # 三项优化 T02：若该参数仍在勾选列表内，则刷新多指标对比图
+            if param_name in self._get_checked_compare_params():
+                self._draw_pred_chart_multi(self._get_checked_compare_params(), self._pred_chart_mode)
         except Exception as e:
             print(f"[ERROR] 按需预测结果处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 三项优化 T02：多指标对比 UI + 后台取数（替代原单参数下拉框）
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _populate_compare_list(self, params):
+        """用可见排口支持的参数填充可勾选对比面板。
+
+        保留已有勾选；面板首次为空时默认全勾选（给出初始图表）。
+        """
+        lst = getattr(self, 'pred_param_list', None)
+        if lst is None:
+            return
+        prev_checked = set()
+        for i in range(lst.count()):
+            it = lst.item(i)
+            if it.checkState() == Qt.Checked:
+                prev_checked.add(it.text())
+        auto_check_all = (lst.count() == 0)
+        lst.blockSignals(True)
+        lst.clear()
+        for p in params:
+            it = QListWidgetItem(p)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            if prev_checked:
+                it.setCheckState(Qt.Checked if p in prev_checked else Qt.Unchecked)
+            else:
+                it.setCheckState(Qt.Checked if auto_check_all else Qt.Unchecked)
+            lst.addItem(it)
+        lst.blockSignals(False)
+
+    def _get_checked_compare_params(self):
+        """返回当前勾选的对比参数名列表。"""
+        lst = getattr(self, 'pred_param_list', None)
+        if lst is None:
+            return []
+        return [lst.item(i).text() for i in range(lst.count())
+                if lst.item(i).checkState() == Qt.Checked]
+
+    def _on_compare_params_changed(self):
+        """勾选变化：重算并触发取数/重绘。"""
+        checked = self._get_checked_compare_params()
+        self._draw_pred_chart_multi(checked, self._pred_chart_mode)
+
+    def _on_pred_mode_changed(self, mode):
+        """模式切换：记录并重绘。"""
+        self._pred_chart_mode = mode
+        checked = self._get_checked_compare_params()
+        self._draw_pred_chart_multi(checked, mode)
+
+    def _on_normalize_toggled(self, flag):
+        """归一化开关：记录并重绘。"""
+        self._pred_chart_normalize = bool(flag)
+        try:
+            self.pred_normalize_btn.setText(f"归一化: {'开' if flag else '关'}")
+        except Exception:
+            pass
+        checked = self._get_checked_compare_params()
+        self._draw_pred_chart_multi(checked, self._pred_chart_mode)
+
+    def _select_all_params(self):
+        lst = getattr(self, 'pred_param_list', None)
+        if lst is None:
+            return
+        lst.blockSignals(True)
+        for i in range(lst.count()):
+            lst.item(i).setCheckState(Qt.Checked)
+        lst.blockSignals(False)
+        self._on_compare_params_changed()
+
+    def _invert_params(self):
+        lst = getattr(self, 'pred_param_list', None)
+        if lst is None:
+            return
+        lst.blockSignals(True)
+        for i in range(lst.count()):
+            it = lst.item(i)
+            it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+        lst.blockSignals(False)
+        self._on_compare_params_changed()
+
+    def _clear_params(self):
+        lst = getattr(self, 'pred_param_list', None)
+        if lst is None:
+            return
+        lst.blockSignals(True)
+        for i in range(lst.count()):
+            lst.item(i).setCheckState(Qt.Unchecked)
+        lst.blockSignals(False)
+        self._on_compare_params_changed()
+
+    def _build_hist_tasks(self, checked_params, mode):
+        """按 docs/system_design.md §5 裁定生成 sub_tasks（按 sub 聚合）。
+
+        每个 sub 仅发起 1 次历史请求（取全量 codes），本地按 params 拆分多参数。
+        Returns: list[dict]，元素含 subid/subtype_code/codes/params/start/end/
+                 index/use_corrected/subname/ent_name。
+        """
+        grouped = getattr(self, 'current_grouped_data', {}) or {}
+        if not grouped or not checked_params:
+            return []
+        checked_set = set(checked_params)
+
+        # ── 确定参与对比的排口集合 ──────────────────────────────────────────
+        if mode == "同排口多参数":
+            target = None
+            sel = getattr(self, 'selected_subid', None)
+            if sel is not None:
+                for uk, sd in grouped.items():
+                    if sd.get('subid', uk) == sel:
+                        target = (uk, sd)
+                        break
+            if target is None:
+                # 无选中排口：取首个可见排口
+                for uk, sd in grouped.items():
+                    target = (uk, sd)
+                    break
+            subs = [target] if target else []
+        else:  # 同参数多排口：所有可见排口
+            subs = list(grouped.items())
+
+        sub_tasks = []
+        for uk, sd in subs:
+            subid = sd.get('subid', uk)
+            sub_type = sd.get('subtype', '')
+            subtype_code = get_subtype_code(sub_type)
+            subname = sd.get('subname', '')
+            ent_name = sd.get('ent_name', '')
+
+            try:
+                codes = self._get_sub_itemcodes(subid, subname, subtype_code)
+            except Exception:
+                codes = None
+            if not codes:
+                continue
+            code_list = [c.strip() for c in codes.split(',') if c.strip()]
+            code_to_name = {code: CODE_TO_NAME.get(code, code) for code in code_list}
+
+            # 该排口支持且被勾选的参数 -> (code, name, axis)
+            params = []
+            for code, name in code_to_name.items():
+                if name in checked_set:
+                    params.append((code, name, classify_axis(name)))
+            if not params:
+                continue
+
+            # 时间窗：近 24h（与设计 §8 一致）
+            end_time = datetime.now()
+            start_time = end_time - timedelta(hours=24)
+            start_str = start_time.strftime("%Y-%m-%d %H:%M")
+            end_str = end_time.strftime("%Y-%m-%d %H:%M")
+            use_corrected = '热电' in ent_name
+
+            sub_tasks.append({
+                'subid': subid,
+                'subtype_code': subtype_code,
+                'codes': ','.join(code_list),
+                'params': params,
+                'start': start_str,
+                'end': end_str,
+                'index': HISTORY_INDEX,
+                'use_corrected': use_corrected,
+                'subname': subname,
+                'ent_name': ent_name,
+            })
+        return sub_tasks
+
+    def _cached_hist_payload(self, task):
+        """若历史缓存命中且未过期，返回与 worker 一致的 history_result payload；否则 None。"""
+        key = make_history_cache_key(
+            task['subid'], task['subtype_code'], task['codes'],
+            task['start'], task['end'], task['index'], task['use_corrected'])
+        entry = self._history_cache.get(key)
+        if entry is None:
+            return None
+        ts, rows = entry
+        if time.time() - ts >= HISTORY_TTL:
+            return None
+        if not isinstance(rows, list):
+            return None
+        series = []
+        for (code, name, axis) in task['params']:
+            val_key = f"val_{code}"
+            times = [r.get('DateTime', '') for r in rows]
+            values = []
+            for r in rows:
+                v = r.get(val_key)
+                if v not in (None, ''):
+                    try:
+                        values.append(float(v))
+                    except (ValueError, TypeError):
+                        values.append(None)
+                else:
+                    values.append(None)
+            series.append({"param_name": name, "code": code,
+                           "axis": axis, "times": times, "values": values})
+        return {
+            "subid": task['subid'], "subname": task['subname'],
+            "ent_name": task['ent_name'], "subtype_code": task['subtype_code'],
+            "window": f"{task['start']} ~ {task['end']}", "series": series,
+        }
+
+    def _draw_pred_chart_multi(self, checked_params, mode):
+        """多指标对比主绘制入口（T02 核心）。
+
+        流程：
+          1. 生成 sub_tasks（_build_hist_tasks）
+          2. 预检 _history_cache，命中者即时成 series
+          3. 未命中者交给后台 HistoryFetchWorker 取数（取消上一个未完成 worker）
+          4. history_result 累加 / fetch_finished 时组装 left+right series、归一化、
+             追加预测点 -> pred_chart.plot_series -> canvas.draw_idle()
+        全程后台取数，主线程零阻塞（消除切指标卡顿）。
+        """
+        grouped = getattr(self, 'current_grouped_data', {}) or {}
+        if not checked_params or not grouped:
+            try:
+                self.pred_chart.clear()
+            except Exception:
+                pass
+            return
+
+        # 取消上一个未完成 worker，避免污染 _hist_results
+        if self._hist_worker is not None and self._hist_worker.isRunning():
+            try:
+                self._hist_worker.quit()
+                self._hist_worker.wait()
+            except Exception:
+                pass
+            self._hist_worker = None
+
+        sub_tasks = self._build_hist_tasks(checked_params, mode)
+        if not sub_tasks:
+            try:
+                self.pred_chart.clear()
+            except Exception:
+                pass
+            return
+
+        # 预检缓存，命中即时成图，未命中送 worker
+        self._hist_results = {}
+        uncached = []
+        for task in sub_tasks:
+            payload = self._cached_hist_payload(task)
+            if payload is not None:
+                self._hist_results[task['subid']] = payload
+            else:
+                uncached.append(task)
+
+        if not uncached:
+            # 全部命中缓存：直接组装绘制
+            self._assemble_and_plot_pred_chart(checked_params, mode)
+            return
+
+        # 启动后台取数
+        self._pred_chart_loading = True
+        worker = HistoryFetchWorker(self.multi_client, uncached,
+                                    self._history_cache, HISTORY_TTL)
+        wref = worker
+        worker.history_result.connect(self._on_hist_result)
+        worker.fetch_finished.connect(
+            lambda: self._on_hist_fetch_finished(checked_params, mode, wref))
+        worker.finished.connect(worker.deleteLater)
+        self._hist_worker = worker
+        worker.start()
+
+    def _on_hist_result(self, payload):
+        """后台逐 sub 回传：累加历史 series。"""
+        subid = payload.get('subid')
+        if subid is not None:
+            self._hist_results[subid] = payload
+
+    def _on_hist_fetch_finished(self, checked_params, mode, worker):
+        """后台取数完成：组装并绘制。"""
+        if self._hist_worker is not worker:
+            # 已有新的取数任务，放弃本次过期结果
+            return
+        self._hist_worker = None
+        self._pred_chart_loading = False
+        self._assemble_and_plot_pred_chart(checked_params, mode)
+
+    def _assemble_and_plot_pred_chart(self, checked_params, mode):
+        """从 _hist_results 组装 left/right series、追加预测点、归一化、截断并绘制。"""
+        results = getattr(self, '_hist_results', {}) or {}
+        if not results:
+            try:
+                self.pred_chart.clear()
+            except Exception:
+                pass
+            return
+
+        # 预测点索引：(ent_name, subname, param) -> 预测值
+        predictions = getattr(self, '_pred_chart_all_predictions', []) or []
+        pred_by_sub_param = {}
+        for p in predictions:
+            key = (p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''))
+            val = p.get('predicted')
+            if val is None:
+                val = p.get('cur_pred')
+            pred_by_sub_param[key] = val
+
+        # 多企业消歧
+        grouped = getattr(self, 'current_grouped_data', {}) or {}
+        ent_names = set(sd.get('ent_name', '') for sd in grouped.values())
+        multi_ent = len(ent_names) > 1
+
+        # 组装原始曲线
+        raw_curves = []  # {name, axis, data, times}
+        for subid, payload in results.items():
+            subname = payload.get('subname', '')
+            ent_name = payload.get('ent_name', '')
+            for s in payload.get('series', []):
+                param = s.get('param_name', '')
+                pred_val = pred_by_sub_param.get((ent_name, subname, param))
+                times_cur = list(s.get('times', [])) + ["预测"]
+                data_cur = list(s.get('values', [])) + [pred_val]
+                label = f"{param}@{ent_name}-{subname}" if multi_ent else f"{param}@{subname}"
+                raw_curves.append({
+                    "name": label,
+                    "axis": s.get('axis', 'left'),
+                    "data": data_cur,
+                    "times": times_cur,
+                })
+
+        # 触发缺失参数的按需预测（保留单次预测点叠加逻辑）
+        requested = set()
+        for subid, payload in results.items():
+            subname = payload.get('subname', '')
+            ent_name = payload.get('ent_name', '')
+            for s in payload.get('series', []):
+                param = s.get('param_name', '')
+                if (ent_name, subname, param) not in pred_by_sub_param and param not in requested:
+                    requested.add(param)
+                    self._request_on_demand_prediction(param)
+
+        if not raw_curves:
+            try:
+                self.pred_chart.clear()
+            except Exception:
+                pass
+            return
+
+        # SERIES_CAP 截断
+        hidden_count = 0
+        if len(raw_curves) > SERIES_CAP:
+            hidden_count = len(raw_curves) - SERIES_CAP
+            raw_curves = raw_curves[:SERIES_CAP]
+
+        # 对齐到公共 X 轴（最长曲线）
+        max_len = max(len(c['data']) for c in raw_curves)
+        common_times = []
+        for c in raw_curves:
+            if len(c['data']) == max_len:
+                common_times = list(c['times'])
+                break
+        if not common_times:
+            common_times = ["" for _ in range(max_len)]
+        for c in raw_curves:
+            diff = max_len - len(c['data'])
+            if diff > 0:
+                c['data'] = c['data'] + [None] * diff
+                c['times'] = c['times'] + [""] * diff
+
+        normalize = bool(self._pred_chart_normalize)
+        if normalize:
+            left_series = [{"name": c['name'], "data": c['data']} for c in raw_curves]
+            right_series = None
+            right_ylabel = ""
+        else:
+            left_series = [{"name": c['name'], "data": c['data']}
+                           for c in raw_curves if c['axis'] == 'left']
+            right_series = [{"name": c['name'], "data": c['data']}
+                            for c in raw_curves if c['axis'] == 'right']
+            right_series = right_series if right_series else None
+            right_ylabel = "pH / 温度 / 水温"
+
+        title = f"{getattr(self, '_pred_chart_title', '预测趋势图')} — {mode}"
+        if hidden_count > 0:
+            title += f"（已隐藏 {hidden_count} 条）"
+
+        try:
+            self.pred_chart.plot_series(
+                times=common_times,
+                series_list=left_series,
+                title=title,
+                right_series_list=right_series,
+                right_ylabel=right_ylabel,
+                normalize=normalize,
+            )
+            self.pred_chart.canvas.draw_idle()
+        except Exception as e:
+            print(f"[ERROR] 绘制多指标预测趋势图失败: {e}")
             import traceback
             traceback.print_exc()
 

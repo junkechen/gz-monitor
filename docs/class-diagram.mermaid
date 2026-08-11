@@ -1,0 +1,64 @@
+classDiagram
+    class HistoryFetchWorker {
+        +pyqtSignal history_result(dict)
+        +pyqtSignal fetch_finished()
+        -multi_client
+        -sub_tasks: list
+        -history_cache: dict
+        -_ttl: int
+        +run()
+        -_fetch_one(t): dict
+    }
+    class TableDiff {
+        -_table: QTableWidget
+        -_prev: dict
+        +render(rows, col_count, make_item_fn, full_reset=False) : (changed,total)
+        +render_empty(placeholder)
+    }
+    class ChartWidget {
+        -_lines: dict
+        -_checkboxes: dict
+        -_right_lines: dict
+        -_right_checkboxes: dict
+        -figure
+        -canvas
+        +plot_series(times, series_list, title, right_series_list, right_ylabel, normalize)
+        +_toggle_line(name, state)
+        +_auto_scale()
+        +draw_idle()
+        +clear()
+        -_get_ax_list()
+    }
+    class MainWindow {
+        -_history_cache: dict
+        -_pred_chart_all_predictions: list
+        -_pred_chart_mode: str
+        -_pred_chart_normalize: bool
+        -_pred_chart_loading: bool
+        -_pred_chart_dirty: bool
+        -_pred_chart_visible: bool
+        -_prediction_dirty: bool
+        -_last_pred_horizon: int
+        -_refresh_last_flush: float
+        -_refresh_timer_coalesce: QTimer
+        -_rt_diff: TableDiff
+        -_hist_worker: HistoryFetchWorker
+        -_hist_results: dict
+        +_schedule_refresh()
+        +_flush_refresh()
+        +_draw_pred_chart_multi(checked_params, mode)
+        +_build_hist_tasks(checked_params, mode): list
+        +_on_compare_params_changed()
+        +_on_pred_mode_changed(mode)
+        +_on_normalize_toggled(flag)
+        +_mark_prediction_dirty()
+        +_render_realtime_table()
+        +_render_pred_table_diff()
+        +_render_history_table_diff()
+        +_render_sub_list_diff()
+    }
+    MainWindow --> HistoryFetchWorker : 创建/启动/取结果
+    MainWindow --> TableDiff : 持有(_rt_diff等)
+    MainWindow *-- ChartWidget : 持有(pred_chart)
+    MainWindow ..> config : 读取常量
+    HistoryFetchWorker ..> multi_client : 经MainWindow传入

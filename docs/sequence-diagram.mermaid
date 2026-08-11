@@ -1,0 +1,54 @@
+sequenceDiagram
+    actor User
+    participant LW as QListWidget(对比参数)
+    participant MW as MainWindow
+    participant WK as HistoryFetchWorker
+    participant API as Client.query_history
+    participant CW as ChartWidget
+
+    User->>LW: 勾选参数 / 切换模式 / 归一化
+    LW->>MW: _on_compare_params_changed()
+    MW->>MW: 截断到 SERIES_CAP，记 hidden_count
+    MW->>MW: _build_hist_tasks(checked, mode)
+    MW->>MW: 预检 _history_cache（命中者即时成 series）
+    MW->>CW: _set_loading(True) 显示"加载中…"
+    MW->>WK: 启动（sub_tasks=未命中者）
+    par 后台并发取数（每 sub 一次网络请求）
+        WK->>API: query_history(subid,codes,window)
+        API-->>WK: rows
+        WK->>WK: 写 _history_cache(ttl=24h)
+        WK-->>MW: history_result({sub, series[]})
+        MW->>MW: 累加至 _hist_results[sub]
+    end
+    WK-->>MW: fetch_finished()
+    MW->>MW: 组装 left/right series（classify_axis）+ normalize + 追加预测点
+    MW->>CW: plot_series(times, left, right, normalize)
+    CW->>CW: figure.clear；画 ax；若有 right 则 ax2=twinx
+    CW->>CW: 生成彩色 QCheckBox 图例（左+右）
+    MW->>CW: canvas.draw_idle()
+    MW->>CW: _set_loading(False)
+
+---
+
+sequenceDiagram
+    participant RT as RefreshTimer(1200s)
+    participant MW as MainWindow
+    participant TBL as TableDiff
+    participant PT as PredictionTimer(60s)
+
+    RT->>MW: _schedule_refresh()
+    MW->>MW: 250ms 节流合并(_refresh_timer_coalesce)
+    MW->>MW: _flush_refresh() → _do_refresh_data()
+    Note over MW: 已移除 QApplication.processEvents()
+    MW->>MW: get_all_realtime_data()
+    MW->>MW: _mark_prediction_dirty()  (取代原 _auto_refresh_prediction)
+    MW->>TBL: render(realtime rows) [setUpdatesEnabled 包裹]
+    TBL-->>MW: 仅 setItem 变化的 cell
+    MW->>TBL: render(pred/history/sub_list) 同理
+    PT->>MW: _auto_update_prediction()
+    alt _prediction_dirty
+        MW->>MW: _run_prediction(silent=True) 后台预测
+        MW->>MW: _prediction_dirty=False
+    else
+        MW->>MW: 跳过（不重复起 Worker）
+    end

@@ -124,3 +124,12 @@ COLORS = {
     "success": "#3fb950",
     "border": "#30363d",
 }
+
+# ── 三项优化（T01）：图表/缓存/轴分类 可调常量 ──────────────────────────────
+FIG_DPI = 80                      # 预测图 figure DPI（下调以降资源占用，Win7 兼容）
+SERIES_CAP = 12                   # 同图曲线数量上限，超出自动隐藏多余并提示
+HISTORY_TTL = 86400               # 历史数据缓存有效期（秒）= 24 小时
+THROTTLE_MS = 250                 # 刷新节流合并窗口（毫秒）
+HISTORY_INDEX = 1                 # 历史取数时间类型：1=小时
+RIGHT_AXIS_PARAMS = {"pH值", "烟气温度", "水温"}  # 走右轴(twinx)的参数集合
+EMPTY_PLACEHOLDER = "暂无数据"    # 空态占位文案

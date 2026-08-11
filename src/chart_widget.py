@@ -4,12 +4,15 @@ GZ安环监测系统 - 图表组件
 使用 matplotlib 替代 WebEngine，Windows 7 兼容
 支持点击图例隐藏/显示曲线，默认都不选中
 支持鼠标悬停显示数值（精准 annotate + 竖线跟踪）
+支持双 Y 轴（twinx）与归一化（三项优化 T01）
 """
 
 import os
 import re
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QScrollArea, QFrame, QLabel
 from PyQt5.QtCore import Qt, QPoint
+
+from config import FIG_DPI
 
 # 设置 matplotlib 使用 Qt5 后端
 import matplotlib
@@ -79,8 +82,19 @@ def _fmt_tooltip_time(time_str):
     return date_part
 
 
+def _normalize_series(data):
+    """把一条 series 的数据做各自 min-max 映射到 [0,1]（None 保持不变）。"""
+    vals = [v for v in data if v is not None]
+    if not vals:
+        return list(data)
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        return [0.0 if v is not None else None for v in data]
+    return [(v - lo) / (hi - lo) if v is not None else None for v in data]
+
+
 class HoverFigureCanvas(FigureCanvasQTAgg):
-    """支持鼠标悬停的 Canvas（使用 annotate + 竖线跟踪）"""
+    """支持鼠标悬停的 Canvas（使用 annotate + 竖线跟踪），兼容双 Y 轴。"""
 
     def __init__(self, figure):
         super().__init__(figure)
@@ -107,7 +121,12 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
 
     # ── 内部工具 ──────────────────────────────────────────────────────────────
     def _get_ax(self):
+        """返回主（左）轴，兼容双轴场景。"""
         return self.figure.axes[0] if self.figure.axes else None
+
+    def _get_ax_list(self):
+        """返回所有 axes（双轴场景含左轴与右轴）。"""
+        return self.figure.axes
 
     def _hide_tooltip(self):
         """清除所有悬停装饰"""
@@ -126,8 +145,18 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
             self.draw_idle()
 
     def _on_hover(self, event):
-        ax = self._get_ax()
-        if ax is None or event.inaxes != ax:
+        axes = self.figure.axes
+        if not axes:
+            self._hide_tooltip()
+            return
+
+        # 找到鼠标所在的轴（任一轴均可）
+        cur_ax = None
+        for a in axes:
+            if event.inaxes == a:
+                cur_ax = a
+                break
+        if cur_ax is None:
             self._hide_tooltip()
             return
 
@@ -141,8 +170,13 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
         idx = int(round(xdata))
         idx = max(0, min(idx, n - 1))
 
-        # 收集所有可见线条在该点的值
-        visible_lines = [ln for ln in ax.lines if ln.get_visible() and not ln.get_label().startswith('_')]
+        # 聚合所有 axes 上的可见线条（跨双轴）
+        visible_lines = []
+        for a in axes:
+            visible_lines.extend([
+                ln for ln in a.lines
+                if ln.get_visible() and not ln.get_label().startswith('_')
+            ])
         if not visible_lines:
             self._hide_tooltip()
             return
@@ -171,12 +205,13 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
 
         time_str = self._times[idx] if idx < len(self._times) else ''
 
-        # ── 更新竖线 ────────────────────────────────────────────────────────
+        # ── 更新竖线（画在主轴上，双轴共享 X，视觉贯穿全图） ───────────────
         if self._vline and self._vline.axes:
             self._vline.set_xdata([idx, idx])
             self._vline.set_visible(True)
         else:
-            self._vline = ax.axvline(x=idx, color='gray', linestyle='--', linewidth=0.8, alpha=0.6, zorder=2)
+            self._vline = axes[0].axvline(x=idx, color='gray', linestyle='--',
+                                          linewidth=0.8, alpha=0.6, zorder=2)
 
         # ── 清除旧高亮圆点 ───────────────────────────────────────────────────
         for dot in self._dot_artists:
@@ -186,14 +221,14 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
                 pass
         self._dot_artists = []
 
-        # ── 画高亮圆点 ───────────────────────────────────────────────────────
-        for label, yv, color in rows:
+        # ── 画高亮圆点（落在各自所属轴上，保证位置正确） ───────────────────
+        for k, (label, yv, color) in enumerate(rows):
             if yv is not None:
-                dot, = ax.plot(idx, yv, 'o', color=color, markersize=6, zorder=5)
+                owner = getattr(visible_lines[k], '_owner_ax', axes[0])
+                dot, = owner.plot(idx, yv, 'o', color=color, markersize=6, zorder=5)
                 self._dot_artists.append(dot)
 
         # ── 构建 tooltip 文本 ────────────────────────────────────────────────
-        # 时间行：显示完整年月日 + 时间（如 "2026-03-25 14:00"）
         time_display = _fmt_tooltip_time(time_str)
         time_lines = time_display.split('\n')
         max_time_len = max(len(l) for l in time_lines)
@@ -205,13 +240,22 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
         text = "\n".join(lines_text)
 
         # ── 确定 tooltip 位置（偏右上，超出右边界则偏左） ───────────────────
+        ax = axes[0]
         x_lim = ax.get_xlim()
         y_lim = ax.get_ylim()
         x_range = x_lim[1] - x_lim[0]
         y_range = y_lim[1] - y_lim[0]
 
-        # tooltip 锚点在最上方有效值附近
-        anchor_y = max(valid_y)
+        # tooltip 锚点：优先用左轴可见线的最高值，避免双轴量纲不一致导致错位
+        left_visible = [
+            ln for ln in ax.lines
+            if ln.get_visible() and not ln.get_label().startswith('_')
+        ]
+        left_y = [ln.get_ydata()[idx] for ln in left_visible
+                  if idx < len(ln.get_ydata())
+                  and ln.get_ydata()[idx] is not None
+                  and ln.get_ydata()[idx] == ln.get_ydata()[idx]]
+        anchor_y = max(left_y) if left_y else y_lim[1]
 
         # 偏移量（数据坐标）
         x_off = x_range * 0.015
@@ -252,7 +296,7 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
 
 
 class ChartWidget(QWidget):
-    """图表组件（使用 Matplotlib，支持交互式图例和鼠标悬停）"""
+    """图表组件（使用 Matplotlib，支持交互式图例和鼠标悬停，支持双 Y 轴/归一化）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -278,8 +322,8 @@ class ChartWidget(QWidget):
 
         self._main_layout.addWidget(self._scroll_area)
 
-        # 创建 matplotlib 图形
-        self.figure = Figure(figsize=(8, 4), dpi=100)
+        # 创建 matplotlib 图形（T01：dpi=FIG_DPI，figsize 略缩以降低资源占用）
+        self.figure = Figure(figsize=(7.6, 3.8), dpi=FIG_DPI)
         self.canvas = HoverFigureCanvas(self.figure)
         self._main_layout.addWidget(self.canvas)
 
@@ -287,72 +331,144 @@ class ChartWidget(QWidget):
         self._current_times = []
         self._current_series_list = []
         self._current_title = ""
-        self._lines = {}      # 存储线条对象
-        self._checkboxes = {} # 存储复选框对象
+        self._lines = {}          # 左轴线条对象
+        self._checkboxes = {}     # 左轴复选框对象
+        self._right_lines = {}    # 右轴线条对象（twinx）
+        self._right_checkboxes = {}  # 右轴复选框对象
+        self._normalize_active = False  # 是否处于归一化模式
 
-    def plot_series(self, times, series_list, title="数据曲线"):
-        """绘制多条曲线，默认都不显示，通过复选框控制"""
+    def _make_checkbox(self, name, color):
+        """创建一条曲线的彩色 QCheckBox 并连接显隐信号。"""
+        checkbox = QCheckBox(name)
+        checkbox.setChecked(False)
+        r, g, b = int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
+        checkbox.setStyleSheet(f"""
+            QCheckBox {{
+                color: rgb({r}, {g}, {b});
+                font-weight: bold;
+                font-size: 12px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+            }}
+        """)
+        checkbox.stateChanged.connect(
+            lambda state, nm=name: self._toggle_line(nm, state)
+        )
+        return checkbox
+
+    def plot_series(self, times, series_list, title="数据曲线",
+                    right_series_list=None, right_ylabel="", normalize=False):
+        """绘制多条曲线，默认都不显示，通过复选框控制。
+
+        Args:
+            times: 公共 X 轴时间标签列表。
+            series_list: 左轴 series 列表，元素 ``{name, data, times?}``。
+            title: 图表标题。
+            right_series_list: 右轴(twinx) series 列表，元素同 series_list；
+                默认 None 表示单轴。
+            right_ylabel: 右轴 Y 轴标题。
+            normalize: True 时所有 series 各自 min-max 映射到 [0,1]，强制单轴
+                （忽略右轴）。默认 False（双轴/单轴按 right_series_list 决定）。
+        """
+        normalize = bool(normalize)
+        right_list = list(right_series_list) if right_series_list else []
+
         # 保存当前数据
         self._current_times = times
         self._current_series_list = series_list
         self._current_title = title
+        self._normalize_active = normalize
 
         # 清空之前的图形和复选框
         self.figure.clear()
         self._lines = {}
+        self._right_lines = {}
 
         # 清除旧复选框
-        for checkbox in self._checkboxes.values():
+        for checkbox in list(self._checkboxes.values()) + list(self._right_checkboxes.values()):
             checkbox.deleteLater()
         self._checkboxes = {}
+        self._right_checkboxes = {}
 
-        # 清除旧复选框布局中的弹性空间
         while self._checkbox_layout.count():
             item = self._checkbox_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        # 创建子图
+        # 创建子图（主轴）
         ax = self.figure.add_subplot(111)
-
-        # ── 绘制曲线（默认不可见） ────────────────────────────────────────────
         colors = plt.cm.tab10.colors
-        x_indices = list(range(len(times)))
 
-        for i, series in enumerate(series_list):
-            color = colors[i % len(colors)]
-            line, = ax.plot(
-                x_indices,
-                series['data'],
-                marker='o',
-                markersize=3,
-                linewidth=1.8,
-                label=series['name'],
-                color=color,
-                visible=False,
-            )
-            self._lines[series['name']] = line
+        # 归一化模式：所有 series 合并到单轴并各自缩放到 [0,1]
+        if normalize:
+            all_series = list(series_list or []) + right_list
+            for i, series in enumerate(all_series):
+                color = colors[i % len(colors)]
+                ndata = _normalize_series(series.get('data', []))
+                line, = ax.plot(
+                    list(range(len(times))),
+                    ndata,
+                    marker='o',
+                    markersize=3,
+                    linewidth=1.8,
+                    label=series['name'],
+                    color=color,
+                    visible=False,
+                )
+                line._owner_ax = ax
+                self._lines[series['name']] = line
 
-            # 创建对应复选框
-            checkbox = QCheckBox(series['name'])
-            checkbox.setChecked(False)
-            r, g, b = int(color[0]*255), int(color[1]*255), int(color[2]*255)
-            checkbox.setStyleSheet(f"""
-                QCheckBox {{
-                    color: rgb({r}, {g}, {b});
-                    font-weight: bold;
-                    font-size: 12px;
-                }}
-                QCheckBox::indicator {{
-                    width: 14px;
-                    height: 14px;
-                }}
-            """)
-            checkbox.stateChanged.connect(
-                lambda state, name=series['name']: self._toggle_line(name, state)
-            )
-            self._checkboxes[series['name']] = checkbox
-            self._checkbox_layout.addWidget(checkbox)
+                checkbox = self._make_checkbox(series['name'], color)
+                self._checkboxes[series['name']] = checkbox
+                self._checkbox_layout.addWidget(checkbox)
+
+            ax.set_ylabel("归一化数值 (0-1)", fontsize=9)
+        else:
+            # 左轴 series
+            for i, series in enumerate(series_list or []):
+                color = colors[i % len(colors)]
+                line, = ax.plot(
+                    list(range(len(times))),
+                    series.get('data', []),
+                    marker='o',
+                    markersize=3,
+                    linewidth=1.8,
+                    label=series['name'],
+                    color=color,
+                    visible=False,
+                )
+                line._owner_ax = ax
+                self._lines[series['name']] = line
+
+                checkbox = self._make_checkbox(series['name'], color)
+                self._checkboxes[series['name']] = checkbox
+                self._checkbox_layout.addWidget(checkbox)
+
+            # 右轴 series（twinx）
+            ax2 = None
+            if right_list:
+                ax2 = ax.twinx()
+                for i, series in enumerate(right_list):
+                    color = colors[(len(series_list or []) + i) % len(colors)]
+                    line, = ax2.plot(
+                        list(range(len(times))),
+                        series.get('data', []),
+                        marker='s',
+                        markersize=3,
+                        linewidth=1.8,
+                        label=series['name'],
+                        color=color,
+                        visible=False,
+                    )
+                    line._owner_ax = ax2
+                    self._right_lines[series['name']] = line
+
+                    checkbox = self._make_checkbox(series['name'], color)
+                    self._right_checkboxes[series['name']] = checkbox
+                    self._checkbox_layout.addWidget(checkbox)
+                ax2.set_ylabel(right_ylabel or "右轴", fontsize=9)
 
         self._checkbox_layout.addStretch()
 
@@ -361,7 +477,7 @@ class ChartWidget(QWidget):
         if num_points == 0:
             pass
         elif num_points <= 12:
-            ax.set_xticks(x_indices)
+            ax.set_xticks(list(range(num_points)))
             ax.set_xticklabels([_fmt_time_label(t) for t in times],
                                rotation=0, ha='center', fontsize=8)
         else:
@@ -374,7 +490,8 @@ class ChartWidget(QWidget):
 
         # ── 图表装饰 ──────────────────────────────────────────────────────────
         ax.set_title(title, fontsize=11, fontweight='bold', pad=8)
-        ax.set_ylabel("数值", fontsize=9)
+        if not normalize:
+            ax.set_ylabel("数值", fontsize=9)
         ax.grid(True, alpha=0.25, linestyle='--')
         ax.tick_params(axis='y', labelsize=8)
 
@@ -388,26 +505,62 @@ class ChartWidget(QWidget):
         self.canvas.draw()
 
     def _toggle_line(self, series_name, state):
-        """切换线条显示/隐藏"""
+        """切换线条显示/隐藏（兼容双轴）。"""
+        target = None
         if series_name in self._lines:
-            self._lines[series_name].set_visible(state == Qt.Checked)
+            target = self._lines[series_name]
+        elif series_name in self._right_lines:
+            target = self._right_lines[series_name]
+
+        if target is not None:
+            target.set_visible(state == Qt.Checked)
             self._auto_scale()
             self.canvas.draw()
 
     def _auto_scale(self):
-        """自动调整 Y 轴范围"""
-        ax = self.figure.axes[0] if self.figure.axes else None
-        if not ax:
+        """自动调整 Y 轴范围（兼容双轴与归一化）。"""
+        axes = self.figure.axes
+        if not axes:
             return
+        ax = axes[0]
 
-        visible_lines = [ln for ln in self._lines.values() if ln.get_visible()]
-        if not visible_lines:
+        # 归一化模式：固定 0-1，跳过缩放
+        norm_mode = bool(getattr(self, '_normalize_active', False))
+
+        # 左轴缩放
+        visible_left = [ln for ln in self._lines.values() if ln.get_visible()]
+        if visible_left and not norm_mode:
+            all_y = self._collect_y(visible_left)
+            if all_y:
+                y_min, y_max = min(all_y), max(all_y)
+                margin = (y_max - y_min) * 0.12 if y_max != y_min else 1
+                ax.set_ylim(y_min - margin, y_max + margin)
+            else:
+                ax.set_ylim(0, 1)
+        else:
             ax.set_ylim(0, 1)
-            self.canvas.draw()
-            return
 
+        # 右轴缩放
+        if len(axes) > 1:
+            ax2 = axes[1]
+            visible_right = [ln for ln in self._right_lines.values() if ln.get_visible()]
+            if visible_right and not norm_mode:
+                all_y = self._collect_y(visible_right)
+                if all_y:
+                    y_min, y_max = min(all_y), max(all_y)
+                    margin = (y_max - y_min) * 0.12 if y_max != y_min else 1
+                    ax2.set_ylim(y_min - margin, y_max + margin)
+                else:
+                    ax2.set_ylim(0, 1)
+            else:
+                ax2.set_ylim(0, 1)
+
+        self.canvas.draw()
+
+    @staticmethod
+    def _collect_y(lines):
         all_y = []
-        for ln in visible_lines:
+        for ln in lines:
             for y in ln.get_ydata():
                 if y is not None:
                     try:
@@ -415,13 +568,7 @@ class ChartWidget(QWidget):
                             all_y.append(y)
                     except Exception:
                         pass
-
-        if all_y:
-            y_min, y_max = min(all_y), max(all_y)
-            margin = (y_max - y_min) * 0.12 if y_max != y_min else 1
-            ax.set_ylim(y_min - margin, y_max + margin)
-
-        self.canvas.draw()
+        return all_y
 
     def clear(self):
         """清空图表"""
@@ -429,10 +576,12 @@ class ChartWidget(QWidget):
         self._current_series_list = []
         self._current_title = ""
         self._lines = {}
+        self._right_lines = {}
 
-        for checkbox in self._checkboxes.values():
+        for checkbox in list(self._checkboxes.values()) + list(self._right_checkboxes.values()):
             checkbox.deleteLater()
         self._checkboxes = {}
+        self._right_checkboxes = {}
 
         while self._checkbox_layout.count():
             item = self._checkbox_layout.takeAt(0)
@@ -441,6 +590,7 @@ class ChartWidget(QWidget):
 
         self.figure.clear()
         ax = self.figure.add_subplot(111)
+        self._normalize_active = False
         ax.text(0.5, 0.5, '暂无数据',
                 horizontalalignment='center',
                 verticalalignment='center',
