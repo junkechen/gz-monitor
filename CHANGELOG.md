@@ -1,6 +1,27 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.21（2026-08-12）✅ 当前版本
+## v5.22（2026-08-12）✅ 当前版本
+
+### ✨ 新增（首次启动教学演示）
+- **首登自动引导**：复用语已有的 `user_data_manager.is_first_run()` / `mark_first_run_completed()`，仅在**首次打开应用**时自动触发一次引导，之后本地存储标记（`%APPDATA%/GZ_Monitor/app_info.json` 的 `first_run` 字段），再次打开不再重复
+- **本地存储标记**：演示完成或点击「跳过」即写入 `first_run: false` + `onboarding_version`，跨重启/跨会话持久化，纯本地、无需联网
+- **8 步产品巡览**：排放口列表 → 实时监测数据 → 切换功能页签 → 开始预测 → 预测结果表 → 对比参数选择器 → 归一化开关 → 对比模式，覆盖核心闭环
+- **半透明遮罩 + 聚光灯挖洞 + 脉冲边框高亮**：自绘实现，不修改任何目标控件样式表，避免破坏暗色主题；底部浮层卡片含「上一步 / 跳过 / 下一步」与步骤计数
+- **帮助菜单「❓ 重看教学演示」**：可随时强制重看（忽略首登标记，`force=True`）
+- **触发位置**：`main.py` 主窗口 `show()` 后延迟 800ms（`QTimer.singleShot`）触发，确保布局稳定后遮罩定位准确
+
+### 🧪 测试
+- **新增 `tests/test_onboarding.py`**：首登 gating 纯逻辑（含 `onboarding_version` 写入）、`build_default_steps` 返回 8 步且锚定真实控件、TourGuide 步进/信号/清理、`start_onboarding` gating 与 force 路径 —— **全部通过**
+  - 注：offscreen 环境下半透明遮罩子控件的 `show()`/`mapTo` 会触发 Qt 段错误（真实显示器无此问题），测试中对几何相关方法打安全补丁，仅验证逻辑；真实聚光灯/脉冲视觉由用户在本机验收
+- **更新 `tests/smoke_main_window.py`**：`required_attrs` 增补 `right_panel` 与 `pred_btn`（引导高亮所需）
+
+### 📦 产物
+- **产物**: `dist\GZ_Monitor_v5.22_Win7.exe`
+- **提交**: (待提交)
+
+---
+
+## v5.21（2026-08-12）
 
 ### 🔧 改造（预测页布局）
 - **对比参数 / 趋势图改用 `QSplitter(Qt.Vertical)`**：用户可拖拽调大小，解决"趋势图区不能调整大小"的痛点

@@ -147,12 +147,14 @@ def is_first_run() -> bool:
     info = load_app_info()
     return info.get("first_run", True)
 
-def mark_first_run_completed():
-    """标记首次运行已完成"""
+def mark_first_run_completed(onboarding_version: Optional[int] = None):
+    """标记首次运行已完成（并可选记录已看过的引导版本）"""
     info = load_app_info()
     info["first_run"] = False
     from datetime import datetime
     info["install_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if onboarding_version is not None:
+        info["onboarding_version"] = onboarding_version
     save_app_info(info)
 
 def update_last_run():

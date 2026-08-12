@@ -66,6 +66,8 @@ def main():
         "param_picker",
         # v5.21：选择器+趋势图用 QSplitter 包裹，header 增加已选计数
         "_pred_chart_splitter", "pred_chart_selected_label",
+        # v5.22：右侧功能页签容器 / 开始预测按钮 提升为 self（引导高亮需要）
+        "right_panel", "pred_btn",
         "refresh_timer", "prediction_timer",
     ]
     missing = [a for a in required_attrs if not hasattr(w, a)]

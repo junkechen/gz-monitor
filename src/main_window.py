@@ -72,6 +72,10 @@ from history_fetch_worker import HistoryFetchWorker, make_history_cache_key
 from pred_param_selector import ParamPickerPanel
 import traceback
 
+# 教学引导版本号：变更引导内容后递增此值，并结合 app_info.onboarding_version
+# 可强制已看过旧版引导的用户重看新版本。
+ONBOARDING_VERSION = 1
+
 
 # ── 后台预测线程 ──────────────────────────────────────────────────────────────
 class PredictionWorker(QThread):
@@ -1192,7 +1196,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(left_container)
 
         # 右侧：主内容区
-        right_panel = QTabWidget()
+        self.right_panel = QTabWidget()
         right_tab_style = f"""
             QTabWidget::pane {{
                 border: 2px solid {COLORS['primary']};
@@ -1200,29 +1204,29 @@ class MainWindow(QMainWindow):
                 background: {COLORS['bg_card']};
             }}
         """
-        right_panel.setStyleSheet(right_tab_style)
+        self.right_panel.setStyleSheet(right_tab_style)
 
         # Tab 1: 实时监控
         self.realtime_tab = self._create_realtime_tab()
-        right_panel.addTab(self.realtime_tab, "📊 实时监控")
+        self.right_panel.addTab(self.realtime_tab, "📊 实时监控")
 
         # Tab 2: 历史数据
         self.history_tab = self._create_history_tab()
-        right_panel.addTab(self.history_tab, "📈 历史数据")
+        self.right_panel.addTab(self.history_tab, "📈 历史数据")
 
         # Tab 3: 数据预测
         self.prediction_tab = self._create_prediction_tab()
-        right_panel.addTab(self.prediction_tab, "🔮 数据预测")
+        self.right_panel.addTab(self.prediction_tab, "🔮 数据预测")
 
         # Tab 4: 预警设置
         self.settings_tab = self._create_settings_tab()
-        right_panel.addTab(self.settings_tab, "⚙️ 系统设置")
+        self.right_panel.addTab(self.settings_tab, "⚙️ 系统设置")
 
         # 添加tab切换事件处理，确保图表在切换时正确显示
-        right_panel.currentChanged.connect(self._on_tab_changed)
+        self.right_panel.currentChanged.connect(self._on_tab_changed)
 
         # 右侧添加到主布局
-        main_layout.addWidget(right_panel, 1)  # 右侧自动拉伸
+        main_layout.addWidget(self.right_panel, 1)  # 右侧自动拉伸
 
         # 状态栏
         self.statusBar().setStyleSheet(f"""
@@ -1757,10 +1761,10 @@ class MainWindow(QMainWindow):
         pred_layout.addSpacing(10)
 
         # 开始预测按钮
-        pred_btn = QPushButton("🚀 开始预测")
-        pred_btn.clicked.connect(self._run_prediction)
-        pred_btn.setMinimumWidth(120)
-        pred_layout.addWidget(pred_btn)
+        self.pred_btn = QPushButton("🚀 开始预测")
+        self.pred_btn.clicked.connect(self._run_prediction)
+        self.pred_btn.setMinimumWidth(120)
+        pred_layout.addWidget(self.pred_btn)
 
         pred_layout.addSpacing(10)
 
@@ -5584,6 +5588,10 @@ class MainWindow(QMainWindow):
         about_action = help_menu.addAction("ℹ️ 关于")
         about_action.triggered.connect(self._show_about)
 
+        # 重看教学演示（强制触发引导，忽略首登标记）
+        tutorial_action = help_menu.addAction("❓ 重看教学演示")
+        tutorial_action.triggered.connect(lambda: self.start_onboarding(force=True))
+
     def _relogin(self):
         """重新登录"""
         reply = QMessageBox.question(
@@ -5722,6 +5730,52 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "成功", "密码修改成功！")
             else:
                 QMessageBox.warning(self, "错误", "密码修改失败")
+
+    # ── 首次启动教学引导 ────────────────────────────────────────────────────
+    def start_onboarding(self, force=False):
+        """启动首次启动教学引导。
+
+        force=True 时忽略首登标记，强制展示（用于「重看教学演示」菜单）。
+        引导结束后通过 finished 信号调用 _on_onboarding_finished 写入标记。
+        """
+        # 防重复：已有引导实例则不重复创建
+        if getattr(self, "_tour", None) is not None:
+            return
+        if not force:
+            try:
+                from user_data_manager import is_first_run
+                if not is_first_run():
+                    return
+            except Exception:
+                pass
+        try:
+            from onboarding import TourGuide, build_default_steps
+            steps = build_default_steps(self)
+            self._tour = TourGuide(self, steps)
+            self._tour.finished.connect(self._on_onboarding_finished)
+            self._tour.start()
+        except Exception as e:
+            logger.error(f"[ONBOARDING] 启动引导失败: {e}")
+            self._tour = None
+
+    def _on_onboarding_finished(self):
+        """引导结束（完成或跳过）：写入首登标记并清理。"""
+        try:
+            from user_data_manager import mark_first_run_completed
+            mark_first_run_completed(ONBOARDING_VERSION)
+        except Exception as e:
+            logger.error(f"[ONBOARDING] 写入首登标记失败: {e}")
+        tour = getattr(self, "_tour", None)
+        if tour is not None:
+            try:
+                self.removeEventFilter(tour)
+            except Exception:
+                pass
+            try:
+                tour.deleteLater()
+            except Exception:
+                pass
+            self._tour = None
 
     def _show_about(self):
         """显示关于信息"""

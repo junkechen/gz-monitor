@@ -107,6 +107,14 @@ def main():
                         print(">>> 显示主窗口...")
                         _main_window.show()
                         print(">>> 主窗口已显示")
+
+                        # 首次启动教学引导：延迟触发，等主窗口布局稳定后展示遮罩
+                        try:
+                            from user_data_manager import is_first_run
+                            if is_first_run():
+                                QTimer.singleShot(800, _main_window.start_onboarding)
+                        except Exception:
+                            pass
                     except Exception as e:
                         print(f">>> 创建主窗口失败: {e}")
                         import traceback
