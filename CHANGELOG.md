@@ -1,6 +1,32 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.19.1（2026-08-12）✅ 当前版本
+## v5.20（2026-08-12）✅ 当前版本
+
+### ✨ 新增
+- **指标选择器全面重构**：原"对比参数"为一长条横向滚动（12+ 指标挤一行，难以筛选），重构为**嵌页式双栏选择器**（`ParamPickerPanel`）：
+  - **左侧分类导航**：📋 全部指标 / 🔥 废气参数 / 💧 废水参数 / 📊 双轴参数 / ✅ 已选(N) / 🗂️ 其他指标，分类按 `PARAM_CATEGORIES` 自动归类，每个分类后附实时计数（如"🔥 废气参数(6)"）
+  - **右侧多选 checklist**：可勾选指标，独立双栏布局，可拖动 splitter 调整左右比例
+  - **顶部实时搜索框**：输入关键字即时过滤（模糊匹配："烟" → 烟气温度、烟气流量；"pH" → pH值）
+  - **保留**：全选 / 反选 / 清空 / 计数提示
+- **新的响应式伸缩**：预测结果区与趋势图区的拉伸比调整为 1:2（趋势图获得更大空间）；分类导航固定 170px，可拖动 splitter 重新分配
+- **空态占位**：搜索结果为空时右侧显示"（当前分类下无匹配指标）"占位，避免 UI 错位
+- **新增参数分类映射**：`config.PARAM_CATEGORIES`（12 个废气 + 7 个废水参数，含已知的扩展指标如"水温"、"累计流量"）
+- **新增 9 项 `ParamPickerPanel` 单测**：实例化、去重保序、分类切换、搜索过滤、全选/反选/清空、信号触发、空态、双轴兜底，全部通过
+- **新增 6 张视觉回归截图**：`tests/screenshots/panel_{all,gas,water,selected,search_y烟,narrow}.png`，方便后续改动对比
+
+### 🔧 改造
+- `main_window.py`：用 `ParamPickerPanel` 替换原横向滚动 `QListWidget`；7 处回调（`_get_checked_compare_params` / `_on_compare_params_changed` / `_on_pred_mode_changed` / `_on_normalize_toggled` / `_select_all_params` / `_invert_params` / `_clear_params`）改用新接口
+- `_on_compare_params_changed` 现在接收 `selected_changed(list[str])` 信号载荷，可空参数仍向后兼容
+- `pred_param_list` 属性移除（已被 `param_picker` 取代），冒烟测试同步更新
+- `_populate_compare_list` 简化为 `set_available_params + set_selected(prev)`
+
+### 📦 产物
+- **提交**: (待提交)
+- **产物**: `dist\GZ_Monitor_v5.20_Win7.exe`（待打包）
+
+---
+
+## v5.19.1（2026-08-12）
 
 ### 🔧 热修复
 - **Bug**: v5.19 启动崩溃。登录后创建主窗口失败，错误 `AttributeError: 'MainWindow' object has no attribute '_pred_chart_mode'`

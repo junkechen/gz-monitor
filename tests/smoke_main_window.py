@@ -61,7 +61,9 @@ def main():
         "_pred_chart_dirty", "_pred_chart_visible", "_prediction_dirty",
         "_last_pred_horizon", "_refresh_last_flush", "_refresh_timer_coalesce",
         "_hist_worker", "_hist_results", "_history_cache", "_rt_diff",
-        "pred_mode_combo", "realtime_table", "pred_param_list",
+        "pred_mode_combo", "realtime_table",
+        # v5.20：横向滚动 ListWidget 已替换为 ParamPickerPanel
+        "param_picker",
         "refresh_timer", "prediction_timer",
     ]
     missing = [a for a in required_attrs if not hasattr(w, a)]
@@ -70,6 +72,24 @@ def main():
         print(f"[FAIL] 关键属性缺失: {missing}")
     else:
         print("[OK] 全部关键属性已初始化")
+
+    # 2.5) v5.20 验证：param_picker 是 ParamPickerPanel 类型 + 关键子组件齐全
+    try:
+        from pred_param_selector import ParamPickerPanel
+        if isinstance(w.param_picker, ParamPickerPanel):
+            print("[OK] param_picker 是 ParamPickerPanel 类型（v5.20 双栏选择器）")
+        else:
+            errors.append(("param_picker 类型错误", f"got {type(w.param_picker)}", ""))
+            print("[FAIL] param_picker 不是 ParamPickerPanel 类型")
+        for sub in ("category_list", "param_list", "search_edit",
+                    "status_label", "splitter"):
+            has = hasattr(w.param_picker, sub)
+            print(f"  - param_picker.{sub}: {'OK' if has else 'MISSING'}")
+            if not has:
+                errors.append((f"param_picker 缺子组件 {sub}", "", ""))
+    except Exception as e:  # noqa: BLE001
+        errors.append(("param_picker 检查", repr(e), traceback.format_exc()))
+        print(f"[FAIL] param_picker 检查异常: {e}")
 
     # 3) 尝试一次预测图绘制入口（不依赖网络数据，应安全降级）
     try:

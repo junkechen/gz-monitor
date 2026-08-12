@@ -69,6 +69,7 @@ from config import (COLORS, WATER_DISPLAY_PARAMS, GAS_DISPLAY_PARAMS, RIGHT_AXIS
                     HISTORY_TTL, HISTORY_INDEX, SERIES_CAP, FIG_DPI, THROTTLE_MS, EMPTY_PLACEHOLDER)
 from refresh_utils import TableDiff, classify_axis
 from history_fetch_worker import HistoryFetchWorker, make_history_cache_key
+from pred_param_selector import ParamPickerPanel
 import traceback
 
 
@@ -1922,6 +1923,7 @@ class MainWindow(QMainWindow):
 
         pred_result_layout.addWidget(pred_result_header)
         pred_result_layout.addWidget(self.pred_result_content, 1)
+        # v5.20：结果区紧凑，趋势图区占比更大（1:2 拉伸比）
         layout.addWidget(self.pred_result_section, 1)
 
         # ── 预测图表区域（含折叠标题栏）───────────────────────────────────
@@ -1979,63 +1981,37 @@ class MainWindow(QMainWindow):
         pred_chart_content_layout.setContentsMargins(0, 4, 0, 0)
         pred_chart_content_layout.setSpacing(0)
 
-        # ── 三项优化 T02：多指标对比参数面板（可勾选 QListWidget）────────────
+        # ── v5.20 三项优化 T06：嵌页式双栏"对比参数"选择器（搜索+分类）────────────
+        # 取代原横向扁平 QListWidget（指标全挤一行、无法搜索分类）
         self.pred_compare_panel = QWidget()
         compare_layout = QHBoxLayout(self.pred_compare_panel)
         compare_layout.setContentsMargins(4, 4, 4, 4)
         compare_layout.setSpacing(8)
 
-        param_lbl = QLabel("对比参数:")
-        param_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 12px;")
+        param_lbl = QLabel("📋 对比参数")
+        param_lbl.setStyleSheet(
+            f"color: {COLORS['text_primary']}; font-size: 12px; font-weight: bold;"
+        )
+        param_lbl.setMinimumWidth(80)
         compare_layout.addWidget(param_lbl)
 
-        self.pred_param_list = QListWidget()
-        self.pred_param_list.setFlow(QListWidget.LeftToRight)
-        self.pred_param_list.setWrapping(False)
-        self.pred_param_list.setSpacing(4)
-        self.pred_param_list.setFixedHeight(40)
-        self.pred_param_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.pred_param_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.pred_param_list.setSelectionMode(QListWidget.NoSelection)
-        self.pred_param_list.setStyleSheet(f"""
-            QListWidget {{
-                background: {COLORS['bg_input']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 4px;
-            }}
-            QListWidget::item {{ color: {COLORS['text_primary']}; spacing: 4px; }}
-        """)
-        self.pred_param_list.itemChanged.connect(self._on_compare_params_changed)
-        compare_layout.addWidget(self.pred_param_list, 1)
+        # 中间：v5.20 新选择器（含搜索/分类/全选/反选/清空/计数）
+        self.param_picker = ParamPickerPanel()
+        self.param_picker.selected_changed.connect(self._on_compare_params_changed)
+        compare_layout.addWidget(self.param_picker, 1)
 
-        # 全选 / 反选 / 清空
-        self.pred_select_all_btn = QPushButton("全选")
-        self.pred_invert_btn = QPushButton("反选")
-        self.pred_clear_btn = QPushButton("清空")
-        for _b in (self.pred_select_all_btn, self.pred_invert_btn, self.pred_clear_btn):
-            _b.setFixedHeight(26)
-            _b.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS['bg_input']};
-                    color: {COLORS['text_primary']};
-                    border: 1px solid {COLORS['border']};
-                    border-radius: 4px;
-                    font-size: 12px;
-                    padding: 0 8px;
-                }}
-                QPushButton:hover {{ background: {COLORS['secondary']}; }}
-            """)
-        self.pred_select_all_btn.clicked.connect(self._select_all_params)
-        self.pred_invert_btn.clicked.connect(self._invert_params)
-        self.pred_clear_btn.clicked.connect(self._clear_params)
-        compare_layout.addWidget(self.pred_select_all_btn)
-        compare_layout.addWidget(self.pred_invert_btn)
-        compare_layout.addWidget(self.pred_clear_btn)
+        # 右侧：模式 + 归一化（紧凑的侧栏）
+        side_bar = QWidget()
+        side_layout = QVBoxLayout(side_bar)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(6)
+        side_bar.setMinimumWidth(150)
+        side_bar.setMaximumWidth(200)
 
         # 模式开关：同排口多参数 / 同参数多排口
-        mode_lbl = QLabel("模式:")
-        mode_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 12px;")
-        compare_layout.addWidget(mode_lbl)
+        mode_lbl = QLabel("对比模式:")
+        mode_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 11px;")
+        side_layout.addWidget(mode_lbl)
         self.pred_mode_combo = QComboBox()
         self.pred_mode_combo.addItems(["同排口多参数", "同参数多排口"])
         self.pred_mode_combo.setCurrentText(self._pred_chart_mode)
@@ -2051,12 +2027,12 @@ class MainWindow(QMainWindow):
             }}
         """)
         self.pred_mode_combo.currentTextChanged.connect(self._on_pred_mode_changed)
-        compare_layout.addWidget(self.pred_mode_combo)
+        side_layout.addWidget(self.pred_mode_combo)
 
         # 归一化按钮
         self.pred_normalize_btn = QPushButton("归一化: 关")
         self.pred_normalize_btn.setCheckable(True)
-        self.pred_normalize_btn.setFixedHeight(26)
+        self.pred_normalize_btn.setFixedHeight(28)
         self.pred_normalize_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS['bg_input']};
@@ -2074,7 +2050,16 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ background: {COLORS['secondary']}; }}
         """)
         self.pred_normalize_btn.toggled.connect(self._on_normalize_toggled)
-        compare_layout.addWidget(self.pred_normalize_btn)
+        side_layout.addWidget(self.pred_normalize_btn)
+        side_layout.addStretch()
+
+        compare_layout.addWidget(side_bar, 0)
+
+        # 保留外部"全选 / 反选 / 清空"按钮命名（仅兼容旧引用），但绑定到
+        # param_picker 的同义方法 —— 避免改动 pred_select_all_btn 等多余控件。
+        self.pred_select_all_btn = None  # 已合并到 ParamPickerPanel 内
+        self.pred_invert_btn = None
+        self.pred_clear_btn = None
 
         pred_chart_content_layout.addWidget(self.pred_compare_panel)
 
@@ -2097,7 +2082,8 @@ class MainWindow(QMainWindow):
 
         pred_chart_layout.addWidget(pred_chart_header)
         pred_chart_layout.addWidget(self.pred_chart_content, 1)
-        layout.addWidget(self.pred_chart_section, 1)
+        # v5.20：与上面对应，趋势图区获得更大空间（1:2 拉伸比）
+        layout.addWidget(self.pred_chart_section, 2)
 
         widget.setLayout(layout)
         return widget
@@ -4956,43 +4942,36 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _populate_compare_list(self, params):
-        """用可见排口支持的参数填充可勾选对比面板。
+        """用可见排口支持的参数填充可勾选对比面板（v5.20 ParamPickerPanel）。
 
         保留已有勾选；面板首次为空时默认全勾选（给出初始图表）。
         """
-        lst = getattr(self, 'pred_param_list', None)
-        if lst is None:
+        picker = getattr(self, 'param_picker', None)
+        if picker is None:
             return
-        prev_checked = set()
-        for i in range(lst.count()):
-            it = lst.item(i)
-            if it.checkState() == Qt.Checked:
-                prev_checked.add(it.text())
-        auto_check_all = (lst.count() == 0)
-        lst.blockSignals(True)
-        lst.clear()
-        for p in params:
-            it = QListWidgetItem(p)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            if prev_checked:
-                it.setCheckState(Qt.Checked if p in prev_checked else Qt.Unchecked)
-            else:
-                it.setCheckState(Qt.Checked if auto_check_all else Qt.Unchecked)
-            lst.addItem(it)
-        lst.blockSignals(False)
+        prev_checked = set(picker.get_selected())
+        auto_check_all = (len(prev_checked) == 0)
+        picker.set_available_params(params)
+        if prev_checked:
+            picker.set_selected(prev_checked)
+        elif auto_check_all:
+            picker.set_selected(list(params))
 
     def _get_checked_compare_params(self):
-        """返回当前勾选的对比参数名列表。"""
-        lst = getattr(self, 'pred_param_list', None)
-        if lst is None:
+        """返回当前勾选的对比参数名列表（v5.20 改用 ParamPickerPanel）。"""
+        picker = getattr(self, 'param_picker', None)
+        if picker is None:
             return []
-        return [lst.item(i).text() for i in range(lst.count())
-                if lst.item(i).checkState() == Qt.Checked]
+        return picker.get_selected()
 
-    def _on_compare_params_changed(self):
-        """勾选变化：重算并触发取数/重绘。"""
-        checked = self._get_checked_compare_params()
-        self._draw_pred_chart_multi(checked, self._pred_chart_mode)
+    def _on_compare_params_changed(self, selected=None):
+        """勾选变化：重算并触发取数/重绘。
+
+        v5.20: selected_changed 信号已传入选中列表；旧兼容路径仍接受无参调用。
+        """
+        if selected is None:
+            selected = self._get_checked_compare_params()
+        self._draw_pred_chart_multi(list(selected), self._pred_chart_mode)
 
     def _on_pred_mode_changed(self, mode):
         """模式切换：记录并重绘。"""
@@ -5011,35 +4990,23 @@ class MainWindow(QMainWindow):
         self._draw_pred_chart_multi(checked, self._pred_chart_mode)
 
     def _select_all_params(self):
-        lst = getattr(self, 'pred_param_list', None)
-        if lst is None:
+        picker = getattr(self, 'param_picker', None)
+        if picker is None:
             return
-        lst.blockSignals(True)
-        for i in range(lst.count()):
-            lst.item(i).setCheckState(Qt.Checked)
-        lst.blockSignals(False)
-        self._on_compare_params_changed()
+        picker.select_all()
+        # param_picker 自身会 emit selected_changed，_on_compare_params_changed 已绑定
 
     def _invert_params(self):
-        lst = getattr(self, 'pred_param_list', None)
-        if lst is None:
+        picker = getattr(self, 'param_picker', None)
+        if picker is None:
             return
-        lst.blockSignals(True)
-        for i in range(lst.count()):
-            it = lst.item(i)
-            it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
-        lst.blockSignals(False)
-        self._on_compare_params_changed()
+        picker.invert()
 
     def _clear_params(self):
-        lst = getattr(self, 'pred_param_list', None)
-        if lst is None:
+        picker = getattr(self, 'param_picker', None)
+        if picker is None:
             return
-        lst.blockSignals(True)
-        for i in range(lst.count()):
-            lst.item(i).setCheckState(Qt.Unchecked)
-        lst.blockSignals(False)
-        self._on_compare_params_changed()
+        picker.clear_selection()
 
     def _build_hist_tasks(self, checked_params, mode):
         """按 docs/system_design.md §5 裁定生成 sub_tasks（按 sub 聚合）。
