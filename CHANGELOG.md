@@ -1,6 +1,24 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.22（2026-08-12）✅ 当前版本
+## v5.23（2026-08-12）✅ 当前版本
+
+### 🐛 修复（教学引导在本机不可见）
+- **根因**：v5.22 的 `TourGuide` 被实现为 `MainWindow` 的**子 widget** 并设置了 `WA_TranslucentBackground`。但 Qt 明确该属性**仅对顶层窗口（top-level）生效**，对子 widget 设置后行为未定义，在 Windows 7 上表现为整个遮罩控件透明、不绘制 —— 用户双击后「什么都没发生」，而引导逻辑其实已跑过一次（故 `app_info.json` 已写入 `first_run:false` + `onboarding_version:1`），之后自然不再触发
+- **修复 1**：`TourGuide` 改为**真正的顶层窗口**（`super().__init__()` 无 parent + `Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool`），`WA_TranslucentBackground` 对其生效，且 `WindowStaysOnTopHint` 保证必定置顶、不被主窗口遮挡
+- **修复 2**：聚光灯坐标改用 `target.mapToGlobal(...)`（屏幕坐标）配合 `self.geometry().topLeft()` 换算，遮罩几何用 `self._win.frameGeometry()` 对齐（含标题栏，基准与 `mapToGlobal` 一致）；主窗口 move/resize 时通过 `eventFilter` 自动跟随重定位
+- **修复 3**：首登判定升级为**基于 `onboarding_version` 比对** —— 即「首次运行 或 引导版本已过期」才触发。因 v5.22 用户本机已写 `onboarding_version:1`，本次将 `ONBOARDING_VERSION` 自 `1` 升到 `2`，使其**下次双击即可自动重看一次修复版**；看完即写入 `2` 并锁定，仍只触发一次
+
+### 🧪 测试
+- **更新 `tests/test_onboarding.py`**：`test_start_onboarding_gating` 同步新语义（非首登+同版本不触发 / 版本过期仍触发 / force 强制触发）；docstring 措辞改为「顶层窗口 + mapToGlobal」 —— **全部通过**
+- 4 套测试（smoke / param_picker / chart_splitter / onboarding）全绿
+
+### 📦 产物
+- **产物**: `dist\GZ_Monitor_v5.23_Win7.exe`
+- **提交**: (待提交)
+
+---
+
+## v5.22（2026-08-12）
 
 ### ✨ 新增（首次启动教学演示）
 - **首登自动引导**：复用语已有的 `user_data_manager.is_first_run()` / `mark_first_run_completed()`，仅在**首次打开应用**时自动触发一次引导，之后本地存储标记（`%APPDATA%/GZ_Monitor/app_info.json` 的 `first_run` 字段），再次打开不再重复

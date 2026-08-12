@@ -8,7 +8,7 @@
 3. TourGuide 步进 / 完成 / 信号 / 清理
 4. MainWindow.start_onboarding 的 gating 与 force 路径
 
-注意：离线（offscreen）环境下，半透明遮罩子控件的 show()/mapTo 会触发 Qt 段错误
+注意：离线（offscreen）环境下，半透明遮罩顶层窗口的 mapToGlobal/show() 会触发 Qt 段错误
 （真实显示器无此问题）。因此测试中对几何相关方法打安全补丁，仅验证逻辑，
 真实聚光灯/脉冲视觉效果由用户在 Windows 本机双击 EXE 验收。
 """
@@ -128,23 +128,35 @@ def test_tour_navigation():
 
 def test_start_onboarding_gating():
     from PyQt5.QtWidgets import QApplication
-    from main_window import MainWindow
+    from main_window import MainWindow, ONBOARDING_VERSION
     import user_data_manager as udm
     app = QApplication.instance() or QApplication(sys.argv[:1])
     w = MainWindow(_FakeClient())
 
     orig_is = udm.is_first_run
-    udm.is_first_run = lambda: False
+    orig_load = udm.load_app_info
     try:
+        # 场景1：已首登 + 看过当前版本 → 不触发
+        udm.is_first_run = lambda: False
+        udm.load_app_info = lambda: {"first_run": False, "onboarding_version": ONBOARDING_VERSION}
         w.start_onboarding(force=False)
-        _check(getattr(w, "_tour", None) is None, "非首登 + force=False 时不启动引导")
+        _check(getattr(w, "_tour", None) is None, "非首登+同版本+force=False 时不启动引导")
+
+        # 场景2：已首登 但 引导版本过期 → 仍触发（升级后需重看）
+        udm.load_app_info = lambda: {"first_run": False, "onboarding_version": ONBOARDING_VERSION - 1}
+        w.start_onboarding(force=False)
+        _check(getattr(w, "_tour", None) is not None, "首登版本过期时仍触发引导")
+        if getattr(w, "_tour", None) is not None:
+            w._tour._finish()
+
+        # 场景3：force=True → 强制触发（重看教学菜单）
+        w.start_onboarding(force=True)
+        _check(getattr(w, "_tour", None) is not None, "force=True 时创建引导实例")
+        w._tour._finish()
+        _check(getattr(w, "_tour", None) is None, "_finish 后引导实例已清理")
     finally:
         udm.is_first_run = orig_is
-
-    w.start_onboarding(force=True)
-    _check(getattr(w, "_tour", None) is not None, "force=True 时创建引导实例")
-    w._tour._finish()
-    _check(getattr(w, "_tour", None) is None, "_finish 后引导实例已清理")
+        udm.load_app_info = orig_load
 
 
 def main():

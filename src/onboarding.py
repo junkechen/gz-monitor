@@ -69,7 +69,9 @@ class TourGuide(QWidget):
     finished = pyqtSignal()
 
     def __init__(self, parent_window, steps):
-        super().__init__(parent_window)
+        # 关键修复：必须是顶层窗口（无 parent），WA_TranslucentBackground 才生效。
+        # 之前作为 MainWindow 的子 widget 设置该属性，在 Win7 上整控件透明不可见。
+        super().__init__()
         self._win = parent_window
         self._steps = list(steps) if steps else []
         self._idx = -1
@@ -77,11 +79,17 @@ class TourGuide(QWidget):
         self._pulse = 0.0
         self._phase = 0.0
 
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
 
         self._build_card()
-        self._win.installEventFilter(self)
+        if self._win is not None:
+            self._win.installEventFilter(self)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -155,9 +163,10 @@ class TourGuide(QWidget):
     # ── 控制接口 ──────────────────────────────────────────────────────────
     def start(self):
         """启动引导（覆盖主窗口、定位到第 0 步）。"""
-        self.setGeometry(0, 0, self._win.width(), self._win.height())
+        self._follow_window()
         self.show()
         self.raise_()
+        self.activateWindow()
         self._goto(0)
 
     def _goto(self, idx):
@@ -207,14 +216,21 @@ class TourGuide(QWidget):
         self.finished.emit()
 
     # ── 几何计算 ──────────────────────────────────────────────────────────
+    def _follow_window(self):
+        """把遮罩对齐到主窗口在屏幕上的几何区域（含标题栏，基准与 mapToGlobal 一致）。"""
+        if self._win is None:
+            return
+        self.setGeometry(self._win.frameGeometry())
+
     def _recompute_hole(self):
-        """根据当前步骤目标控件，计算聚光灯矩形（主窗口坐标 → 遮罩坐标）。"""
+        """根据当前步骤目标控件，计算聚光灯矩形（屏幕坐标 → 遮罩坐标）。"""
         self._hole = QRect()
         if 0 <= self._idx < len(self._steps):
             target = self._steps[self._idx].get("target")
-            if target is not None and hasattr(target, "mapTo") and hasattr(target, "size"):
+            if target is not None and hasattr(target, "mapToGlobal") and hasattr(target, "size"):
                 try:
-                    top_left = target.mapTo(self, QPoint(0, 0))
+                    # 控件全局坐标 - 遮罩全局原点 = 相对遮罩坐标
+                    top_left = target.mapToGlobal(QPoint(0, 0)) - self.geometry().topLeft()
                     self._hole = QRect(top_left, target.size()).adjusted(-8, -8, 8, 8)
                 except Exception:
                     self._hole = QRect()
@@ -249,7 +265,7 @@ class TourGuide(QWidget):
     # ── 事件 ──────────────────────────────────────────────────────────────
     def eventFilter(self, obj, event):
         if obj is self._win and event.type() in (QEvent.Type.Resize, QEvent.Type.Move):
-            self.setGeometry(0, 0, self._win.width(), self._win.height())
+            self._follow_window()
             self._recompute_hole()
             self.update()
         return super().eventFilter(obj, event)

@@ -74,7 +74,7 @@ import traceback
 
 # 教学引导版本号：变更引导内容后递增此值，并结合 app_info.onboarding_version
 # 可强制已看过旧版引导的用户重看新版本。
-ONBOARDING_VERSION = 1
+ONBOARDING_VERSION = 2
 
 
 # ── 后台预测线程 ──────────────────────────────────────────────────────────────
@@ -5743,8 +5743,10 @@ class MainWindow(QMainWindow):
             return
         if not force:
             try:
-                from user_data_manager import is_first_run
-                if not is_first_run():
+                from user_data_manager import is_first_run, load_app_info
+                # 首次运行 或 引导版本已过期（升级后仍需再看一次）→ 触发；
+                # 否则（已看过当前版本引导）→ 不重复展示。
+                if not is_first_run() and load_app_info().get("onboarding_version") == ONBOARDING_VERSION:
                     return
             except Exception:
                 pass
