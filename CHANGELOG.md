@@ -8,6 +8,7 @@
 - **修复**: 把依赖 widget 的 `_rt_diff = TableDiff(self.realtime_table)` 之外的纯状态字段，全部上移到 `_init_ui()` 之前初始化；`TableDiff` 仍保留在 `_init_ui()` 之后（依赖 `_init_ui` 中创建的 `realtime_table`）
 - **提交**: `e41f994`
 - **产物**: `dist\GZ_Monitor_v5.19.1_Win7.exe`
+- **回归守卫**: 新增 `tests/smoke_main_window.py`，用 `QT_QPA_PLATFORM=offscreen` 无头实例化 `MainWindow`，验证启动不抛 `AttributeError` 且关键属性齐备；可直接 `python tests/smoke_main_window.py` 运行
 
 ---
 
