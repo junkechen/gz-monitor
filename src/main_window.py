@@ -1970,6 +1970,10 @@ class MainWindow(QMainWindow):
         """)
         self.pred_chart_toggle_btn.clicked.connect(self._toggle_pred_chart)
         pred_chart_header_layout.addWidget(pred_chart_title)
+        self.pred_chart_selected_label = QLabel("已选 0 项")
+        self.pred_chart_selected_label.setStyleSheet(
+            "color: white; font-size: 12px; background: transparent; padding: 0 10px;")
+        pred_chart_header_layout.addWidget(self.pred_chart_selected_label)
         pred_chart_header_layout.addSpacing(12)
         pred_chart_header_layout.addStretch()
         pred_chart_header_layout.addWidget(self.pred_chart_toggle_btn)
@@ -1980,6 +1984,13 @@ class MainWindow(QMainWindow):
         pred_chart_content_layout = QVBoxLayout(self.pred_chart_content)
         pred_chart_content_layout.setContentsMargins(0, 4, 0, 0)
         pred_chart_content_layout.setSpacing(0)
+
+        # v5.21：选择器 + 趋势图改用垂直 QSplitter，用户可拖拽调大小
+        chart_splitter = QSplitter(Qt.Vertical)
+        chart_splitter.setHandleWidth(6)
+        chart_splitter.setChildrenCollapsible(False)
+        self._pred_chart_splitter = chart_splitter
+        pred_chart_content_layout.addWidget(chart_splitter, 1)
 
         # ── v5.20 三项优化 T06：嵌页式双栏"对比参数"选择器（搜索+分类）────────────
         # 取代原横向扁平 QListWidget（指标全挤一行、无法搜索分类）
@@ -2061,7 +2072,7 @@ class MainWindow(QMainWindow):
         self.pred_invert_btn = None
         self.pred_clear_btn = None
 
-        pred_chart_content_layout.addWidget(self.pred_compare_panel)
+        chart_splitter.addWidget(self.pred_compare_panel)
 
         chart_group = QGroupBox()
         chart_group.setStyleSheet(f"""
@@ -2078,7 +2089,14 @@ class MainWindow(QMainWindow):
         self.pred_chart.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         chart_inner.addWidget(self.pred_chart)
         chart_group.setLayout(chart_inner)
-        pred_chart_content_layout.addWidget(chart_group)
+        chart_splitter.addWidget(chart_group)
+
+        # v5.21：默认趋势图占大头（≈140:600），选择器可全折叠、趋势图不可折叠
+        chart_splitter.setStretchFactor(0, 0)
+        chart_splitter.setStretchFactor(1, 1)
+        chart_splitter.setCollapsible(0, True)
+        chart_splitter.setCollapsible(1, False)
+        chart_splitter.setSizes([140, 600])
 
         pred_chart_layout.addWidget(pred_chart_header)
         pred_chart_layout.addWidget(self.pred_chart_content, 1)
@@ -4964,6 +4982,14 @@ class MainWindow(QMainWindow):
             return []
         return picker.get_selected()
 
+    def _update_selected_count_label(self):
+        """刷新趋势图标题栏的「已选 N 项」统计（v5.21）。"""
+        try:
+            n = len(self._get_checked_compare_params())
+            self.pred_chart_selected_label.setText(f"已选 {n} 项")
+        except Exception:
+            pass
+
     def _on_compare_params_changed(self, selected=None):
         """勾选变化：重算并触发取数/重绘。
 
@@ -4972,12 +4998,14 @@ class MainWindow(QMainWindow):
         if selected is None:
             selected = self._get_checked_compare_params()
         self._draw_pred_chart_multi(list(selected), self._pred_chart_mode)
+        self._update_selected_count_label()
 
     def _on_pred_mode_changed(self, mode):
         """模式切换：记录并重绘。"""
         self._pred_chart_mode = mode
         checked = self._get_checked_compare_params()
         self._draw_pred_chart_multi(checked, mode)
+        self._update_selected_count_label()
 
     def _on_normalize_toggled(self, flag):
         """归一化开关：记录并重绘。"""
@@ -4988,6 +5016,7 @@ class MainWindow(QMainWindow):
             pass
         checked = self._get_checked_compare_params()
         self._draw_pred_chart_multi(checked, self._pred_chart_mode)
+        self._update_selected_count_label()
 
     def _select_all_params(self):
         picker = getattr(self, 'param_picker', None)

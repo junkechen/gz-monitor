@@ -203,7 +203,7 @@ class ParamPickerPanel(QWidget):
 
         # 整体 size policy 让 panel 可被外层 splitter 压高/拉高
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.setMinimumHeight(180)
+        self.setMinimumHeight(120)
 
         # 空态初始化分类与右侧
         self._refresh_categories()

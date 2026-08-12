@@ -64,6 +64,8 @@ def main():
         "pred_mode_combo", "realtime_table",
         # v5.20：横向滚动 ListWidget 已替换为 ParamPickerPanel
         "param_picker",
+        # v5.21：选择器+趋势图用 QSplitter 包裹，header 增加已选计数
+        "_pred_chart_splitter", "pred_chart_selected_label",
         "refresh_timer", "prediction_timer",
     ]
     missing = [a for a in required_attrs if not hasattr(w, a)]

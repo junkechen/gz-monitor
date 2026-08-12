@@ -1,6 +1,28 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.20（2026-08-12）✅ 当前版本
+## v5.21（2026-08-12）✅ 当前版本
+
+### 🔧 改造（预测页布局）
+- **对比参数 / 趋势图改用 `QSplitter(Qt.Vertical)`**：用户可拖拽调大小，解决"趋势图区不能调整大小"的痛点
+- **默认趋势图占大头**（比例 ≈ 140:600，约 19% : 81%），首次打开即以图表为主
+- **选择器可完全折叠**（`setCollapsible(0, True)`）、趋势图不可折叠（`setCollapsible(1, False)`）；折叠后趋势图占满内容区
+- **`ParamPickerPanel` 最小高度从 180 降到 120**：默认展开也不挤压趋势图
+- **预测趋势图标题栏新增「已选 N 项」实时统计**：勾选 / 反选 / 清空 / 切模式 / 归一化切换 时同步刷新，折叠选择器后仍可见当前选择
+- **新增方法 `_update_selected_count_label()`**：3 处回调（`_on_compare_params_changed` / `_on_pred_mode_changed` / `_on_normalize_toggled`）末尾调用，行为统一
+
+### 🧪 测试
+- **新增 `tests/test_chart_splitter.py`**：断言 splitter 方向=Vertical、2 窗格、窗格0=对比参数面板、窗格1=含 `pred_chart` 的 QGroupBox；选择器可折叠、趋势图不可折叠；`param_picker.minimumHeight == 120`；`pred_chart_selected_label` 存在 —— **7 项断言全过**
+- **更新 `tests/smoke_main_window.py`**：`required_attrs` 增补 `_pred_chart_splitter` 与 `pred_chart_selected_label`，仍通过
+- **更新 `tests/test_param_picker.py`**：原有 9 项全过，未被改动影响
+- **新增 `tests/render_pred_layout.py`**：offscreen 渲染 3 张截图 `pred_layout_{default,collapsed,picker_big}.png`，验证默认/全折叠/选择器拉大三种 splitter 状态
+
+### 📦 产物
+- **产物**: `dist\GZ_Monitor_v5.21_Win7.exe`（待打包）
+- **提交**: (待提交)
+
+---
+
+## v5.20（2026-08-12）
 
 ### ✨ 新增
 - **指标选择器全面重构**：原"对比参数"为一长条横向滚动（12+ 指标挤一行，难以筛选），重构为**嵌页式双栏选择器**（`ParamPickerPanel`）：
