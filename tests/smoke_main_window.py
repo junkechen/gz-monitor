@@ -81,12 +81,11 @@ def main():
     try:
         from pred_param_selector import ParamPickerPanel
         if isinstance(w.param_picker, ParamPickerPanel):
-            print("[OK] param_picker 是 ParamPickerPanel 类型（v5.20 双栏选择器）")
+            print("[OK] param_picker 是 ParamPickerPanel 类型（v5.25 下拉选择器）")
         else:
             errors.append(("param_picker 类型错误", f"got {type(w.param_picker)}", ""))
             print("[FAIL] param_picker 不是 ParamPickerPanel 类型")
-        for sub in ("category_list", "param_list", "search_edit",
-                    "status_label", "splitter"):
+        for sub in ("toggle_btn", "popup", "search_edit", "_checkboxes"):
             has = hasattr(w.param_picker, sub)
             print(f"  - param_picker.{sub}: {'OK' if has else 'MISSING'}")
             if not has:

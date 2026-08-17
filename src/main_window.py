@@ -2003,14 +2003,7 @@ class MainWindow(QMainWindow):
         compare_layout.setContentsMargins(4, 4, 4, 4)
         compare_layout.setSpacing(8)
 
-        param_lbl = QLabel("📋 对比参数")
-        param_lbl.setStyleSheet(
-            f"color: {COLORS['text_primary']}; font-size: 12px; font-weight: bold;"
-        )
-        param_lbl.setMinimumWidth(80)
-        compare_layout.addWidget(param_lbl)
-
-        # 中间：v5.20 新选择器（含搜索/分类/全选/反选/清空/计数）
+        # 中间：v5.25 下拉式多选选择器（按钮「对比参数 (N) ▾」+ 浮层勾选）
         self.param_picker = ParamPickerPanel()
         self.param_picker.selected_changed.connect(self._on_compare_params_changed)
         compare_layout.addWidget(self.param_picker, 1)

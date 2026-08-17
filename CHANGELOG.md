@@ -1,5 +1,33 @@
 # GZ 安环监测系统 — 版本更新日志
 
+## v5.25（2026-08-17）✅ 当前版本
+
+### 🎨 简化（对比参数选择器：从"双栏分类+搜索"改为"下拉多选"）
+- **来源**：用户在 v5.20 双栏选择器基础上反馈"对比参数选择有点太复杂了"
+- **新形态**：主面板只保留一个按钮「对比参数 (N) ▾」，平时只占一行，最大化趋势图空间。点击按钮弹出浮层，浮层内含：
+  - 顶部搜索框（按关键字实时过滤勾选项）
+  - 中部可滚动分组勾选列表（按废气/废水/其他分组，组标题加粗）
+  - 底部全选/清空 + "已选 N / T" 计数
+- **消除的复杂度**：原左侧 170px 分类导航栏、内嵌横向分割条、顶部分类/搜索/操作 3 段式 UI 全部移除
+- **公共 API 完全不变**：`selected_changed(list)` / `set_available_params` / `get_selected` / `set_selected` / `select_all` / `invert` / `clear_selection` 签名与 v5.20 一致 —— `main_window.py` 的 `_on_compare_params_changed` / `_get_checked_compare_params` / `_populate_compare_list` / `_select_all_params` / `_invert_params` / `_clear_params` 无需改动
+- **细节**：
+  - 移除 `pred_compare_panel` 内冗余的「📋 对比参数」静态标题（按钮本身已带"对比参数 (N) ▾"）
+  - 选择器自身 `minimumHeight` 由 120 → 40（v5.21 缩一次，v5.25 再缩）
+  - 浮层 `Qt.Popup`：点外部 / ESC 自动关闭，置顶显示
+  - 分类优先级逻辑 `_classify` 完全保留：gas/water > rax > limbo（实际数据下「双轴」组恒为空，与 v5.20~v5.24 一致）
+
+### 🧪 测试
+- `tests/test_param_picker.py` 重写为新 API（实例化 / 去重保序 / set_get 往返 / `_classify` 优先级 / 搜索过滤 / 全选反选清空 / 信号 / 空态）—— 8 项全过
+- `tests/test_chart_splitter.py` 同步 `minimumHeight` 断言 120 → 40 —— 通过
+- `tests/smoke_main_window.py` 同步子组件清单（`toggle_btn`/`popup`/`search_edit`/`_checkboxes`）—— 通过
+- `tests/render_param_picker.py` 重写：渲染收起态 / 浮层 / 浮层搜索态 3 张截图
+
+### 📦 交付
+- `dist/GZ_Monitor_v5.25_Win7.exe`（单文件，约 55 MB）
+- GitHub: `junkechen/gz-monitor`（待 push）
+
+---
+
 ## v5.24（2026-08-12）✅ 当前版本
 
 ### 🐛 修复（Win7 打开「数据预测」有时闪退）

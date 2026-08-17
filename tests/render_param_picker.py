@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-v5.20 视觉回归：渲染 ParamPickerPanel 各种分类与状态，输出 PNG。
+v5.25 视觉回归：渲染 ParamPickerPanel 下拉多选形态，输出 PNG。
 
 用途：
-- 人工复核"嵌页式双栏选择器"在废气/废水/双轴/已选/搜索 各状态下的布局
-- 当 main_window.py / pred_param_selector.py 改动后，可视觉对比截图变化
-- 输出至 tests/screenshots/ 目录（git 忽略）
+- 人工复核"对比参数 (N) ▾"按钮 + 展开浮层（搜索 + 分组勾选 + 全选/清空）
+- 当 pred_param_selector.py 改动后，可视觉对比截图变化
+- 输出至 tests/screenshots/（git 忽略）
 
 运行：
     set QT_QPA_PLATFORM=offscreen
@@ -38,27 +38,12 @@ SAMPLE = (
 )
 
 
-def _switch_to(picker, key):
-    for i in range(picker.category_list.count()):
-        if picker.category_list.item(i).data(0x0100) == key:
-            picker.category_list.setCurrentRow(i)
-            return True
-    return False
-
-
-def _grab(picker, name: str):
-    """渲染前强制刷新两个 QListWidget 的 viewport，避免 offscreen 漏渲。"""
+def _grab(widget, name):
     app = QApplication.instance()
-    for cat in (getattr(picker, "category_list", None),
-                getattr(picker, "param_list", None)):
-        if cat is not None:
-            cat.viewport().update()
-            cat.viewport().repaint()
-            cat.repaint()
-    picker.repaint()
-    for _ in range(8):
+    widget.repaint()
+    for _ in range(10):
         app.processEvents()
-    pixmap = picker.grab()
+    pixmap = widget.grab()
     out = os.path.join(SCREENSHOT_DIR, name + ".png")
     pixmap.save(out, "PNG")
     print(f"[OK] 截图已存 {out} ({pixmap.width()}x{pixmap.height()})")
@@ -70,41 +55,33 @@ def main():
     picker = ParamPickerPanel()
     picker.set_available_params(SAMPLE)
     picker.set_selected(["非甲烷总烃", "pH值", "化学需氧量"])
-    picker.resize(900, 320)  # 给够高度以便所有项都可见
+    picker.resize(900, 40)
     picker.show()
     for _ in range(8):
         app.processEvents()
 
-    # 默认（"全部"分类）
-    _grab(picker, "panel_all")
+    # 1) 收起态：仅一个按钮「对比参数 (N) ▾」
+    _grab(picker, "panel_collapsed")
 
-    # 切到"废气"
-    if _switch_to(picker, "gas"):
-        _grab(picker, "panel_gas")
-
-    # 切到"废水"
-    if _switch_to(picker, "water"):
-        _grab(picker, "panel_water")
-
-    # 切到"已选"
-    if _switch_to(picker, "sel"):
-        _grab(picker, "panel_selected")
-
-    # 切回"全部" + 加搜索"烟"
-    _switch_to(picker, "all")
-    picker.search_edit.setText("烟")
+    # 2) 展开浮层：搜索 + 分组勾选 + 全选/清空
+    picker._toggle_popup()
     for _ in range(8):
         app.processEvents()
-    _grab(picker, "panel_search_y烟")
+    try:
+        _grab(picker.popup, "panel_popup")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 浮层截图失败（offscreen 限制，非致命）: {e}")
 
-    # 清空搜索，模拟极端窄窗口（让 splitter 比例硬挤）
-    picker.search_edit.setText("")
-    picker.resize(500, 320)
-    for _ in range(8):
-        app.processEvents()
-    _grab(picker, "panel_narrow")
+    # 3) 展开 + 搜索"烟"
+    try:
+        picker.search_edit.setText("烟")
+        for _ in range(8):
+            app.processEvents()
+        _grab(picker.popup, "panel_popup_search")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 浮层搜索态截图失败（非致命）: {e}")
 
-    print("\n=== 已生成 6 张截图，全部存于 tests/screenshots/ ===")
+    print("\n=== 已生成下拉选择器截图，存于 tests/screenshots/ ===")
     return 0
 
 

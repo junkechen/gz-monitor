@@ -91,12 +91,12 @@ def main():
     else:
         print("[OK] 趋势图不可折叠")
 
-    # 6) 选择器最小高度已降到 120
-    if w.param_picker.minimumHeight() != 120:
-        errors.append(("param_picker minHeight 应为 120",
+    # 6) 选择器最小高度（v5.25 改为下拉按钮，仅需 40）
+    if w.param_picker.minimumHeight() != 40:
+        errors.append(("param_picker minHeight 应为 40",
                        w.param_picker.minimumHeight(), ""))
     else:
-        print("[OK] param_picker.minimumHeight = 120")
+        print("[OK] param_picker.minimumHeight = 40")
 
     # 7) 已选计数 label 存在
     if not hasattr(w, "pred_chart_selected_label"):
