@@ -104,6 +104,28 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
         self._annot = None        # annotate 对象
         self._dot_artists = []    # 高亮圆点列表
 
+    # ── Win7 / Agg 后端健壮性：尺寸无效时绝不绘制，否则 C++ 层段错误闪退 ──
+    def _has_valid_size(self):
+        return self.width() > 0 and self.height() > 0
+
+    def resizeEvent(self, event):
+        # FigureCanvasQTAgg 基类在 resize 时会绘制；若画布被 QSplitter 折叠、
+        # 或引导首次切换页签时窗口几何尚未稳定（width/height 为 0），
+        # 基类会创建 0 尺寸位图并 draw，Win7 + Agg 后端直接崩溃且无 Python 异常。
+        if not self._has_valid_size():
+            return
+        super().resizeEvent(event)
+
+    def draw(self):
+        if not self._has_valid_size():
+            return
+        super().draw()
+
+    def draw_idle(self):
+        if not self._has_valid_size():
+            return
+        super().draw_idle()
+
     def set_hover_data(self, times):
         """设置时间轴数据（仅需时间列表，系列数据从 ax.lines 实时读取）"""
         self._times = times

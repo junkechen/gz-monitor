@@ -1,6 +1,25 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.23（2026-08-12）✅ 当前版本
+## v5.24（2026-08-12）✅ 当前版本
+
+### 🐛 修复（Win7 打开「数据预测」有时闪退）
+- **根因**：`chart_widget.HoverFigureCanvas` 继承自 `FigureCanvasQTAgg`，但未重写 `resizeEvent`。该基类在画布尺寸为 **0/负** 时会自动 `draw()`，而 matplotlib **Agg 后端在 Win7 上创建 0 尺寸位图即触发 C++ 层段错误（无 Python 异常、直接闪退）**。两个触发场景：
+  1. v5.21 引入的 `QSplitter` 把「趋势图」格拖到极小/折叠，或窗口布局某瞬间使画布高度为 0
+  2. v5.23 首次启动教学引导第③步切到预测页时，主窗口几何尚未完全稳定，画布尺寸为 0
+- **修复**：在 `HoverFigureCanvas` 重写 `resizeEvent` / `draw` / `draw_idle`，统一加尺寸守卫——「width≤0 或 height≤0 时直接 return，不绘制」。覆盖 `plot_series`(line 505 `draw`)、`_toggle_line`(518 `draw`)、`clear` 后续重绘、以及 splitter 拖拽引起的所有 resize 路径；尺寸恢复有效时基类 `resizeEvent` 正常重绘，图表照常显示
+- **影响面**：所有 `ChartWidget`（预测图 + 历史图共用该 canvas 类）均受益；纯防御性改动，有效尺寸时行为与修复前完全一致
+
+### 🧪 测试
+- 4 套测试（smoke / param_picker 9 项 / chart_splitter / onboarding）**全绿**，无头构造 MainWindow 不崩、无回归
+- 注：该崩溃为 Win7 + 真实显示器特有的 C++ 层问题，offscreen 无头环境无法复现；真实修复效果由用户在本机验收（把趋势图拖到最小、或引导首登切到预测页，验证不再闪退）
+
+### 📦 产物
+- **产物**: `dist\GZ_Monitor_v5.24_Win7.exe`
+- **提交**: (待提交)
+
+---
+
+## v5.23（2026-08-12）
 
 ### 🐛 修复（教学引导在本机不可见）
 - **根因**：v5.22 的 `TourGuide` 被实现为 `MainWindow` 的**子 widget** 并设置了 `WA_TranslucentBackground`。但 Qt 明确该属性**仅对顶层窗口（top-level）生效**，对子 widget 设置后行为未定义，在 Windows 7 上表现为整个遮罩控件透明、不绘制 —— 用户双击后「什么都没发生」，而引导逻辑其实已跑过一次（故 `app_info.json` 已写入 `first_run:false` + `onboarding_version:1`），之后自然不再触发
