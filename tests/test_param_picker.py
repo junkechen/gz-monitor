@@ -55,21 +55,28 @@ def test_instantiation():
     print("[OK] 实例化 + 子组件就位")
 
 
-def test_popup_is_top_level():
-    """浮层必须是顶层窗口（parent=None）。
+def test_popup_is_not_top_level():
+    """浮层必须是「普通子控件」，绝不能带 Qt.Popup / 顶层窗口标志。
 
-    回归锁：v5.25 曾把浮层设为 `QWidget(self)` + Qt.Popup，使其位于"隐藏的预测页签"
-    内；打开预测页签时 Qt 为这个带顶层标志的子控件创建原生窗口而父级尚未窗口化，
-    在 Win7 下直接段错误闪退。改为 parent=None 的顶层弹窗后，隐藏时不创建 HWND，
-    仅点击展开时作为独立顶层窗口显示，彻底规避。
+    回归锁（v5.28）：v5.25~v5.27 用 QWidget(None)+Qt.Popup 顶层原生窗口，在 Win7
+    预测页签内创建 HWND 会段错误闪退。改为挂在主窗口下的普通子控件后，不再创建任何
+    顶层原生窗口，彻底规避 Win7 崩溃（与 v5.23 内嵌式选择器一样安全）。
     """
     app = QApplication.instance() or QApplication(sys.argv[:1])
     picker = ParamPickerPanel()
-    assert picker.popup.parent() is None, \
-        f"浮层必须是顶层窗口(parent=None)，实际 parent={picker.popup.parent()}"
-    assert picker.popup.windowFlags() & Qt.Popup == Qt.Popup, \
-        "浮层应带 Qt.Popup 顶层标志"
-    print("[OK] 浮层为顶层窗口(Qt.Popup, parent=None) — 规避 Win7 打开预测页签闪退")
+    assert picker.popup.parent() is not None, \
+        f"浮层必须是子控件(parent 不为 None)，实际 parent={picker.popup.parent()}"
+    assert picker.popup.windowFlags() & Qt.Popup != Qt.Popup, \
+        "浮层绝不能带 Qt.Popup 顶层标志（Win7 崩溃源）"
+    assert picker.popup.windowFlags() & Qt.Window != Qt.Window, \
+        "浮层绝不能带 Qt.Window 顶层标志"
+    # 显示后仍为子控件、非顶层窗口
+    picker.popup.show()
+    app.processEvents()
+    assert picker.popup.parent() is not None
+    assert not (picker.popup.windowFlags() & Qt.Popup), "显示后仍不应带 Qt.Popup"
+    picker.popup.hide()
+    print("[OK] 浮层为普通子控件(无 Qt.Popup/Window 顶层标志) — Win7 安全")
 
 
 def test_set_available_params_dedup():
@@ -110,6 +117,8 @@ def test_search_filter():
     """输入"烟" → 仅含"烟"的勾选项可见。"""
     app = QApplication.instance() or QApplication(sys.argv[:1])
     picker = _make_picker(app, SAMPLE_PARAMS)
+    picker.show()  # popup 现为 picker 子控件，需祖先可见 cb.isVisible 才为真
+    app.processEvents()
     picker.popup.show()  # 浮层未显示时子控件 isVisible 恒为 False
 
     picker.search_edit.setText("烟")
@@ -176,6 +185,8 @@ def test_empty_state():
 
     # 有指标但搜索无匹配 → 所有勾选项隐藏
     picker.set_available_params(SAMPLE_PARAMS)
+    picker.show()
+    app.processEvents()
     picker.popup.show()
     picker.search_edit.setText("__no_match__")
     app.processEvents()
@@ -191,7 +202,7 @@ def main():
     failures = []
     tests = [
         test_instantiation,
-        test_popup_is_top_level,
+        test_popup_is_not_top_level,
         test_set_available_params_dedup,
         test_select_get_roundtrip,
         test_classify_priority,

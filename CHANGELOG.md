@@ -1,21 +1,30 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.27（2026-08-18）✅ 当前版本
+## v5.28（2026-08-18）✅ 当前版本
 
-### 🐛 修复（Win7 高分屏下「开始预测」出图原生崩溃）
-- **现象**：用户明确 **Win10 可正常运行、Win7 闪退**；崩溃精确发生在"点「开始预测」、后台算完、趋势图绘制出图那一刻"
-- **根因**：matplotlib 3.7 的 `FigureCanvasQTAgg._update_pixel_ratio` 直接读取 Qt 的 `devicePixelRatioF()`。Win7 在 125%/150% 系统 DPI 下该值返回 **1.25 / 1.5**（Win10 标准 100% DPI 下为 1.0）。所有与 DPI 比相关的尺寸换算（`paintEvent` 的 `width = rect.width() * device_pixel_ratio`、copy_from_bbox 的 bbox、`resizeEvent`、`mouseEventCoords` 等）因此变成**分数 / 越界**，导致 `QImage` 尺寸与内存缓冲不匹配 —— **Win7 原生访问越界段错误**。首次出图前 canvas 无 renderer、`paintEvent` 早退，故"打开页签"不崩，唯独"出图后首次 paintEvent"崩，与现象完全吻合
-- **修复**：在 `HoverFigureCanvas` 覆盖 `_update_pixel_ratio`，强制 `device_pixel_ratio = 1.0`（不再读取 Qt 的 `devicePixelRatioF()`），并在 `__init__` 调 `setDevicePixelRatio(1.0)` 双保险。预测图已用低 DPI(`FIG_DPI=80`)，无需高清，锁 1.0 后显示清晰度无变化，且 Win10 标准 DPI 下本就是 1.0、行为完全一致
-- **与历史修复的关系**：v5.24(0 尺寸绘制守卫)、v5.26(下拉浮层改顶层窗口) 均为不同诱因；本次是第三个、也是"出图"专属的 Win7 崩溃点
+### 🐛 修复（Win7 预测页「对比参数」下拉闪退 — 真正的根因）
+- **现象**：用户确认 **v5.23 在 Win7 不闪退**，但 v5.25 引入下拉浮层后、v5.26/v5.27 在 Win7 仍闪退（Win10 正常）
+- **根因（已纠正 v5.27 的误判）**：v5.27 曾把崩溃归因于 matplotlib 的 `device_pixel_ratio`(DPI)，但 **v5.23 同样走 `HoverFigureCanvas` 的 matplotlib 绘制路径、且在同机 Win7 上不崩**，证明 DPI 不是元凶。真正跨版本稳定引发 Win7 原生崩溃的，是 **v5.25 引入的 `Qt.Popup` 顶层浮层窗口**——它无论 `parent=None`(v5.26) 还是 `parent=self`(v5.25 初版)，本质都是"顶层原生窗口(HWND)"，在 Win7 预测页签内创建/显示即段错误闪退。v5.23 用的是内嵌式选择器（无浮层窗口），故安全
+- **修复**：把浮层从"顶层 `Qt.Popup` 窗口"改为 **挂在主窗口下的普通子控件**（`QWidget(self)` 创建、展开时 `setParent(主窗口)` 绝对定位叠加），用全局事件过滤器实现"点击外部 / 按 ESC 关闭"。**零顶层原生窗口、零 Win7 崩溃风险**，且完整保留 v5.25 你要的"按钮 + 下拉多选"UX
+- **v5.27 的 DPR 锁处置**：`HoverFigureCanvas.device_pixel_ratio` 强制 1.0 仍保留，但定位为**高分屏防御性加固**（非本次根因）；Win10 100% DPI 下本就是 1.0，行为不变
 
 ### 🧪 测试
-- **新增回归 `tests/test_device_pixel_ratio.py`**：构造后、`_update_pixel_ratio()` 被调用后、`device_pixel_ratio` 属性三处断言恒为 1.0 —— 通过
-- **新增回归 `tests/test_pred_chart_draw.py`**：实际跑通 `plot_series`（多曲线 / 双轴 / 归一化）+ `clear` 全链路，确认 `device_pixel_ratio=1.0` 下绘制无异常且 renderer 正常生成 —— 通过
-- `tests/smoke_main_window.py` 无回归（MainWindow 仍可无头构造、预测页可构造、param_picker 正常）—— 通过
+- **`tests/test_param_picker.py`**：`test_popup_is_not_top_level` 反向回归锁（浮层必须 `parent 不为 None`、不带 `Qt.Popup`/`Qt.Window` 顶层标志）；展开/搜索/全选/反选/清空/信号/空态全通过
+- **端到端（offscreen）**：构造 MainWindow → 点「对比参数」展开浮层 → 断言 `visible=True` 且 `parent 为主窗口` 且 `无 Qt.Popup` → 模拟点击浮层外部 → 浮层自动关闭；全程无异常
+- `tests/smoke_main_window.py` / `test_pred_chart_draw.py` / `test_device_pixel_ratio.py` 无回归
 
 ### 📦 产物
-- **产物**: `dist\GZ_Monitor_v5.27_Win7.exe`
+- **产物**: `dist\GZ_Monitor_v5.28_Win7.exe`
 - **提交**: (待提交)
+
+---
+
+## v5.27（2026-08-18）（已被 v5.28 纠正根因）
+
+### 🐛 修复（原判定为"出图 DPI 崩溃"，实为误判）
+- 曾在 `HoverFigureCanvas` 强制 `device_pixel_ratio = 1.0`，意图修复"开始预测出图"崩溃
+- **后续纠正**：用户反馈 v5.23 不闪退，而 v5.23 同样走 matplotlib 绘制路径 → 证明 DPI 非元凶。该改动降级为**高分屏防御性加固**保留，真正的崩溃点是 v5.25 引入的 `Qt.Popup` 顶层浮层（见 v5.28）
+- **提交**: `a14cc1e`
 
 ---
 

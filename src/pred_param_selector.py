@@ -12,7 +12,8 @@ v5.25 预测页面优化：下拉式多选"对比参数"选择器
 
 实现策略
 - 主控件：QPushButton（toggle_btn）承载下拉
-- 浮层：QWidget + Qt.Popup（点击外部/ESC 自动关闭，置顶）
+- 浮层：普通子控件（挂在主窗口下，绝对定位叠加），点击外部/ESC 关闭
+        ⚠️ 绝不能用 Qt.Popup / 顶层窗口——Win7 预测页签内创建原生窗口(HWND)会段错误闪退
 - 浮层内：QLineEdit 搜索 + QScrollArea 分组勾选 + 底部操作栏
 - 保留 _classify / _param_tag 便于分类与单测复用
 """
@@ -21,9 +22,10 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Set
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QEvent, QRect
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QHBoxLayout,
     QLabel,
@@ -67,6 +69,10 @@ class ParamPickerPanel(QWidget):
         self._checkboxes: Dict[str, QCheckBox] = {}  # param -> 勾选框
         self._suppress = False                    # 批量操作时阻止重复 emit
         self._build_ui()
+        # 安装全局事件过滤器：实现"点击浮层外部/按 ESC 关闭"（替代 Qt.Popup 默认行为）
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     # ── 公开 API ─────────────────────────────────────────────────────────
     def set_available_params(self, params: Iterable[str]) -> None:
@@ -169,14 +175,14 @@ class ParamPickerPanel(QWidget):
         self._build_popup()
 
     def _build_popup(self) -> None:
-        # ⚠️ 必须是顶层窗口（parent=None）！
-        # 若设为 self 的子控件并带 Qt.Popup 顶层标志，则该控件位于"隐藏的预测页签"
-        # 内；一旦用户打开预测页签、Qt 为这个带顶层标志的子控件创建原生窗口(HWND)，
-        # 而其父级尚未完成原生窗口化，Win7 下会直接段错误闪退（offscreen 无法复现）。
-        # 改为 parent=None 的顶层弹窗：隐藏时不创建 HWND，仅点击展开时作为独立顶层
-        # 窗口显示，彻底规避该崩溃。
-        self.popup = QWidget(None)
-        self.popup.setWindowFlags(Qt.Popup)
+        # Win7 安全策略（v5.28 修正）：
+        # 浮层必须是「普通子控件」，绝不能带 Qt.Popup / 任何顶层窗口标志。
+        # 旧实现（v5.25~v5.27）使用 QWidget(None)+Qt.Popup 顶层原生窗口，在 Win7
+        # 预测页签内创建 HWND 会段错误闪退。现改为挂在主窗口下的普通子控件，用绝对
+        # 定位叠加、点击外部/ESC 关闭，零原生窗口、零 Win7 崩溃风险。
+        self.popup = QWidget(self)
+        self.popup.setObjectName("paramPopup")
+        self.popup.setVisible(False)
         self.popup.setMinimumWidth(340)
         self.popup.setStyleSheet(self._popup_style())
 
@@ -356,13 +362,30 @@ class ParamPickerPanel(QWidget):
         if hasattr(self, "_count_label"):
             self._count_label.setText(f"已选 {sel} / {tot}")
 
+    # ── 全局事件过滤：点击浮层外部 / 按 ESC 关闭（替代 Qt.Popup 的默认行为）──
+    def eventFilter(self, obj, event) -> bool:
+        if self.popup.isVisible():
+            if event.type() == QEvent.MouseButtonPress:
+                gp = event.globalPos()
+                top_left = self.popup.mapToGlobal(self.popup.rect().topLeft())
+                if not QRect(top_left, self.popup.size()).contains(gp):
+                    self.popup.hide()
+            elif event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+                self.popup.hide()
+        return super().eventFilter(obj, event)
+
     def _toggle_popup(self) -> None:
         if self.popup.isVisible():
             self.popup.hide()
             return
         btn = self.toggle_btn
+        # 挂到主窗口下，确保浮层绘制在一切控件之上（仍是普通子控件，非顶层窗口）
+        top = self.window()
+        if top is not None and self.popup.parent() is not top:
+            self.popup.setParent(top)
         self.popup.setFixedWidth(max(340, btn.width()))
+        self.popup.setFixedHeight(380)
         gpos = btn.mapToGlobal(btn.rect().bottomLeft())
-        self.popup.move(gpos)
+        self.popup.move(top.mapFromGlobal(gpos) if top is not None else gpos)
         self.popup.show()
         self.popup.raise_()
