@@ -2357,12 +2357,19 @@ class MainWindow(QMainWindow):
                 self._pred_result_cache.pop(k, None)
 
     def _update_status_bar(self):
-        """更新状态栏信息"""
+        """更新状态栏信息（含当前 EXE 文件的生成时间，便于确认是否更新到最新版）"""
         interval_seconds = int(self.refresh_interval / 1000)
+        try:
+            exe_path = sys.executable
+            _gen = datetime.fromtimestamp(os.path.getmtime(exe_path))
+            exe_info = f"📦 {os.path.basename(exe_path)} 生成于 {_gen.strftime('%Y-%m-%d %H:%M')}"
+        except Exception:
+            exe_info = ""
         self.statusBar().showMessage(
             f"✓ 已登录: {self.username} | "
             f"📊 版本 {self.version} | "
             f"🔄 自动刷新: {interval_seconds}秒 | "
+            f"{exe_info} | "
             f"📡 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
