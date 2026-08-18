@@ -14,6 +14,8 @@
 1. 双击 `dist\GZ_Monitor_v5.31_Win7.exe`
 2. 若 Win7 仍崩溃 → 把 `%APPDATA%\GZ_Monitor\logs\` 下的 `crash.log` + `crash_<pid>_<ts>.dmp` 发给我，我有完整 Python 栈 + MiniDump 才能精准定位
 3. 若不再崩溃 → 视为修复成功；最后保留 v5.28 浮层改动（已确认 Win7 安全）
+- **产物**: `dist\GZ_Monitor_v5.31_Win7.exe`（70 MB，含 dbghelp.dll 支持 MiniDump）
+- **提交**: `efd3c51`
 
 ## v5.30（2026-08-18）
 
