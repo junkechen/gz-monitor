@@ -1,6 +1,21 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.30（2026-08-18）✅ 当前版本
+## v5.31（2026-08-18）✅ 当前版本
+
+### 🐛 修复（Win7 预测闪退的全链路诊断修复）
+- **背景**：v5.30 用户实测仍"win10正常 / win7点击开始预测闪退"。v5.27/v5.28/v5.29 连续三轮未根除根本原因是**诊断黑盒**——`main.py` 的 `_global_exception_hook` **只 print 到 stderr 却从未真正写文件**，Win7 用户看不到 stderr，结果就是"静默闪退"，无法提供任何 Python 栈
+- **修复 1：crash.log 真正落盘**：`_write_crash_log()` 写到 `%APPDATA%\GZ_Monitor\logs\crash.log`（权限稳定路径），所有 Python 未捕获异常均落盘；SEH 注册成功也写入日志证明已注册。修复 `from datetime import datetime` 在 module 顶层（之前 `_write_crash_log` 调 `datetime.now()` 时 NameError，落入 fallback `print`）
+- **修复 2：Windows 原生崩溃兜底**：通过 ctypes 注册 `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler` + `MiniDumpWriteDump`，可在 matplotlib/Qt C 层段错误（如 Win7 高分屏 QImage blit 越界）时落盘 `.dmp` 文件 + 写 `crash.log` 一行 `NATIVE_CRASH`
+- **修复 3：Win7 环境诊断**：`main()` 启动后立即调用 `_log_win7_diagnostics()`，把 OS 版本（`platform.release()`/`version()`）、Qt/PyQt5/matplotlib 版本、`screen.devicePixelRatio()`、可执行路径全部记录到 `crash.log`，下一轮排查不再需要第二次提问
+- **修复 4：预测链路埋点**：`_run_prediction` 进入时记录 `dpr + horizon + pred_type + has_data`；`_assemble_and_plot_pred_chart` 出图前记录 `canvas_size + chart_size + n_curves + mode + normalize`，每次 `plot_series` + `draw_idle` 都有日志；捕获异常时同时调 `_write_crash_log('PRED_CHART', tb)` 落盘
+- **改动文件**：`src/main.py`（核心）、`src/main_window.py`（预测埋点）
+
+### 📋 用户使用说明
+1. 双击 `dist\GZ_Monitor_v5.31_Win7.exe`
+2. 若 Win7 仍崩溃 → 把 `%APPDATA%\GZ_Monitor\logs\` 下的 `crash.log` + `crash_<pid>_<ts>.dmp` 发给我，我有完整 Python 栈 + MiniDump 才能精准定位
+3. 若不再崩溃 → 视为修复成功；最后保留 v5.28 浮层改动（已确认 Win7 安全）
+
+## v5.30（2026-08-18）
 
 ### ✨ 改进（状态栏显示"生成时间"，一眼确认是否更新到最新版）
 - **背景**：用户多次反馈"生成时间不对，是不是没更新"。排查确认：v5.29 EXE 实际构建于 2026-08-18 14:08（对应提交 `1444174`），**确已更新**；代码内本来没有任何"生成时间"界面标签，用户看到的是 Windows 资源管理器里 EXE 文件的"修改/创建时间"，在 `dist/` 有 13 个版本、且跨机拷贝会重置"创建时间"时极易误判为旧版

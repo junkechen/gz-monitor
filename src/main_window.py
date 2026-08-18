@@ -4083,11 +4083,33 @@ class MainWindow(QMainWindow):
 
     def _run_prediction(self, silent=False, predict_all_params=True):
         """运行预测 —— 遍历所有排放口，预测全量参数（异步模式，API调用在后台线程）
-        
+
         Args:
             silent: 是否静默模式（不显示等待光标）
             predict_all_params: 是否预测所有参数（True=预测所有，False=使用用户选择的参数）
         """
+        # ── Win7 诊断：记录进入预测流程前的状态 ────────────────────────────
+        try:
+            from main import _write_crash_log
+            import sys as _sys
+            dpr = 1.0
+            try:
+                from PyQt5.QtWidgets import QApplication
+                _app = QApplication.instance()
+                if _app and _app.primaryScreen():
+                    dpr = _app.primaryScreen().devicePixelRatio()
+            except Exception:
+                pass
+            _write_crash_log('PRED_BEGIN', (
+                f'silent={silent}, predict_all={predict_all_params}\n'
+                f'  pred_type_combo={getattr(self, "pred_type_combo", None) and self.pred_type_combo.currentText()!r}\n'
+                f'  horizon={getattr(self, "prediction_horizon", "?")}\n'
+                f'  has_data={bool(getattr(self, "current_grouped_data", None))}\n'
+                f'  primaryScreen dpr={dpr}\n'
+                f'  python={_sys.version.split()[0]}\n'
+            ))
+        except Exception:
+            pass
         if not hasattr(self, 'current_grouped_data') or not self.current_grouped_data:
             if not silent:
                 QMessageBox.warning(self, "提示", "暂无排放口数据，请先刷新数据")
@@ -5330,6 +5352,9 @@ class MainWindow(QMainWindow):
             title += f"（已隐藏 {hidden_count} 条）"
 
         try:
+            logger.info(f"[PRED-CHART] plot_series begin: n_curves={len(raw_curves)}, mode={mode}, normalize={normalize}, "
+                        f"canvas_size={self.pred_chart.canvas.width()}x{self.pred_chart.canvas.height()}, "
+                        f"chart_size={self.pred_chart.width()}x{self.pred_chart.height()}")
             self.pred_chart.plot_series(
                 times=common_times,
                 series_list=left_series,
@@ -5338,9 +5363,18 @@ class MainWindow(QMainWindow):
                 right_ylabel=right_ylabel,
                 normalize=normalize,
             )
+            logger.info(f"[PRED-CHART] plot_series done; now draw_idle")
             self.pred_chart.canvas.draw_idle()
+            logger.info(f"[PRED-CHART] draw_idle scheduled (Win7 关崩溃点)")
         except Exception as e:
-            print(f"[ERROR] 绘制多指标预测趋势图失败: {e}")
+            logger.exception(f"[PRED-CHART] 绘制多指标预测趋势图失败: {e}")
+            try:
+                from main import _write_crash_log
+                import traceback as _tb
+                _write_crash_log('PRED_CHART', _tb.format_exc())
+            except Exception:
+                pass
+            # 不再 raise，避免 Qt 事件循环在 paintEvent 中崩
             import traceback
             traceback.print_exc()
 

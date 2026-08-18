@@ -6,24 +6,298 @@ GZ安环监测系统 - 主程序入口
 import sys
 import os
 import traceback
+import time
+from datetime import datetime  # 用于 _write_crash_log 等模块级函数
 
 # ── 全局异常兜底：防止未捕获异常导致程序静默退出 ─────────────────────────────
+def _log_dir_for_exe() -> str:
+    """获取日志目录（%APPDATA% 优先，EXE 同级目录次之）。"""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    # 1) 优先写到 %APPDATA%\GZ_Monitor\logs （权限稳定）
+    appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
+    preferred = os.path.join(appdata, 'GZ_Monitor', 'logs')
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        # 写权限测试
+        test = os.path.join(preferred, '.write_test')
+        with open(test, 'w', encoding='utf-8') as f:
+            f.write('1')
+        os.remove(test)
+        return preferred
+    except Exception:
+        pass
+    # 2) 回退到 EXE 同级 logs/
+    fallback = os.path.join(base, 'logs')
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def _write_crash_log(prefix: str, text: str) -> None:
+    """把崩溃信息追加写入 crash.log（永不抛异常）。"""
+    try:
+        log_dir = _log_dir_for_exe()
+        path = os.path.join(log_dir, 'crash.log')
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(f"\n===== {prefix} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(text)
+            f.write("\n")
+    except Exception:
+        # 写日志失败时 silent fallback：至少把内容打到 stderr
+        try:
+            print(f"[CRASH-LOG-WRITE-FAILED] {prefix}: {text}", file=sys.stderr)
+        except Exception:
+            pass
+
+
 def _global_exception_hook(exc_type, exc_value, exc_tb):
-    """全局异常钩子：捕获所有未处理异常，记录日志而非静默崩溃"""
+    """全局异常钩子：捕获所有未处理异常，写盘到 crash.log（不再静默崩溃）。"""
     try:
         err_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        print(f"[FATAL] 未捕获异常:\n{err_msg}", file=sys.stderr)
-        # 尝试写入日志文件
-        if getattr(sys, 'frozen', False):
-            log_dir = os.path.join(os.path.dirname(sys.executable), "logs")
-        else:
-            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, "crash.log")
+        sys.stderr.write(f"[FATAL] 未捕获异常:\n{err_msg}\n")
+        sys.stderr.flush()
+        _write_crash_log('UNCAUGHT', err_msg)
+    except Exception as inner_exc:
+        try:
+            sys.stderr.write(f"[FATAL] exception hook itself failed: {inner_exc}\n")
+        except Exception:
+            pass
+
+
+def _unraisable_hook(unraisable):
+    """捕获 sys.unraisable（典型场景：C 回调里的 Python 异常被吞）。"""
+    try:
+        msg = (f"{unraisable.exc_type.__name__}: {unraisable.exc_value}\n"
+               f"  origin: {getattr(unraisable, 'object', '?')}\n"
+               f"  source: {getattr(unraisable, 'source', '?')}\n"
+               f"  tb: {''.join(traceback.format_exception(unraisable.exc_type, unraisable.exc_value, unraisable.exc_traceback)) if unraisable.exc_traceback else '(none)'}")
+        _write_crash_log('UNRAISABLE', msg)
     except Exception:
-        pass  # 日志写入失败也不要再抛异常
+        pass
+
 
 sys.excepthook = _global_exception_hook
+try:
+    sys.unraisablehook = _unraisable_hook  # Python 3.8+
+except AttributeError:
+    pass
+
+# 进程退出前的「干净退出」标记（区分闪退 vs 正常退出）
+import atexit
+def _atexit_clean_exit():
+    try:
+        _write_crash_log('CLEAN_EXIT', f'process exiting cleanly; pid={os.getpid()}\n')
+    except Exception:
+        pass
+atexit.register(_atexit_clean_exit)
+
+
+# ── Windows 原生崩溃兜底：通过 ctypes 接管 SEH，落盘 .dmp ─────────────────────
+# 关键能力：当 matplotlib/PyQt5 的 C 层段错误（如 Win7 QImage blit 越界）直接
+# 把进程杀掉时，Python 的 sys.excepthook 根本来不及触发；只有 SEH + MiniDump
+# 才能拿到堆栈。下面这段代码必须在 QApplication 之前导入，否则就晚了。
+try:
+    import ctypes
+    from ctypes import wintypes
+
+    if sys.platform == 'win32':
+        _MINIDUMP_WRITE_DUMP = None
+        try:
+            _dbghelp = ctypes.windll.dbghelp
+            _MINIDUMP_WRITE_DUMP = _dbghelp.MiniDumpWriteDump
+            _MINIDUMP_WRITE_DUMP.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.HANDLE,
+                ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            _MINIDUMP_WRITE_DUMP.restype = ctypes.c_uint32
+
+            _kernel32 = ctypes.windll.kernel32
+
+            EXCEPTION_MAXIMUM_PARAMS = 15  # 定义在 winnt.h
+
+            class _EXCEPTION_RECORD(ctypes.Structure):
+                _fields_ = [
+                    ('ExceptionCode', wintypes.DWORD),
+                    ('ExceptionFlags', wintypes.DWORD),
+                    ('ExceptionRecord', ctypes.c_void_p),
+                    ('ExceptionAddress', ctypes.c_void_p),
+                    ('NumberParameters', wintypes.DWORD),
+                    ('ExceptionInformation', ctypes.c_uint32 * EXCEPTION_MAXIMUM_PARAMS),
+                ]
+
+            class _MINIDUMP_EXCEPTION_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ('ThreadId', wintypes.DWORD),
+                    ('ExceptionPointers', ctypes.c_void_p),
+                    ('ClientPointers', wintypes.BOOL),
+                ]
+
+            class _MINIDUMP_TYPE:
+                MiniDumpWithFullMemory = 0x00000002
+                MiniDumpWithDataSegs = 0x00000004
+                MiniDumpWithHandleData = 0x00000008
+                MiniDumpWithUnloadedModules = 0x00000020
+                MiniDumpWithFullMemoryInfo = 0x00000040
+                MiniDumpWithThreadInfo = 0x00000100
+
+            LONG = ctypes.c_long
+            _EXCEPTION_POINTERS = ctypes.c_void_p
+
+            # 异常码
+            EXCEPTION_ACCESS_VIOLATION = 0xC0000005
+            EXCEPTION_STACK_OVERFLOW = 0xC00000FD
+            EXCEPTION_ILLEGAL_INSTRUCTION = 0xC000001D
+            EXCEPTION_INT_DIVIDE_BY_ZERO = 0xC0000094
+
+            # 进程路径
+            _proc_handle = _kernel32.GetCurrentProcess()
+            _proc_id = _kernel32.GetCurrentProcessId()
+
+            def _seh_handler(exception_code):
+                """SEH 入口：写 .dmp + 写 crash.log 后让进程自然退出。"""
+                try:
+                    log_dir = _log_dir_for_exe()
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    dmp_path = os.path.join(log_dir, f'crash_{_proc_id}_{ts}.dmp')
+                    log_path = os.path.join(log_dir, 'crash.log')
+                    msg = (
+                        f"NATIVE SEH EXCEPTION 0x{exception_code & 0xFFFFFFFF:08X}\n"
+                        f"  timestamp: {ts}\n"
+                        f"  pid={_proc_id}\n"
+                        f"  dump: {dmp_path}\n"
+                    )
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(f"\n===== NATIVE_CRASH {ts} =====\n{msg}\n")
+                    # 落盘 MiniDump
+                    try:
+                        out_file = _kernel32.CreateFileW(
+                            ctypes.c_wchar_p(dmp_path),
+                            0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                            0,  # no share
+                            None,
+                            2,  # CREATE_ALWAYS
+                            0x80,  # FILE_ATTRIBUTE_NORMAL
+                            None,
+                        )
+                        if out_file:
+                            # 用 MiniDumpWithFullMemory + 其它 flag
+                            flags = (_MINIDUMP_TYPE.MiniDumpWithFullMemory
+                                     | _MINIDUMP_TYPE.MiniDumpWithDataSegs
+                                     | _MINIDUMP_TYPE.MiniDumpWithHandleData
+                                     | _MINIDUMP_TYPE.MiniDumpWithThreadInfo)
+                            exception_info = _MINIDUMP_EXCEPTION_INFORMATION()
+                            exception_info.ThreadId = _kernel32.GetCurrentThreadId()
+                            exception_info.ExceptionPointers = 0  # 简化
+                            exception_info.ClientPointers = False
+                            _MINIDUMP_WRITE_DUMP(_proc_handle, _proc_id, out_file,
+                                                 flags,
+                                                 ctypes.byref(exception_info) if exception_info.ExceptionPointers else None,
+                                                 None, None)
+                            _kernel32.CloseHandle(out_file)
+                    except Exception as dump_exc:
+                        with open(log_path, 'a', encoding='utf-8') as f:
+                            f.write(f"  dump write failed: {dump_exc}\n")
+                    # 必须返回 1 让异常被当作已处理（避免 nested 处理），但进程通常会退出
+                    return 1  # EXCEPTION_EXECUTE_HANDLER
+                except Exception:
+                    return 1
+
+            # 注册 SEH：用 SetUnhandledExceptionFilter（WinXP+/全通用）
+            try:
+                SetUnhandledExceptionFilter = _kernel32.SetUnhandledExceptionFilter
+                SetUnhandledExceptionFilter.argtypes = [ctypes.c_void_p]
+                SetUnhandledExceptionFilter.restype = ctypes.c_void_p
+
+                SEH_HANDLER_TYPE = ctypes.WINFUNCTYPE(LONG, _EXCEPTION_POINTERS)
+
+                def _seh_trampoline(exc_ptrs):
+                    try:
+                        # EXCEPTION_POINTERS = { EXCEPTION_RECORD* pExceptionRecord; ... }
+                        # pExceptionRecord 首字段 DWORD ExceptionCode
+                        code = 0
+                        if exc_ptrs:
+                            try:
+                                # 读前 4 字节作为 ExceptionCode
+                                code = ctypes.c_uint32.from_address(exc_ptrs).value
+                            except Exception:
+                                code = 0
+                    except Exception:
+                        code = 0
+                    return _seh_handler(code)
+
+                _seh_c = SEH_HANDLER_TYPE(_seh_trampoline)
+                _seh_c_addr = ctypes.cast(_seh_c, ctypes.c_void_p).value
+                prev = SetUnhandledExceptionFilter(_seh_c_addr)
+                _write_crash_log('SEH_INSTALLED',
+                                 f'SetUnhandledExceptionFilter registered, '
+                                 f'addr=0x{_seh_c_addr:X}, prev=0x{prev or 0:X}\n')
+
+                # 同时注册 AddVectoredExceptionHandler 作为首发拦截（Windows XP+）
+                try:
+                    AddVectoredExceptionHandler = _kernel32.AddVectoredExceptionHandler
+                    AddVectoredExceptionHandler.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+                    AddVectoredExceptionHandler.restype = ctypes.c_void_p
+                    vec_handler = AddVectoredExceptionHandler(1, _seh_c_addr)  # CALL_FIRST
+                    _write_crash_log('VECTORED_HANDLER_INSTALLED',
+                                     f'AddVectoredExceptionHandler ok, handle=0x{vec_handler or 0:X}\n')
+                except Exception as vec_exc:
+                    _write_crash_log('VECTORED_HANDLER_SKIPPED', f'{vec_exc}\n')
+            except Exception as seh_set_exc:
+                _write_crash_log('SEH_FAILED', f'SetUnhandledExceptionFilter failed: {seh_set_exc}\n')
+        except Exception as load_exc:
+            _write_crash_log('DBGHELP_LOAD_FAILED', f'failed to load dbghelp: {load_exc}\n')
+except Exception:
+    # ctypes 不可用就静默忽略（理论上在 Windows 打包环境必成功）
+    pass
+
+
+# ── Win7 环境诊断日志（启动时记录） ────────────────────────────────────────
+def _log_win7_diagnostics() -> None:
+    """记录 OS/Python/Qt/matplotlib 版本以及设备像素比，便于 Win7 排查。"""
+    try:
+        from datetime import datetime as _dt
+        info = []
+        info.append(f"timestamp: {_dt.now().isoformat()}")
+        try:
+            info.append(f"sys.platform: {sys.platform}")
+        except Exception: pass
+        try:
+            import platform as _plat
+            info.append(f"platform.release: {_plat.release()}; platform.version: {_plat.version()}")
+        except Exception: pass
+        info.append(f"Python: {sys.version.split()[0]}")
+        try:
+            import PyQt5
+            from PyQt5.QtCore import QT_VERSION_STR, PYQT_VERSION_STR
+            info.append(f"Qt: {QT_VERSION_STR}; PyQt5: {PYQT_VERSION_STR}")
+        except Exception as exc:
+            info.append(f"PyQt5 import failed: {exc}")
+        try:
+            import matplotlib
+            info.append(f"matplotlib: {matplotlib.__version__}")
+        except Exception:
+            pass
+        try:
+            from PyQt5.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                # devicePixelRatio 与 devicePixelRatioF
+                for screen in app.screens():
+                    info.append(f"screen name={screen.name()} dpr={screen.devicePixelRatio()} dprF={screen.devicePixelRatioF()} geom={screen.geometry()}")
+                    break
+        except Exception:
+            pass
+        try:
+            info.append(f"sys.executable: {sys.executable}")
+            info.append(f"sys.frozen: {getattr(sys, 'frozen', False)}")
+        except Exception:
+            pass
+        info.append(f"sys.argv: {sys.argv}")
+        _write_crash_log('STARTUP_DIAG', '\n'.join(info))
+    except Exception:
+        pass
 
 # 添加src目录到路径（打包后和开发时均适用）
 if getattr(sys, 'frozen', False):
@@ -66,6 +340,9 @@ def main():
     app.setStyle('Fusion')
     app.setFont(QFont("Microsoft YaHei", 9))
     app.setPalette(_dark_palette())
+
+    # 启动后立即记录 Win7 环境诊断（必须在 QApplication 创建后调用）
+    _log_win7_diagnostics()
 
     # 判断版本
     version = _get_version()
