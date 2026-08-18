@@ -1,6 +1,25 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.26（2026-08-18）✅ 当前版本
+## v5.27（2026-08-18）✅ 当前版本
+
+### 🐛 修复（Win7 高分屏下「开始预测」出图原生崩溃）
+- **现象**：用户明确 **Win10 可正常运行、Win7 闪退**；崩溃精确发生在"点「开始预测」、后台算完、趋势图绘制出图那一刻"
+- **根因**：matplotlib 3.7 的 `FigureCanvasQTAgg._update_pixel_ratio` 直接读取 Qt 的 `devicePixelRatioF()`。Win7 在 125%/150% 系统 DPI 下该值返回 **1.25 / 1.5**（Win10 标准 100% DPI 下为 1.0）。所有与 DPI 比相关的尺寸换算（`paintEvent` 的 `width = rect.width() * device_pixel_ratio`、copy_from_bbox 的 bbox、`resizeEvent`、`mouseEventCoords` 等）因此变成**分数 / 越界**，导致 `QImage` 尺寸与内存缓冲不匹配 —— **Win7 原生访问越界段错误**。首次出图前 canvas 无 renderer、`paintEvent` 早退，故"打开页签"不崩，唯独"出图后首次 paintEvent"崩，与现象完全吻合
+- **修复**：在 `HoverFigureCanvas` 覆盖 `_update_pixel_ratio`，强制 `device_pixel_ratio = 1.0`（不再读取 Qt 的 `devicePixelRatioF()`），并在 `__init__` 调 `setDevicePixelRatio(1.0)` 双保险。预测图已用低 DPI(`FIG_DPI=80`)，无需高清，锁 1.0 后显示清晰度无变化，且 Win10 标准 DPI 下本就是 1.0、行为完全一致
+- **与历史修复的关系**：v5.24(0 尺寸绘制守卫)、v5.26(下拉浮层改顶层窗口) 均为不同诱因；本次是第三个、也是"出图"专属的 Win7 崩溃点
+
+### 🧪 测试
+- **新增回归 `tests/test_device_pixel_ratio.py`**：构造后、`_update_pixel_ratio()` 被调用后、`device_pixel_ratio` 属性三处断言恒为 1.0 —— 通过
+- **新增回归 `tests/test_pred_chart_draw.py`**：实际跑通 `plot_series`（多曲线 / 双轴 / 归一化）+ `clear` 全链路，确认 `device_pixel_ratio=1.0` 下绘制无异常且 renderer 正常生成 —— 通过
+- `tests/smoke_main_window.py` 无回归（MainWindow 仍可无头构造、预测页可构造、param_picker 正常）—— 通过
+
+### 📦 产物
+- **产物**: `dist\GZ_Monitor_v5.27_Win7.exe`
+- **提交**: (待提交)
+
+---
+
+## v5.26（2026-08-18）（上一版）
 
 ### 🐛 修复（Win7 打开「数据预测」必崩 + 归一化按钮"消失"）
 - **现象**：用户反馈 v5.25「预测一点开就闪退」，且原本好用的「归一化」按钮不见了

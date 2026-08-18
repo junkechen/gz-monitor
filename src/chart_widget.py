@@ -11,6 +11,7 @@ import os
 import re
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QScrollArea, QFrame, QLabel
 from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtGui import QResizeEvent
 
 from config import FIG_DPI
 
@@ -98,6 +99,16 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
 
     def __init__(self, figure):
         super().__init__(figure)
+        # ── Win7 高分屏兼容：强制 device_pixel_ratio = 1.0 ──────────────────
+        # Win7 在 125%/150% 系统 DPI 下，Qt 的 devicePixelRatioF() 返回 1.25/1.5；
+        # matplotlib 的 FigureCanvasQTAgg.paintEvent 据此计算 copy_from_bbox 的
+        # bbox 与 QImage 尺寸，分数/越界尺寸会触发原生段错误（Win10 标准 100% DPI
+        # 下为 1.0，故不受影响）。预测图已用低 DPI(FIG_DPI=80)，无需高清，锁 1.0
+        # 即可彻底规避崩溃。详见 _update_pixel_ratio 的覆盖实现。
+        try:
+            self.setDevicePixelRatio(1.0)
+        except Exception:
+            pass
         self._times = []          # 原始时间字符串列表
         self._callback_id = None
         self._vline = None        # 竖线对象
@@ -107,6 +118,17 @@ class HoverFigureCanvas(FigureCanvasQTAgg):
     # ── Win7 / Agg 后端健壮性：尺寸无效时绝不绘制，否则 C++ 层段错误闪退 ──
     def _has_valid_size(self):
         return self.width() > 0 and self.height() > 0
+
+    def _update_pixel_ratio(self):
+        # 覆盖 FigureCanvasQT 的默认实现：始终按 1.0 处理，
+        # 不再读取 Qt 的 devicePixelRatioF()（Win7 高分屏下会返回 1.25/1.5）。
+        # 不锁 1.0 时，paintEvent 里 width = rect.width() * device_pixel_ratio
+        # 等所有尺寸换算都会变成分数，copy_from_bbox 算出的 bbox/QImage 尺寸
+        # 出现越界，触发 Win7 原生段错误（与"开始预测出图时闪退"现象吻合）。
+        # 预测图已用低 DPI(FIG_DPI=80)，锁 1.0 不影响显示清晰度。
+        if self._set_device_pixel_ratio(1.0):
+            event = QResizeEvent(self.size(), self.size())
+            self.resizeEvent(event)
 
     def resizeEvent(self, event):
         # FigureCanvasQTAgg 基类在 resize 时会绘制；若画布被 QSplitter 折叠、
