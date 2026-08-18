@@ -359,7 +359,8 @@ class ChartWidget(QWidget):
         return checkbox
 
     def plot_series(self, times, series_list, title="数据曲线",
-                    right_series_list=None, right_ylabel="", normalize=False):
+                    right_series_list=None, right_ylabel="", normalize=False,
+                    selected_names=None):
         """绘制多条曲线，默认都不显示，通过复选框控制。
 
         Args:
@@ -371,9 +372,17 @@ class ChartWidget(QWidget):
             right_ylabel: 右轴 Y 轴标题。
             normalize: True 时所有 series 各自 min-max 映射到 [0,1]，强制单轴
                 （忽略右轴）。默认 False（双轴/单轴按 right_series_list 决定）。
+            selected_names: 可选，已选中的 series 名集合（与 picker._selected 对齐）。
+                None = 全部不勾选（保持旧行为）；非空 = 命中的 checkbox 自动勾选
+                并将对应 line 设为 visible=True，让 picker 与 chart 真正联动。
+                这同时修复了 v5.20 起 picker 与 chart 两套 UI 互不关联导致的
+                "已选 N 项 / 图表空白" 现象 (v5.33 修复)。
         """
         normalize = bool(normalize)
         right_list = list(right_series_list) if right_series_list else []
+        # v5.33 修复：picker 选中状态透传到 chart；空集合视为"不联动"（默认行为）
+        selected_set = set(selected_names) if selected_names else set()
+        auto_show = bool(selected_set)
 
         # 保存当前数据
         self._current_times = times
@@ -407,6 +416,8 @@ class ChartWidget(QWidget):
             for i, series in enumerate(all_series):
                 color = colors[i % len(colors)]
                 ndata = _normalize_series(series.get('data', []))
+                # v5.33: 命中 picker 已选时立刻显示（picker->chart 联动）
+                line_visible = auto_show and (series['name'] in selected_set)
                 line, = ax.plot(
                     list(range(len(times))),
                     ndata,
@@ -415,12 +426,19 @@ class ChartWidget(QWidget):
                     linewidth=1.8,
                     label=series['name'],
                     color=color,
-                    visible=False,
+                    visible=line_visible,
                 )
                 line._owner_ax = ax
                 self._lines[series['name']] = line
 
+                # v5.33: 同步把命中的 checkbox 创建为 checked，并阻断它的首个 stateChanged
+                # 事件（lambda 会再调 _toggle_line，但 visible 已经是正确值，安全幂等）
+                cb_state = line_visible
                 checkbox = self._make_checkbox(series['name'], color)
+                if line_visible:
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(True)
+                    checkbox.blockSignals(False)
                 self._checkboxes[series['name']] = checkbox
                 self._checkbox_layout.addWidget(checkbox)
 
@@ -429,6 +447,8 @@ class ChartWidget(QWidget):
             # 左轴 series
             for i, series in enumerate(series_list or []):
                 color = colors[i % len(colors)]
+                # v5.33: picker 联动
+                line_visible = auto_show and (series['name'] in selected_set)
                 line, = ax.plot(
                     list(range(len(times))),
                     series.get('data', []),
@@ -437,12 +457,16 @@ class ChartWidget(QWidget):
                     linewidth=1.8,
                     label=series['name'],
                     color=color,
-                    visible=False,
+                    visible=line_visible,
                 )
                 line._owner_ax = ax
                 self._lines[series['name']] = line
 
                 checkbox = self._make_checkbox(series['name'], color)
+                if line_visible:
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(True)
+                    checkbox.blockSignals(False)
                 self._checkboxes[series['name']] = checkbox
                 self._checkbox_layout.addWidget(checkbox)
 
@@ -452,6 +476,7 @@ class ChartWidget(QWidget):
                 ax2 = ax.twinx()
                 for i, series in enumerate(right_list):
                     color = colors[(len(series_list or []) + i) % len(colors)]
+                    line_visible = auto_show and (series['name'] in selected_set)
                     line, = ax2.plot(
                         list(range(len(times))),
                         series.get('data', []),
@@ -460,12 +485,16 @@ class ChartWidget(QWidget):
                         linewidth=1.8,
                         label=series['name'],
                         color=color,
-                        visible=False,
+                        visible=line_visible,
                     )
                     line._owner_ax = ax2
                     self._right_lines[series['name']] = line
 
                     checkbox = self._make_checkbox(series['name'], color)
+                    if line_visible:
+                        checkbox.blockSignals(True)
+                        checkbox.setChecked(True)
+                        checkbox.blockSignals(False)
                     self._right_checkboxes[series['name']] = checkbox
                     self._checkbox_layout.addWidget(checkbox)
                 ax2.set_ylabel(right_ylabel or "右轴", fontsize=9)

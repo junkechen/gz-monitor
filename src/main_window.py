@@ -988,7 +988,20 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._setup_warning()
         self._setup_menu()
-        self._refresh_data()  # 初始加载数据
+        # v5.33 修复 Win7「登录后啥也不显示就退了」的症状：
+        # 历史实现里 _refresh_data() 在 __init__ 主线程同步执行，里面会走
+        # multi_client.get_all_realtime_data() 同步 HTTP API。Win10 上快到看不出问题，
+        # 但 Win7 / 慢网络 / 等鉴权 cookie 时会阻塞主线程几十秒甚至几分钟，导致
+        # QTimer.singleShot 调度的 show_main_window 回调进不去 → 主窗口永远不显示 →
+        # 任务管理器看到「进程在 / CPU=0 / 不显示」。
+        # 修复：先让主窗口 show 出来，再异步触发首次刷新；首屏画完后再去取数。
+        try:
+            from main import _write_crash_log
+            _write_crash_log('MAIN_WINDOW_INIT_OK',
+                             f'init_ui done, defer refresh_data to next event loop tick\n')
+        except Exception:
+            pass
+        QTimer.singleShot(0, self._refresh_data)
 
         # 三项优化 T04：启动预测自动更新定时器（预测由 60s 定时器统一触发，避免与首屏刷新聚集）
         if self.auto_update_prediction and not self.prediction_timer.isActive():
@@ -5355,6 +5368,17 @@ class MainWindow(QMainWindow):
             logger.info(f"[PRED-CHART] plot_series begin: n_curves={len(raw_curves)}, mode={mode}, normalize={normalize}, "
                         f"canvas_size={self.pred_chart.canvas.width()}x{self.pred_chart.canvas.height()}, "
                         f"chart_size={self.pred_chart.width()}x{self.pred_chart.height()}")
+            # v5.33 修复：把 picker 当前已选项透传给 chart_widget 的 plot_series，
+            # 让 line / checkbox 与 ParamPickerPanel._selected 同步，避免出现
+            # "ParamPickerPanel 已选 19 项，但 matplotlib 图表区域空白" 这个老 bug。
+            # 之前 picker 与 chart 是两套独立 UI，plot 时 line 永远 visible=False、
+            # checkbox 永远 unchecked，必须用户手动点复选框才有曲线。
+            try:
+                _selected_now = set(self._get_checked_compare_params())
+            except Exception:
+                _selected_now = set()
+            _plotted_names = {c['name'] for c in raw_curves}
+            _selected_for_chart = _selected_now & _plotted_names
             self.pred_chart.plot_series(
                 times=common_times,
                 series_list=left_series,
@@ -5362,8 +5386,14 @@ class MainWindow(QMainWindow):
                 right_series_list=right_series,
                 right_ylabel=right_ylabel,
                 normalize=normalize,
+                selected_names=_selected_for_chart,
             )
             logger.info(f"[PRED-CHART] plot_series done; now draw_idle")
+            # v5.33: 让命中的 line 立刻落在合理 Y 轴范围内（用户无需手动触发）
+            try:
+                self.pred_chart._auto_scale()
+            except Exception:
+                pass
             self.pred_chart.canvas.draw_idle()
             logger.info(f"[PRED-CHART] draw_idle scheduled (Win7 关崩溃点)")
         except Exception as e:
