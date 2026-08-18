@@ -2,13 +2,11 @@
 """
 回归测试：预测趋势图绘制链路（多排放口对比 + 双轴 + 归一化）。
 
-背景：v5.27 修复 Win7 高分屏下"开始预测出图"原生崩溃（device_pixel_ratio
-非 1.0 导致 matplotlib QImage 尺寸越界）。本测试在无头(offscreen)下实际跑通
-ChartWidget.plot_series / clear / 双轴 / 归一化 全链路，确保：
-  1. device_pixel_ratio 始终为 1.0（修复核心）；
-  2. 含多 series、right_series_list(双轴)、normalize 的绘制不抛异常；
-  3. 绘制后 canvas 具备 renderer，下一次 paintEvent 不会因无 renderer 早退
-     （即不会在"出图"后崩）。
+背景：v5.23 的 HoverFigureCanvas 在 Win7 下稳定（用户实测 v5.23 不崩）；
+后续 v5.24/v5.27 为"加固"加的 device_pixel_ratio 锁与尺寸守卫反而引入
+出图原生崩溃，v5.29 已还原到 v5.23 状态。本测试在无头(offscreen)下实际跑通
+ChartWidget.plot_series / clear / 双轴 / 归一化 全链路，确保绘制不抛异常、
+绘制后 canvas 具备 renderer（否则"出图"后 paintEvent 早退等价于崩）。
 
 运行：
     set QT_QPA_PLATFORM=offscreen
@@ -40,11 +38,6 @@ def main():
             errors.append((label, repr(e), traceback.format_exc()))
 
     w = ChartWidget()
-
-    # 1) device_pixel_ratio 必须为 1.0
-    if getattr(w.canvas, "_device_pixel_ratio", None) != 1.0:
-        errors.append(("device_pixel_ratio",
-                        f"{getattr(w.canvas, '_device_pixel_ratio', None)!r}", ""))
 
     times = ["08-18 01:00", "08-18 02:00", "08-18 03:00", "08-18 04:00"]
 
@@ -94,7 +87,6 @@ def main():
         return 1
 
     print("[OK] 预测趋势图绘制全链路（多曲线/双轴/归一化/clear）无异常，renderer 已生成")
-    print("[OK] canvas.device_pixel_ratio == 1.0（Win7 高分屏兼容）")
     print("=== test_pred_chart_draw 通过 ===")
     return 0
 

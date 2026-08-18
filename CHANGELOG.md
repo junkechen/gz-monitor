@@ -1,6 +1,29 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.28（2026-08-18）✅ 当前版本
+## v5.29（2026-08-18）✅ 当前版本
+
+### 🐛 修复（Win7 预测页「出图/趋势图」闪退 — 真正根因：v5.24/v5.27 的画布加固回归）
+- **现象**：v5.28 已去掉 `Qt.Popup` 浮层，但用户实测"**趋势图预测后，闪退**"——崩溃点在"开始预测→出图"那一刻，并非浮层
+- **定位方法（关键）**：用 `git diff 9b0ba46(v5.23) HEAD` 逐行比对预测绘制路径，结论：
+  - `main_window.py` 的"出图"函数（`_draw_pred_chart_multi` / `_show_prediction_chart` / `pred_chart.plot_series` 等）在 v5.23→当前**完全没改**
+  - `chart_widget.py` 的**绘制逻辑（plot_series 等）也没改**
+  - 唯一差异 = 我 v5.24（尺寸守卫）+ v5.27（DPR 锁 + `_update_pixel_ratio` 覆盖 + `setDevicePixelRatio(1.0)`）加的 `HoverFigureCanvas` 包装器
+- **根因**：v5.23 的 `HoverFigureCanvas` 是干净的（无 `setDevicePixelRatio`、无守卫、无覆盖），让 matplotlib 自然处理 DPI 在 Win7 上稳定。我加的 `setDevicePixelRatio(1.0)` 让画布内部缓冲(1.0)与 Win7 屏幕 DPI(1.25/1.5) 失配，加上 `_update_pixel_ratio` 覆盖打乱 matplotlib 原生 DPR 处理，出图时原生 blit 尺寸错位 → 段错误。**v5.23 不崩，正是因为没这些"加固"**
+- **修复**：把 `HoverFigureCanvas` **逐字节还原到 v5.23（9b0ba46）状态**（git blob `e7c1087` 一致）。移除 `setDevicePixelRatio` / `_has_valid_size` / `_update_pixel_ratio` / `resizeEvent`·`draw`·`draw_idle` 覆盖 / `QResizeEvent` import。v5.28 的浮层去 `Qt.Popup` 改动保留（是 genuine 的 Win7 安全改进，只是不是出图崩溃点）
+- **经验**：Win7 原生崩溃排查时，用 `git diff <已知好版本> HEAD` 锁定回归点，比"猜 matplotlib 内部机制"可靠得多；"为兼容而加的加固"可能反向引入崩溃
+
+### 🧪 测试
+- **删除** `tests/test_device_pixel_ratio.py`（断言 DPR 锁，已失效）
+- **改写** `tests/test_pred_chart_draw.py`：去掉 DPR 断言，保留"多曲线/双轴/归一化/clear 全链路不抛异常 + renderer 生成"覆盖
+- `tests/smoke_main_window.py` / `test_param_picker.py`(9/9) / `test_pred_chart_draw.py` 全部通过，无回归
+
+### 📦 产物
+- **产物**: `dist\GZ_Monitor_v5.29_Win7.exe`
+- **提交**: (待提交)
+
+---
+
+## v5.28（2026-08-18）（上一版）
 
 ### 🐛 修复（Win7 预测页「对比参数」下拉闪退 — 真正的根因）
 - **现象**：用户确认 **v5.23 在 Win7 不闪退**，但 v5.25 引入下拉浮层后、v5.26/v5.27 在 Win7 仍闪退（Win10 正常）
