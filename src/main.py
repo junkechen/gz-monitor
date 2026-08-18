@@ -234,16 +234,12 @@ try:
                                  f'SetUnhandledExceptionFilter registered, '
                                  f'addr=0x{_seh_c_addr:X}, prev=0x{prev or 0:X}\n')
 
-                # 同时注册 AddVectoredExceptionHandler 作为首发拦截（Windows XP+）
-                try:
-                    AddVectoredExceptionHandler = _kernel32.AddVectoredExceptionHandler
-                    AddVectoredExceptionHandler.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-                    AddVectoredExceptionHandler.restype = ctypes.c_void_p
-                    vec_handler = AddVectoredExceptionHandler(1, _seh_c_addr)  # CALL_FIRST
-                    _write_crash_log('VECTORED_HANDLER_INSTALLED',
-                                     f'AddVectoredExceptionHandler ok, handle=0x{vec_handler or 0:X}\n')
-                except Exception as vec_exc:
-                    _write_crash_log('VECTORED_HANDLER_SKIPPED', f'{vec_exc}\n')
+                # 注意：这里【刻意不】使用 AddVectoredExceptionHandler(CALL_FIRST)。
+                # 该 API 会在「每一次 first-chance 异常」(含 Python/Qt 内部可自行恢复的
+                # 良性异常) 时被首个调用，若处理函数对其一律返回 EXCEPTION_EXECUTE_HANDLER(1)
+                # 会打断正常的异常恢复流程，导致进程在启动/首绘时无故退出 (v5.31 的回归)。
+                # SetUnhandledExceptionFilter 是 last-chance 兜底，只在真正无人处理的
+                # 原生崩溃时触发，既能拿到 MiniDump 又不会干扰正常异常流，已足够。
             except Exception as seh_set_exc:
                 _write_crash_log('SEH_FAILED', f'SetUnhandledExceptionFilter failed: {seh_set_exc}\n')
         except Exception as load_exc:
