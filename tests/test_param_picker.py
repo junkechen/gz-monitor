@@ -28,6 +28,7 @@ SRC = os.path.abspath(os.path.join(HERE, "..", "src"))
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from PyQt5.QtCore import Qt  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 from pred_param_selector import ParamPickerPanel  # noqa: E402
@@ -52,6 +53,23 @@ def test_instantiation():
     for sub in ("toggle_btn", "popup", "search_edit", "_checkboxes"):
         assert hasattr(picker, sub), f"缺子组件: {sub}"
     print("[OK] 实例化 + 子组件就位")
+
+
+def test_popup_is_top_level():
+    """浮层必须是顶层窗口（parent=None）。
+
+    回归锁：v5.25 曾把浮层设为 `QWidget(self)` + Qt.Popup，使其位于"隐藏的预测页签"
+    内；打开预测页签时 Qt 为这个带顶层标志的子控件创建原生窗口而父级尚未窗口化，
+    在 Win7 下直接段错误闪退。改为 parent=None 的顶层弹窗后，隐藏时不创建 HWND，
+    仅点击展开时作为独立顶层窗口显示，彻底规避。
+    """
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    picker = ParamPickerPanel()
+    assert picker.popup.parent() is None, \
+        f"浮层必须是顶层窗口(parent=None)，实际 parent={picker.popup.parent()}"
+    assert picker.popup.windowFlags() & Qt.Popup == Qt.Popup, \
+        "浮层应带 Qt.Popup 顶层标志"
+    print("[OK] 浮层为顶层窗口(Qt.Popup, parent=None) — 规避 Win7 打开预测页签闪退")
 
 
 def test_set_available_params_dedup():
@@ -173,6 +191,7 @@ def main():
     failures = []
     tests = [
         test_instantiation,
+        test_popup_is_top_level,
         test_set_available_params_dedup,
         test_select_get_roundtrip,
         test_classify_priority,

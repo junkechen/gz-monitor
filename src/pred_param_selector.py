@@ -169,7 +169,13 @@ class ParamPickerPanel(QWidget):
         self._build_popup()
 
     def _build_popup(self) -> None:
-        self.popup = QWidget(self)
+        # ⚠️ 必须是顶层窗口（parent=None）！
+        # 若设为 self 的子控件并带 Qt.Popup 顶层标志，则该控件位于"隐藏的预测页签"
+        # 内；一旦用户打开预测页签、Qt 为这个带顶层标志的子控件创建原生窗口(HWND)，
+        # 而其父级尚未完成原生窗口化，Win7 下会直接段错误闪退（offscreen 无法复现）。
+        # 改为 parent=None 的顶层弹窗：隐藏时不创建 HWND，仅点击展开时作为独立顶层
+        # 窗口显示，彻底规避该崩溃。
+        self.popup = QWidget(None)
         self.popup.setWindowFlags(Qt.Popup)
         self.popup.setMinimumWidth(340)
         self.popup.setStyleSheet(self._popup_style())
