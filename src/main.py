@@ -505,7 +505,7 @@ if current_dir not in sys.path:
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QFont, QColor, QPalette
-from PyQt5.QtCore import QTimer, Qt, QtMsgType, qInstallMessageHandler
+from PyQt5.QtCore import QTimer, Qt, QtMsgType, qInstallMessageHandler, QThread, pyqtSignal
 
 from main_window import LoginDialog, MainWindow
 from multi_account_api import GZMultiAccountClient
@@ -515,6 +515,40 @@ from config import BUILTIN_ACCOUNTS
 # 全局窗口引用（防止GC）
 _main_window = None
 _login_dialog = None
+_login_worker = None  # v5.38: 后台登录线程引用（防止 QThread 运行时被析构而 qFatal）
+
+
+class LoginWorker(QThread):
+    """后台登录线程（v5.38 性能优化）。
+
+    原实现把 multi_client.login_all()（5 个账户逐个登录 + time.sleep(0.5) 的
+    串行网络请求）直接跑在主线程，登录期间 UI 完全卡死。现在移入后台线程，
+    进度与结果通过 pyqtSignal 桥接回主线程更新登录对话框，绝不跨线程直接
+    调用 Qt 控件。
+    """
+    progress = pyqtSignal(str)          # 登录进度消息
+    login_finished = pyqtSignal(dict)   # 登录结果 dict
+
+    def __init__(self, multi_client, parent=None):
+        super().__init__(parent)
+        self._multi_client = multi_client
+
+    def run(self):
+        """后台执行 login_all，进度/结果通过信号回主线程"""
+        try:
+            result = self._multi_client.login_all(progress_callback=self.progress.emit)
+            self.login_finished.emit(result)
+        except Exception as e:
+            print(f">>> 登录线程异常: {e}")
+            import traceback
+            traceback.print_exc()
+            self.login_finished.emit({
+                "success": False,
+                "message": f"登录失败: {str(e)}",
+                "success_count": 0,
+                "fail_count": 0,
+                "total": 0,
+            })
 
 
 def main():
@@ -544,12 +578,21 @@ def main():
     # 显示登录对话框
     _login_dialog = LoginDialog(version=version)
 
-    # 直接在对话框显示后执行多账户登录
+    # 显示登录对话框后执行多账户登录（v5.38: 登录移入后台线程，UI 不再卡死）
     def do_multi_account_login():
-        global _main_window, _login_dialog
+        global _main_window, _login_dialog, _login_worker
 
         try:
             print(">>> 开始登录流程...")
+
+            # 防止重复点击：上一次登录线程仍在运行则忽略
+            if _login_worker is not None:
+                try:
+                    if _login_worker.isRunning():
+                        print(">>> 登录线程已在运行，忽略重复点击")
+                        return
+                except RuntimeError:
+                    _login_worker = None
 
             # 创建多账户客户端并添加所有内置账户
             multi_client = GZMultiAccountClient()
@@ -557,48 +600,73 @@ def main():
                 multi_client.add_account(account['name'], account['password'])
             print(f">>> 已添加 {len(BUILTIN_ACCOUNTS)} 个账户")
 
-            # 登录所有账户
+            # 登录所有账户（v5.38: 后台线程执行，不阻塞主线程）
             _login_dialog.login_btn.setEnabled(False)
-            print(">>> 开始登录所有账户...")
-            result = multi_client.login_all(progress_callback=_login_dialog.set_login_progress)
-            print(f">>> 登录结果: {result}")
+            print(">>> 开始登录所有账户（后台线程）...")
 
-            if result['success']:
-                _login_dialog.set_login_result(True, result['message'])
-                print(">>> 登录成功，准备显示主窗口...")
+            def _on_login_progress(msg):
+                # 主线程更新登录进度（信号已桥接回主线程）
+                _login_dialog.set_login_progress(msg)
 
-                # 延迟1秒后显示主窗口
-                def show_main_window():
-                    global _main_window
-                    try:
-                        print(">>> 隐藏登录对话框...")
-                        _login_dialog.hide()
-                        print(">>> 创建主窗口...")
-                        _main_window = MainWindow(multi_client)
-                        print(">>> 显示主窗口...")
-                        _main_window.show()
-                        print(">>> 主窗口已显示")
+            def _on_login_finished(result):
+                print(f">>> 登录结果: {result}")
+                # 注意：这里不能把 _login_worker 置 None（线程可能尚未结束，
+                # 提前丢引用会让 QThread 运行时被析构而 qFatal），统一交给
+                # _on_login_worker_finished 在 finished 信号里清理。
+                if result.get('success'):
+                    _login_dialog.set_login_result(True, result.get('message', ''))
+                    print(">>> 登录成功，准备显示主窗口...")
 
-                        # 首次启动教学引导：延迟触发，等主窗口布局稳定后展示遮罩
+                    # 延迟1秒后显示主窗口
+                    def show_main_window():
+                        global _main_window
                         try:
-                            from user_data_manager import is_first_run
-                            if is_first_run():
-                                QTimer.singleShot(800, _main_window.start_onboarding)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f">>> 创建主窗口失败: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        _login_dialog.show()
-                        _login_dialog.set_login_result(False, f"创建窗口失败: {str(e)}")
-                        _login_dialog.login_btn.setEnabled(True)
+                            print(">>> 隐藏登录对话框...")
+                            _login_dialog.hide()
+                            print(">>> 创建主窗口...")
+                            _main_window = MainWindow(multi_client)
+                            print(">>> 显示主窗口...")
+                            _main_window.show()
+                            print(">>> 主窗口已显示")
 
-                QTimer.singleShot(1000, show_main_window)
-            else:
-                _login_dialog.set_login_result(False, result['message'])
-                _login_dialog.login_btn.setEnabled(True)
-                print(">>> 登录失败")
+                            # 首次启动教学引导：延迟触发，等主窗口布局稳定后展示遮罩
+                            try:
+                                from user_data_manager import is_first_run
+                                if is_first_run():
+                                    QTimer.singleShot(800, _main_window.start_onboarding)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f">>> 创建主窗口失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            _login_dialog.show()
+                            _login_dialog.set_login_result(False, f"创建窗口失败: {str(e)}")
+                            _login_dialog.login_btn.setEnabled(True)
+
+                    QTimer.singleShot(1000, show_main_window)
+                else:
+                    _login_dialog.set_login_result(False, result.get('message', ''))
+                    _login_dialog.login_btn.setEnabled(True)
+                    print(">>> 登录失败")
+
+            def _on_login_worker_finished():
+                # 线程已结束：安全释放全局引用 + deleteLater（析构安全）
+                global _login_worker
+                w = _login_worker
+                _login_worker = None
+                if w is not None:
+                    try:
+                        w.deleteLater()
+                    except Exception:
+                        pass
+
+            _login_worker = LoginWorker(multi_client)
+            _login_worker.progress.connect(_on_login_progress)
+            _login_worker.login_finished.connect(_on_login_finished)
+            _login_worker.finished.connect(_on_login_worker_finished)
+            _login_worker.start()
+            print(">>> 登录线程已启动")
 
         except Exception as e:
             print(f">>> 登录过程发生错误: {e}")

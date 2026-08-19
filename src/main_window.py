@@ -9,6 +9,7 @@ import os
 import time
 import gc
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -429,6 +430,45 @@ class PredictionWorker(QThread):
     def _get_wl(value, param_name, thresholds):
         from data_processor import get_warning_level as _gwl
         return _gwl(value, param_name, thresholds)
+
+
+class RefreshDataWorker(QThread):
+    """后台刷新取数线程（v5.38 性能优化）。
+
+    原 _do_refresh_data 在主线程同步执行：
+      multi_client.get_all_realtime_data()（内部 ThreadPoolExecutor 但阻塞等待全部返回）
+      + parse_realtime_data + merge_corrected_data_into_grouped（热电厂排口同步联网取折算值）。
+    网络慢时 UI 完全冻结。本类把"取数 + 解析分组 + 折算合并"三个纯计算/网络步骤
+    移入后台线程，完成后通过 data_ready 信号把结果传回主线程，主线程只做 UI 更新。
+    """
+    data_ready = pyqtSignal(object)    # payload = (grouped_data, grouped_data_for_warning)
+    fetch_failed = pyqtSignal(str)     # 失败消息
+
+    def __init__(self, multi_client, parent=None):
+        super().__init__(parent)
+        self._multi_client = multi_client
+
+    def run(self):
+        """后台执行取数 + 折算合并"""
+        import traceback
+        try:
+            realtime_data = self._multi_client.get_all_realtime_data()
+            if not realtime_data.get('rows') or len(realtime_data.get('rows', [])) == 0:
+                self.fetch_failed.emit("数据获取失败或无数据")
+                return
+
+            # 解析并按排放口分组
+            grouped_data = parse_realtime_data(realtime_data)
+
+            # 热电厂折算数据注入（预警系统和实时监控都使用）
+            grouped_data_for_warning = merge_corrected_data_into_grouped(
+                grouped_data, self._multi_client, None
+            )
+
+            self.data_ready.emit((grouped_data, grouped_data_for_warning))
+        except Exception as e:
+            traceback.print_exc()
+            self.fetch_failed.emit(f"刷新数据异常: {e}")
 
 
 # ==================== 版本检测 ====================
@@ -984,6 +1024,11 @@ class MainWindow(QMainWindow):
         self._refresh_timer_coalesce = None       # 节流合并定时器（T04）
         self._hist_worker = None                  # 后台历史取数 worker
         self._hist_results = {}                   # 历史取数结果累加 {subid: {...}}
+        # v5.38: 实时刷新后台取数 worker（防线程堆积 + 生命周期安全）
+        self._refresh_worker = None               # 后台刷新 worker 引用（防止 QThread 运行时被析构）
+        self._refresh_worker_running = False      # 后台刷新是否在途（防刷新风暴）
+        # v5.38: 按需预测并发上限（同一时刻最多 2 个），超限直接跳过不排队
+        self._ondemand_sem = threading.BoundedSemaphore(2)
 
         self._init_ui()
         self._setup_warning()
@@ -2585,50 +2630,80 @@ class MainWindow(QMainWindow):
         self._refresh_data()
 
     def _do_refresh_data(self):
-        """实际的数据刷新逻辑（从_refresh_data拆出）"""
+        """实际的数据刷新逻辑（v5.38: 取数+折算合并移入后台线程，主线程只做 UI 更新）"""
         self.last_update_label.setText(f"最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self._update_status_bar()
 
-        # ── 内存管理：定期执行垃圾回收 ───────────────────────────────────────
+        # ── 内存管理：定期执行垃圾回收（保留在主线程） ───────────────────────
         self._gc_counter += 1
         if self._gc_counter >= self._gc_interval:
             self._gc_counter = 0
             self._check_memory()
 
-        # 获取所有企业实时数据
-        realtime_data = self.multi_client.get_all_realtime_data()
-        if not realtime_data.get('rows') or len(realtime_data.get('rows', [])) == 0:
-            self.last_update_label.setText(f"最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (数据获取失败)")
-            logger.warning("获取实时数据失败或无数据")
-            # 不弹 QMessageBox，改为状态栏提示，避免阻塞定时器
+        # ── v5.38: 防止刷新风暴：上一轮后台取数仍在跑则跳过本次，绝不堆积线程 ──
+        if getattr(self, '_refresh_worker_running', False):
+            logger.info("后台刷新仍在进行，跳过本次刷新（防线程堆积）")
             return
+        rw = getattr(self, '_refresh_worker', None)
+        if rw is not None:
+            try:
+                if rw.isRunning():
+                    logger.info("后台刷新仍在进行，跳过本次刷新（防线程堆积）")
+                    return
+            except RuntimeError:
+                self._refresh_worker = None
 
-        # 解析并按排放口分组
-        grouped_data = parse_realtime_data(realtime_data)
+        self._refresh_worker_running = True
+        worker = RefreshDataWorker(self.multi_client)
+        worker.data_ready.connect(self._on_refresh_data_ready)
+        worker.fetch_failed.connect(self._on_refresh_fetch_failed)
+        worker.finished.connect(self._on_refresh_worker_finished)
+        self._refresh_worker = worker
+        worker.start()
 
-        # ── 热电厂折算数据注入（预警系统和实时监控都使用） ──────────────────
-        # 热电厂（企业名含"热电"）需要使用折算值进行预警判断和实时显示
-        # 对 grouped_data 中的热电厂，用折算数据替换实测值
-        grouped_data_for_warning = merge_corrected_data_into_grouped(
-            grouped_data, self.multi_client, None
-        )
-        # 实时监控和预警系统都使用包含折算值的数据
-        self.current_grouped_data = grouped_data_for_warning
+    def _on_refresh_data_ready(self, payload):
+        """后台取数完成：在主线程更新 UI（v5.38）"""
+        try:
+            grouped_data, grouped_data_for_warning = payload
+            # 实时监控和预警系统都使用包含折算值的数据（主线程更新，供预测 worker 等读取）
+            self.current_grouped_data = grouped_data_for_warning
 
-        # 更新排放口列表
-        self._update_sub_list(grouped_data)
+            # 更新排放口列表
+            self._update_sub_list(grouped_data)
 
-        # 检查预警（使用包含折算值的数据）
-        self.warning_system.check_and_alert(grouped_data_for_warning, self.thresholds)
+            # 检查预警（使用包含折算值的数据）
+            self.warning_system.check_and_alert(grouped_data_for_warning, self.thresholds)
 
-        # 如果有选中的排放口，显示其数据
-        if hasattr(self, 'selected_subid'):
-            self._show_sub_realtime(self.selected_subid)
+            # 如果有选中的排放口，显示其数据
+            if hasattr(self, 'selected_subid'):
+                self._show_sub_realtime(self.selected_subid)
 
-        # 三项优化 T04：预测改由 prediction_timer(60s) 统一触发，
-        # 不再在每次数据刷新内叠加调用，避免重复预测导致卡顿
+            # 三项优化 T04：预测改由 prediction_timer(60s) 统一触发，
+            # 不再在每次数据刷新内叠加调用，避免重复预测导致卡顿
 
-        logger.info(f"数据刷新完成，共 {len(grouped_data)} 个排放口")
+            logger.info(f"数据刷新完成，共 {len(grouped_data)} 个排放口")
+        except Exception as e:
+            logger.error(f"刷新数据后处理异常: {e}", exc_info=True)
+
+    def _on_refresh_fetch_failed(self, msg):
+        """后台取数失败：仅提示，不弹窗阻塞定时器（v5.38）"""
+        try:
+            self.last_update_label.setText(
+                f"最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ({msg})")
+            logger.warning(f"获取实时数据失败: {msg}")
+        except Exception:
+            pass
+
+    def _on_refresh_worker_finished(self):
+        """后台刷新线程结束：清理引用，允许下一次刷新（v5.38）"""
+        self._refresh_worker_running = False
+        w = getattr(self, '_refresh_worker', None)
+        self._refresh_worker = None
+        if w is not None:
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
 
     def _update_sub_list(self, grouped_data):
         """更新排放口列表（支持多企业）"""
@@ -4596,6 +4671,7 @@ class MainWindow(QMainWindow):
 
         if not predictions:
             self.pred_table.setUpdatesEnabled(True)
+            self.pred_table.viewport().update()
             self.pred_result_label.setText("暂无预测结果")
             return
 
@@ -4717,6 +4793,7 @@ class MainWindow(QMainWindow):
             summary = f"共 {total} 条预测，未来 {horizon if horizon else 0} 小时内全部正常 ✅"
         self.pred_result_label.setText(summary)
         self.pred_table.setUpdatesEnabled(True)
+        self.pred_table.viewport().update()
 
     def _show_hour_prediction_table(self, predictions):
         """显示小时预测结果（动态多小时列）"""
@@ -4972,45 +5049,65 @@ class MainWindow(QMainWindow):
                 # 对象已被销毁，清理后允许重建
                 workers.pop(param_name, None)
 
+        # v5.38: 并发上限——同一时刻最多 2 个按需预测 worker，超限直接跳过。
+        # 按需预测只是锦上添花（补全缺失参数的预测点），跳过不影响已显示曲线，
+        # 下次刷新/交互会再补；绝不阻塞排队，避免 Win7 老机器线程堆积卡顿。
+        if not self._ondemand_sem.acquire(blocking=False):
+            print(f"[PRED] 按需预测并发已满(2)，跳过: {param_name}")
+            return
+
         pred_type = getattr(self, '_pred_chart_title', '小时数据预测') or '小时数据预测'
         self._on_demand_param = param_name
 
-        worker = PredictionWorker(
-            grouped_data=self.current_grouped_data,
-            multi_client=self.multi_client,
-            prediction_horizon=self.prediction_horizon,
-            prediction_params=[param_name],
-            pred_type=pred_type,
-            thresholds=self.thresholds,
-            sub_itemcodes_cache=self._sub_itemcodes_cache,
-            api_data_cache=self._api_data_cache,
-            thresholds_cache=getattr(self, '_thresholds_cache', {}),
-            get_subtype_code_fn=get_subtype_code,
-            is_water_sub_fn=is_water_sub,
-            code_to_name_map=CODE_TO_NAME,
-            intervention_sm=getattr(self, '_intervention_sm', None),
-            get_sub_itemcodes_fn=self._get_sub_itemcodes,
-        )
-        # 用默认参数 pn=param_name 固化闭包，避免循环变量延迟绑定
-        worker.prediction_done.connect(
-            lambda preds, pn=param_name: self._on_ondemand_prediction_done(preds, pn)
-        )
+        try:
+            worker = PredictionWorker(
+                grouped_data=self.current_grouped_data,
+                multi_client=self.multi_client,
+                prediction_horizon=self.prediction_horizon,
+                prediction_params=[param_name],
+                pred_type=pred_type,
+                thresholds=self.thresholds,
+                sub_itemcodes_cache=self._sub_itemcodes_cache,
+                api_data_cache=self._api_data_cache,
+                thresholds_cache=getattr(self, '_thresholds_cache', {}),
+                get_subtype_code_fn=get_subtype_code,
+                is_water_sub_fn=is_water_sub,
+                code_to_name_map=CODE_TO_NAME,
+                intervention_sm=getattr(self, '_intervention_sm', None),
+                get_sub_itemcodes_fn=self._get_sub_itemcodes,
+            )
+            # 用默认参数 pn=param_name 固化闭包，避免循环变量延迟绑定
+            worker.prediction_done.connect(
+                lambda preds, pn=param_name: self._on_ondemand_prediction_done(preds, pn)
+            )
 
-        # 完成后：先从 dict 移除引用，再 deleteLater（此时线程已 finished，析构安全）
-        def _cleanup(w=worker, pn=param_name):
+            # 完成后：先从 dict 移除引用，再 deleteLater（此时线程已 finished，析构安全）
+            def _cleanup(w=worker, pn=param_name):
+                try:
+                    self._pred_ondemand_workers.pop(pn, None)
+                except Exception:
+                    pass
+                try:
+                    w.deleteLater()
+                except Exception:
+                    pass
+                # v5.38: 释放并发槽位，允许下一个缺失参数发起按需预测
+                try:
+                    self._ondemand_sem.release()
+                except Exception:
+                    pass
+
+            worker.finished.connect(_cleanup)
+            workers[param_name] = worker
+            worker.start()
+            print(f"[PRED] 按需预测已发起: {param_name}")
+        except Exception as e:
+            # 发起失败：释放并发槽位，避免信号量泄漏
             try:
-                self._pred_ondemand_workers.pop(pn, None)
+                self._ondemand_sem.release()
             except Exception:
                 pass
-            try:
-                w.deleteLater()
-            except Exception:
-                pass
-
-        worker.finished.connect(_cleanup)
-        workers[param_name] = worker
-        worker.start()
-        print(f"[PRED] 按需预测已发起: {param_name}")
+            print(f"[ERROR] 按需预测发起失败: {e}")
 
     def _on_ondemand_prediction_done(self, new_preds, param_name):
         """按需预测完成：合并进趋势图缓存（仅刷新缓存，不触发整图重绘）。
@@ -5988,6 +6085,17 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
             self._hist_worker = None
+        # v5.38: 后台刷新取数 worker（新增，不改变上述 v5.36 生命周期逻辑）
+        rw = getattr(self, '_refresh_worker', None)
+        if rw is not None:
+            try:
+                if rw.isRunning():
+                    rw.quit()
+                    rw.wait(3000)
+            except RuntimeError:
+                pass
+            self._refresh_worker = None
+        self._refresh_worker_running = False
 
     def closeEvent(self, event):
         """关闭事件"""

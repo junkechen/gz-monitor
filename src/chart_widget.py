@@ -565,7 +565,8 @@ class ChartWidget(QWidget):
             _write_crash_log('PRED_STEP', 'before canvas.draw()\n')
         except Exception:
             pass
-        self.canvas.draw()
+        # v5.38: 同步 draw() 改为 draw_idle()（异步调度，不阻塞 UI 线程）
+        self.canvas.draw_idle()
         try:
             from main import _write_crash_log
             _write_crash_log('PRED_STEP', 'after canvas.draw() OK\n')
@@ -623,7 +624,8 @@ class ChartWidget(QWidget):
             else:
                 ax2.set_ylim(0, 1)
 
-        self.canvas.draw()
+        # v5.38: 全量重绘改为 draw_idle()（异步调度，避免 Win7 老机器卡顿）
+        self.canvas.draw_idle()
 
     @staticmethod
     def _collect_y(lines):
@@ -666,4 +668,5 @@ class ChartWidget(QWidget):
                 fontsize=12, color='gray')
         ax.set_xticks([])
         ax.set_yticks([])
-        self.canvas.draw()
+        # v5.38: clear 全量重绘改为 draw_idle()（异步调度）
+        self.canvas.draw_idle()

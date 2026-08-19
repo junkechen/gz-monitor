@@ -72,6 +72,10 @@ def main():
     ))
 
     # 5) 绘制后必须具备 renderer（否则下次 paintEvent 早退，等同于"出图后崩"）
+    # v5.38: plot_series 末尾 canvas.draw() 已改为 draw_idle()（异步调度，避免 Win7
+    # 卡顿）。renderer 在事件循环处理 idle draw 后生成，这里先 processEvents 让
+    # 异步重绘落地，再校验 renderer 存在（守护"出图后空白/崩"的原始意图不变）。
+    app.processEvents()
     if not hasattr(w.canvas, "renderer"):
         errors.append(("renderer", "plot_series 后 canvas 无 renderer", ""))
 
