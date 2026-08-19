@@ -4945,21 +4945,32 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _request_on_demand_prediction(self, param_name):
-        """对下拉框中选中的、尚未预测的参数发起后台按需预测。
+        """对尚未预测的参数发起后台按需预测。
 
-        仅刷新趋势图缓存，不会修改 self.prediction_params（用户已选指标），
-        也不会重建预测表，从而满足"不选择则预测所有参数"的既有逻辑不被破坏。
+        仅刷新趋势图缓存，不会修改 self.prediction_params，也不重建预测表。
+
+        重要：本函数会被图表组装循环按"缺失参数"逐个调用，一次可能并发发起多个
+        不同参数的预测。因此必须用 dict 保留所有在途 worker 的 Python 引用，
+        绝不能覆盖单一槽位——否则上一个仍在运行的 QThread 会因引用计数归零被
+        C++ 析构，触发 qFatal("QThread: Destroyed while thread is still running") 而闪退。
         """
         if not getattr(self, 'current_grouped_data', None):
             return
-        # 避免对同一参数重复发起后台任务
-        if (getattr(self, '_on_demand_param', None) == param_name
-                and getattr(self, '_pred_ondemand_worker', None) is not None):
+        # 按参数名保留在途 worker 引用，防止运行时被销毁
+        workers = getattr(self, '_pred_ondemand_workers', None)
+        if workers is None:
+            workers = {}
+            self._pred_ondemand_workers = workers
+
+        # 同一参数已在跑则跳过（避免重复发起）
+        existing = workers.get(param_name)
+        if existing is not None:
             try:
-                if self._pred_ondemand_worker.isRunning():
+                if existing.isRunning():
                     return
             except RuntimeError:
-                self._pred_ondemand_worker = None
+                # 对象已被销毁，清理后允许重建
+                workers.pop(param_name, None)
 
         pred_type = getattr(self, '_pred_chart_title', '小时数据预测') or '小时数据预测'
         self._on_demand_param = param_name
@@ -4980,11 +4991,24 @@ class MainWindow(QMainWindow):
             intervention_sm=getattr(self, '_intervention_sm', None),
             get_sub_itemcodes_fn=self._get_sub_itemcodes,
         )
+        # 用默认参数 pn=param_name 固化闭包，避免循环变量延迟绑定
         worker.prediction_done.connect(
-            lambda preds: self._on_ondemand_prediction_done(preds, param_name)
+            lambda preds, pn=param_name: self._on_ondemand_prediction_done(preds, pn)
         )
-        worker.finished.connect(worker.deleteLater)
-        self._pred_ondemand_worker = worker
+
+        # 完成后：先从 dict 移除引用，再 deleteLater（此时线程已 finished，析构安全）
+        def _cleanup(w=worker, pn=param_name):
+            try:
+                self._pred_ondemand_workers.pop(pn, None)
+            except Exception:
+                pass
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
+
+        worker.finished.connect(_cleanup)
+        workers[param_name] = worker
         worker.start()
         print(f"[PRED] 按需预测已发起: {param_name}")
 
@@ -5903,8 +5927,51 @@ class MainWindow(QMainWindow):
             f"开发日期：2026-03-21"
         )
 
+    def _stop_pred_workers(self):
+        """安全停止所有在途预测/取数线程，防止窗口关闭时 QThread 仍在运行被析构而 qFatal。"""
+        # 按需预测 worker（dict 按参数名）
+        workers = getattr(self, '_pred_ondemand_workers', None)
+        if workers:
+            for w in list(workers.values()):
+                try:
+                    if w.isRunning():
+                        w.quit()
+                except RuntimeError:
+                    pass
+            for w in list(workers.values()):
+                try:
+                    if w.isRunning():
+                        w.wait(3000)
+                except RuntimeError:
+                    pass
+            try:
+                self._pred_ondemand_workers.clear()
+            except Exception:
+                pass
+        # 主预测 worker
+        pw = getattr(self, '_pred_worker', None)
+        if pw is not None:
+            try:
+                if pw.isRunning():
+                    pw.quit()
+                    pw.wait(3000)
+            except RuntimeError:
+                pass
+            self._pred_worker = None
+        # 历史取数 worker
+        hw = getattr(self, '_hist_worker', None)
+        if hw is not None:
+            try:
+                if hw.isRunning():
+                    hw.quit()
+                    hw.wait(3000)
+            except RuntimeError:
+                pass
+            self._hist_worker = None
+
     def closeEvent(self, event):
         """关闭事件"""
+        self._stop_pred_workers()
         self.warning_system.stop_alert()
         event.accept()
 
