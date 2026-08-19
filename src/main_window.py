@@ -4174,6 +4174,17 @@ class MainWindow(QMainWindow):
 
     def _on_prediction_worker_done(self, all_predictions, pred_type, silent):
         """后台线程完成后在主线程执行UI更新"""
+        # ── Win7 诊断：定位静默崩溃环节 ─────────────────────────────────────
+        try:
+            from main import _write_crash_log
+            import threading
+            cur = threading.current_thread()
+            is_main = (cur is threading.main_thread())
+            _write_crash_log('PRED_STEP',
+                             f'worker_done entered; thread={cur.name} '
+                             f'is_main_thread={is_main} n_preds={len(all_predictions) if all_predictions else 0}\n')
+        except Exception:
+            pass
         QApplication.restoreOverrideCursor()
 
         # 调试日志
@@ -5198,6 +5209,12 @@ class MainWindow(QMainWindow):
              追加预测点 -> pred_chart.plot_series -> canvas.draw_idle()
         全程后台取数，主线程零阻塞（消除切指标卡顿）。
         """
+        # ── Win7 诊断埋点 ──────────────────────────────────────────────────
+        try:
+            from main import _write_crash_log
+            _write_crash_log('PRED_STEP', f'draw_pred_chart_multi entered; n_params={len(checked_params) if checked_params else 0} mode={mode}\n')
+        except Exception:
+            pass
         grouped = getattr(self, 'current_grouped_data', {}) or {}
         if not checked_params or not grouped:
             try:
@@ -5267,6 +5284,12 @@ class MainWindow(QMainWindow):
 
     def _assemble_and_plot_pred_chart(self, checked_params, mode):
         """从 _hist_results 组装 left/right series、追加预测点、归一化、截断并绘制。"""
+        # ── Win7 诊断埋点 ──────────────────────────────────────────────────
+        try:
+            from main import _write_crash_log
+            _write_crash_log('PRED_STEP', f'assemble_plot entered; mode={mode} n_results={len(getattr(self, "_hist_results", {}) or {})}\n')
+        except Exception:
+            pass
         results = getattr(self, '_hist_results', {}) or {}
         if not results:
             try:
@@ -5379,6 +5402,11 @@ class MainWindow(QMainWindow):
                 _selected_now = set()
             _plotted_names = {c['name'] for c in raw_curves}
             _selected_for_chart = _selected_now & _plotted_names
+            try:
+                from main import _write_crash_log
+                _write_crash_log('PRED_STEP', f'before plot_series; n_curves={len(raw_curves)} normalize={normalize} selected={len(_selected_for_chart)}\n')
+            except Exception:
+                pass
             self.pred_chart.plot_series(
                 times=common_times,
                 series_list=left_series,
@@ -5388,13 +5416,28 @@ class MainWindow(QMainWindow):
                 normalize=normalize,
                 selected_names=_selected_for_chart,
             )
+            try:
+                from main import _write_crash_log
+                _write_crash_log('PRED_STEP', 'plot_series returned OK\n')
+            except Exception:
+                pass
             logger.info(f"[PRED-CHART] plot_series done; now draw_idle")
             # v5.33: 让命中的 line 立刻落在合理 Y 轴范围内（用户无需手动触发）
             try:
                 self.pred_chart._auto_scale()
             except Exception:
                 pass
+            try:
+                from main import _write_crash_log
+                _write_crash_log('PRED_STEP', 'before draw_idle\n')
+            except Exception:
+                pass
             self.pred_chart.canvas.draw_idle()
+            try:
+                from main import _write_crash_log
+                _write_crash_log('PRED_STEP', 'draw_idle returned OK\n')
+            except Exception:
+                pass
             logger.info(f"[PRED-CHART] draw_idle scheduled (Win7 关崩溃点)")
         except Exception as e:
             logger.exception(f"[PRED-CHART] 绘制多指标预测趋势图失败: {e}")

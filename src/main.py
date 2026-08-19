@@ -400,6 +400,46 @@ except Exception:
     pass
 
 
+# ── Qt 消息钩子：捕获 qFatal/qCritical/qWarning（静默崩溃的决定性取证手段） ──
+# 关键：v5.34 发现 Win7 上「开始预测」后进程静默消失、却无任何 NATIVE_CRASH/UNCAUGHT
+# 记录 —— 说明崩溃绕过了 SetUnhandledExceptionFilter。头号嫌疑是 Qt 的 qFatal：
+# Qt 的 qFatal 默认行为是 abort()（或 _exit 1），根本不走 SEH；常见诱因如
+# 「Cannot create children for a parent that is in a different thread」「QWidget:
+# Must construct a QApplication before a QWidget」「QPainter::begin: Paint device
+# returned engine == 0」。下面把 Qt 所有消息（尤其 FATAL/CRITICAL）写进 crash.log，
+# 这样下次静默崩溃时日志里会留下 qFatal 的罪证文字，一锤定音。
+def _qt_message_handler(msg_type, context, msg: str) -> None:
+    try:
+        _names = {
+            QtMsgType.QtDebugMsg: 'DEBUG',
+            QtMsgType.QtInfoMsg: 'INFO',
+            QtMsgType.QtWarningMsg: 'WARNING',
+            QtMsgType.QtCriticalMsg: 'CRITICAL',
+            QtMsgType.QtFatalMsg: 'FATAL',
+            QtMsgType.QtSystemMsg: 'SYSTEM',
+        }
+        level = _names.get(msg_type, 'UNKNOWN')
+        ctx = ''
+        try:
+            if context and context.file:
+                ctx = f'  [Qt file={context.file} line={context.line} func={context.function}]'
+        except Exception:
+            pass
+        _write_crash_log('QT_MSG', f'[{level}] {msg}{ctx}\n')
+        if msg_type == QtMsgType.QtFatalMsg:
+            # qFatal 在返回后会由 Qt 默认行为 abort()，我们已在上面同步落盘；
+            # 这里再补一段 Python 栈（若此刻仍在 Python 调用帧里），便于定位触发点。
+            try:
+                import traceback as _tb
+                _write_crash_log('QT_FATAL', 'qFatal triggered; process will now abort.\n'
+                                 + ''.join(_tb.format_stack()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 注意：不要拦截 Qt 的后续默认行为（qFatal 仍会 abort 退出），这样进程确实退出。
+
+
 # ── Win7 环境诊断日志（启动时记录） ────────────────────────────────────────
 def _log_win7_diagnostics() -> None:
     """记录 OS/Python/Qt/matplotlib 版本以及设备像素比，便于 Win7 排查。"""
@@ -465,7 +505,7 @@ if current_dir not in sys.path:
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QFont, QColor, QPalette
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QtMsgType, qInstallMessageHandler
 
 from main_window import LoginDialog, MainWindow
 from multi_account_api import GZMultiAccountClient
@@ -490,6 +530,13 @@ def main():
 
     # 启动后立即记录 Win7 环境诊断（必须在 QApplication 创建后调用）
     _log_win7_diagnostics()
+
+    # 安装 Qt 消息钩子：把 qFatal/qCritical 等写进 crash.log（静默崩溃取证）
+    try:
+        qInstallMessageHandler(_qt_message_handler)
+        _write_crash_log('QT_MSG_HANDLER_INSTALLED', 'qInstallMessageHandler set\n')
+    except Exception:
+        pass
 
     # 判断版本
     version = _get_version()
