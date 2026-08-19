@@ -26,8 +26,31 @@ import matplotlib.patches as mpatches
 from datetime import datetime
 
 # 设置中文字体 - 优先使用系统自带的中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+# v5.34 防御性加固：Win7 上若 SimHei/Microsoft YaHei 等中文字体缺失或损坏，
+# FreeType 在渲染中文标题/标签时可能触发原生崩溃。这里把字体设置整体包进
+# try/except，并显式保证 DejaVu Sans（matplotlib 内置、必然存在）始终在回退链
+# 末端，避免「找不到任何可用字形」的极端情况。即便个别中文字体不可用，也能
+# 优雅回退到 DejaVu Sans 而非让 FreeType 在缺字路径上崩溃。
+try:
+    _sans_list = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS', 'DejaVu Sans']
+    # 仅保留当前环境真实存在的字体，进一步降低 FreeType 加载损坏/缺失字体文件的风险
+    try:
+        _fm = matplotlib.font_manager
+        _installed = {f.name for f in _fm.fontManager.ttflist}
+        _sans_list = [n for n in _sans_list if n in _installed] or _sans_list
+    except Exception:
+        pass
+    if 'DejaVu Sans' not in _sans_list:
+        _sans_list.append('DejaVu Sans')
+    plt.rcParams['font.sans-serif'] = _sans_list
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+except Exception:
+    # 兜底：任何字体配置异常都不能阻碍 matplotlib 初始化
+    try:
+        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+    except Exception:
+        pass
 
 # ── 时间缩写转换 ──────────────────────────────────────────────────────────────
 _MONTH_SHORT = {

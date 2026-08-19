@@ -115,6 +115,102 @@ try:
 
             _kernel32 = ctypes.windll.kernel32
 
+            # ── 增强诊断：把异常地址解析为「模块+偏移」并抓取调用栈 ───────────────
+            # 思路（v5.34 新增）：原生崩溃只拿到异常码没用，必须知道是哪个 DLL 的哪
+            # 一行出错。GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS)
+            # 可由任意地址反查其所属模块 HMODULE，再 GetModuleFileNameW 取路径 →
+            # basename 即模块名，偏移 = 地址 - 模块基址。CaptureStackBackTrace 抓
+            # 当前线程调用栈，逐帧同样解析为「模块+偏移」。这样用户下次崩溃时 crash.log
+            # 直接告诉我们是 Qt5Gui / Qt5Core / _image / ft2font / matplotlib /
+            # python38 等哪个模块出错，无需再传 .dmp。
+            _GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x4
+            try:
+                _kernel32.GetModuleHandleExW.argtypes = [
+                    ctypes.c_ulong, ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_void_p)]
+                _kernel32.GetModuleHandleExW.restype = ctypes.c_bool
+            except Exception:
+                pass
+            try:
+                _kernel32.GetModuleFileNameW.argtypes = [
+                    ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong]
+                _kernel32.GetModuleFileNameW.restype = ctypes.c_ulong
+            except Exception:
+                pass
+            try:
+                _kernel32.CaptureStackBackTrace.argtypes = [
+                    ctypes.c_ulong, ctypes.c_ulong,
+                    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_ulong)]
+                _kernel32.CaptureStackBackTrace.restype = ctypes.c_ushort
+            except Exception:
+                pass
+            try:
+                _kernel32.CreateFileW.argtypes = [
+                    ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong,
+                    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+                _kernel32.CreateFileW.restype = ctypes.c_void_p
+            except Exception:
+                pass
+
+            # 常见原生异常码 → 可读名（便于 crash.log 直接看出异常类型）
+            _EXCEPTION_CODE_NAMES = {
+                0xC0000005: 'EXCEPTION_ACCESS_VIOLATION',
+                0xC0000006: 'EXCEPTION_IN_PAGE_ERROR',
+                0xC000001D: 'EXCEPTION_ILLEGAL_INSTRUCTION',
+                0xC0000025: 'EXCEPTION_NONCONTINUABLE_EXCEPTION',
+                0xC0000026: 'EXCEPTION_INVALID_DISPOSITION',
+                0xC000008C: 'EXCEPTION_ARRAY_BOUNDS_EXCEEDED',
+                0xC000008D: 'EXCEPTION_FLT_DENORMAL_OPERAND',
+                0xC000008E: 'EXCEPTION_FLT_DIVIDE_BY_ZERO',
+                0xC000008F: 'EXCEPTION_FLT_INEXACT_RESULT',
+                0xC0000090: 'EXCEPTION_FLT_INVALID_OPERATION',
+                0xC0000091: 'EXCEPTION_FLT_OVERFLOW',
+                0xC0000092: 'EXCEPTION_FLT_STACK_CHECK',
+                0xC0000093: 'EXCEPTION_FLT_UNDERFLOW',
+                0xC0000094: 'EXCEPTION_INT_DIVIDE_BY_ZERO',
+                0xC00000FD: 'EXCEPTION_STACK_OVERFLOW',
+                0xC0000374: 'STATUS_HEAP_CORRUPTION',
+                0xC0000409: 'STATUS_STACK_BUFFER_OVERRUN',
+                0x80000003: 'EXCEPTION_BREAKPOINT',
+                0x80000004: 'EXCEPTION_SINGLE_STEP',
+            }
+
+            def _exception_code_name(code):
+                return _EXCEPTION_CODE_NAMES.get(int(code) & 0xFFFFFFFF)
+
+            def _resolve_module(addr):
+                """由地址反查所属模块，返回 (模块基名, 模块基址, 偏移)。无法解析返回 (None, addr, 0)。"""
+                if not addr:
+                    return (None, addr, 0)
+                try:
+                    hmod = ctypes.c_void_p()
+                    if _kernel32.GetModuleHandleExW(
+                            _GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            ctypes.c_void_p(int(addr)),
+                            ctypes.byref(hmod)) and hmod.value:
+                        buf = ctypes.create_unicode_buffer(1024)
+                        _kernel32.GetModuleFileNameW(hmod, buf, 1024)
+                        base = int(hmod.value)
+                        offset = int(addr) - base
+                        name = buf.value or ''
+                        short = os.path.basename(name) if name else '0x%X' % base
+                        return (short, base, offset)
+                except Exception:
+                    pass
+                return (None, addr, 0)
+
+            def _capture_stack_trace(max_frames=48):
+                """用 CaptureStackBackTrace 抓取当前线程调用栈（返回地址列表）。"""
+                frames = []
+                try:
+                    ary = (ctypes.c_void_p * max_frames)()
+                    n = _kernel32.CaptureStackBackTrace(0, max_frames, ary, None)
+                    n = int(n)
+                    frames = [int(ary[i]) for i in range(n)]
+                except Exception:
+                    pass
+                return frames
+
             EXCEPTION_MAXIMUM_PARAMS = 15  # 定义在 winnt.h
 
             class _EXCEPTION_RECORD(ctypes.Structure):
@@ -155,22 +251,62 @@ try:
             _proc_handle = _kernel32.GetCurrentProcess()
             _proc_id = _kernel32.GetCurrentProcessId()
 
-            def _seh_handler(exception_code):
-                """SEH 入口：写 .dmp + 写 crash.log 后让进程自然退出。"""
+            def _seh_handler(exception_code, exception_address=0, exc_ptrs=None):
+                """SEH 入口：写增强版 crash.log（含出错模块+偏移与调用栈）+ 落盘 .dmp。
+
+                Args:
+                    exception_code: 异常码（如 0xC0000005）。
+                    exception_address: 出错指令地址（EXCEPTION_RECORD.ExceptionAddress）。
+                    exc_ptrs: EXCEPTION_POINTERS 原始指针，用于把真实异常上下文写进 .dmp。
+                """
                 try:
                     log_dir = _log_dir_for_exe()
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     dmp_path = os.path.join(log_dir, f'crash_{_proc_id}_{ts}.dmp')
                     log_path = os.path.join(log_dir, 'crash.log')
-                    msg = (
-                        f"NATIVE SEH EXCEPTION 0x{exception_code & 0xFFFFFFFF:08X}\n"
-                        f"  timestamp: {ts}\n"
-                        f"  pid={_proc_id}\n"
-                        f"  dump: {dmp_path}\n"
-                    )
+                    code_name = _exception_code_name(exception_code)
+                    lines = []
+                    lines.append(
+                        f"NATIVE SEH EXCEPTION 0x{int(exception_code) & 0xFFFFFFFF:08X}"
+                        f"{(' (' + code_name + ')') if code_name else ''}")
+                    lines.append(f"  timestamp: {ts}")
+                    lines.append(f"  pid={_proc_id}")
+
+                    # ── 出错模块 + 偏移（由 ExceptionAddress 反查） ──
+                    if exception_address:
+                        mod, base, off = _resolve_module(int(exception_address))
+                        if mod:
+                            lines.append(f"  faulting_address = 0x{int(exception_address):X}")
+                            lines.append(
+                                f"  faulting_module   = {mod}  (base=0x{base:X}, offset=0x{off:X})")
+                        else:
+                            lines.append(
+                                f"  faulting_address = 0x{int(exception_address):X}  (module not resolved)")
+                    else:
+                        lines.append("  faulting_address = unknown")
+
+                    # ── 调用栈（每帧解析为 模块+偏移） ──
+                    try:
+                        frames = _capture_stack_trace()
+                        if frames:
+                            lines.append(f"  call_stack ({len(frames)} frames):")
+                            for i, f in enumerate(frames):
+                                m, b, o = _resolve_module(int(f))
+                                if m:
+                                    lines.append(f"    #{i:02d}  {m}+0x{o:X}   (0x{int(f):X})")
+                                else:
+                                    lines.append(f"    #{i:02d}  0x{int(f):X}   (module not resolved)")
+                        else:
+                            lines.append("  call_stack: (empty)")
+                    except Exception as st_exc:
+                        lines.append(f"  call_stack_error: {st_exc!r}")
+
+                    lines.append(f"  dump: {dmp_path}")
+                    msg = "\n".join(lines) + "\n"
                     with open(log_path, 'a', encoding='utf-8') as f:
                         f.write(f"\n===== NATIVE_CRASH {ts} =====\n{msg}\n")
-                    # 落盘 MiniDump
+
+                    # ── 落盘 MiniDump（携带真实异常上下文，便于事后符号化） ──
                     try:
                         out_file = _kernel32.CreateFileW(
                             ctypes.c_wchar_p(dmp_path),
@@ -181,25 +317,34 @@ try:
                             0x80,  # FILE_ATTRIBUTE_NORMAL
                             None,
                         )
-                        if out_file:
+                        if out_file and out_file != -1:  # -1 == INVALID_HANDLE_VALUE
                             # 用 MiniDumpWithFullMemory + 其它 flag
                             flags = (_MINIDUMP_TYPE.MiniDumpWithFullMemory
                                      | _MINIDUMP_TYPE.MiniDumpWithDataSegs
                                      | _MINIDUMP_TYPE.MiniDumpWithHandleData
-                                     | _MINIDUMP_TYPE.MiniDumpWithThreadInfo)
+                                     | _MINIDUMP_TYPE.MiniDumpWithThreadInfo
+                                     | _MINIDUMP_TYPE.MiniDumpWithUnloadedModules)
                             exception_info = _MINIDUMP_EXCEPTION_INFORMATION()
                             exception_info.ThreadId = _kernel32.GetCurrentThreadId()
-                            exception_info.ExceptionPointers = 0  # 简化
-                            exception_info.ClientPointers = False
+                            if exc_ptrs:
+                                # 把真实异常指针写进 dump，符号化时能直接定位 faulting IP
+                                exception_info.ExceptionPointers = ctypes.c_void_p(int(exc_ptrs))
+                                exception_info.ClientPointers = False
+                                ex_arg = ctypes.byref(exception_info)
+                            else:
+                                exception_info.ExceptionPointers = 0
+                                exception_info.ClientPointers = False
+                                ex_arg = None
                             _MINIDUMP_WRITE_DUMP(_proc_handle, _proc_id, out_file,
-                                                 flags,
-                                                 ctypes.byref(exception_info) if exception_info.ExceptionPointers else None,
-                                                 None, None)
+                                                 flags, ex_arg, None, None)
                             _kernel32.CloseHandle(out_file)
                     except Exception as dump_exc:
-                        with open(log_path, 'a', encoding='utf-8') as f:
-                            f.write(f"  dump write failed: {dump_exc}\n")
-                    # 必须返回 1 让异常被当作已处理（避免 nested 处理），但进程通常会退出
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(f"  dump write failed: {dump_exc!r}\n")
+                        except Exception:
+                            pass
+                    # 必须返回 1 让异常被当作已处理，但进程通常会退出
                     return 1  # EXCEPTION_EXECUTE_HANDLER
                 except Exception:
                     return 1
@@ -213,19 +358,25 @@ try:
                 SEH_HANDLER_TYPE = ctypes.WINFUNCTYPE(LONG, _EXCEPTION_POINTERS)
 
                 def _seh_trampoline(exc_ptrs):
-                    try:
-                        # EXCEPTION_POINTERS = { EXCEPTION_RECORD* pExceptionRecord; ... }
-                        # pExceptionRecord 首字段 DWORD ExceptionCode
-                        code = 0
-                        if exc_ptrs:
-                            try:
-                                # 读前 4 字节作为 ExceptionCode
-                                code = ctypes.c_uint32.from_address(exc_ptrs).value
-                            except Exception:
-                                code = 0
-                    except Exception:
-                        code = 0
-                    return _seh_handler(code)
+                    """SEH 分派入口：从 EXCEPTION_POINTERS 解析异常码与出错地址。"""
+                    code = 0
+                    addr = 0
+                    if exc_ptrs:
+                        try:
+                            # EXCEPTION_POINTERS = { PEXCEPTION_RECORD; PCONTEXT; }
+                            record_ptr = ctypes.c_void_p.from_address(int(exc_ptrs)).value
+                            if record_ptr:
+                                # EXCEPTION_RECORD 布局（winnt.h）：
+                                #   +0  DWORD  ExceptionCode
+                                #   +4  DWORD  ExceptionFlags
+                                #   +8  PVOID  ExceptionRecord
+                                #   +12 PVOID  ExceptionAddress  ← 出错指令地址
+                                code = ctypes.c_uint32.from_address(record_ptr).value
+                                addr = ctypes.c_void_p.from_address(record_ptr + 12).value
+                        except Exception:
+                            code = 0
+                            addr = 0
+                    return _seh_handler(code, addr, exc_ptrs)
 
                 _seh_c = SEH_HANDLER_TYPE(_seh_trampoline)
                 _seh_c_addr = ctypes.cast(_seh_c, ctypes.c_void_p).value
