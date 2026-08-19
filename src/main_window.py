@@ -5013,17 +5013,30 @@ class MainWindow(QMainWindow):
         print(f"[PRED] 按需预测已发起: {param_name}")
 
     def _on_ondemand_prediction_done(self, new_preds, param_name):
-        """按需预测完成：合并进趋势图缓存并重绘（仅刷新趋势图，不影响预测表）。"""
+        """按需预测完成：合并进趋势图缓存（仅刷新缓存，不触发整图重绘）。
+
+        v5.37 修复：此前这里会调用 _draw_pred_chart_multi 做完整重绘
+        （chart_widget.plot_series 内部 self.figure.clear() 全清，再按 selected_names
+        重建）。而预测完成后几秒内会有多个在途按需 worker 陆续完成，
+        每次完成的自动重绘把"刚显示几秒的预测曲线"清成空白，表现为
+        "曲线出现几秒后消失"。现改为仅合并预测点进缓存，由下一次正常刷新
+        （prediction_timer 60s / 用户交互 / _on_compare_params_changed）带上新预测点，
+        绝不主动清空已显示的趋势图。
+        """
+        try:
+            from main import _write_crash_log
+            _write_crash_log('PRED_STEP',
+                             f'ondemand_done entered; param={param_name} n_new={len(new_preds) if new_preds else 0}\n')
+        except Exception:
+            pass
         try:
             existing = getattr(self, '_pred_chart_all_predictions', []) or []
             # 用新结果替换该参数的旧预测，避免重复
             merged = [p for p in existing if p.get('param') != param_name]
             merged.extend(new_preds)
             self._pred_chart_all_predictions = merged
-
-            # 三项优化 T02：若该参数仍在勾选列表内，则刷新多指标对比图
-            if param_name in self._get_checked_compare_params():
-                self._draw_pred_chart_multi(self._get_checked_compare_params(), self._pred_chart_mode)
+            # v5.37: 不再调用 _draw_pred_chart_multi（会清空已显示的趋势图）。
+            # 新预测点将在下一次正常刷新时出现在图上。
         except Exception as e:
             print(f"[ERROR] 按需预测结果处理失败: {e}")
             import traceback
@@ -5315,6 +5328,13 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         results = getattr(self, '_hist_results', {}) or {}
+        try:
+            from main import _write_crash_log
+            _sel = set(self._get_checked_compare_params()) if getattr(self, '_get_checked_compare_params', None) else set()
+            _write_crash_log('PRED_STEP',
+                             f'assemble: n_hist_results={len(results)} checked={len(_sel)}\n')
+        except Exception:
+            pass
         if not results:
             try:
                 self.pred_chart.clear()
