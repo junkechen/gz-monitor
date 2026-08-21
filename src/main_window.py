@@ -157,21 +157,19 @@ class PredictionWorker(QThread):
                     logger.warning(f"[PRED_WORKER] 详细错误: {traceback.format_exc()}")
             
             if not codes:
-                logger.debug(f"[PRED_WORKER] {subname}: 无监测项目代码，尝试从grouped_data提取...")
-                # 备用方案：从grouped_data中直接提取code
+                logger.debug(f"[PRED_WORKER] {subname}: 无监测项目代码，尝试从当前排放口数据提取...")
+                # 备用方案：从当前排放口 sub_data 的 params 中直接提取 code
                 codes_set = set()
-                for key, val in group_data.items():
-                    if isinstance(val, dict) and 'params' in val:
-                        for p in val['params']:
-                            c = p.get('code')
-                            if c is not None:
-                                try:
-                                    codes_set.add(str(int(float(c))))
-                                except (ValueError, TypeError):
-                                    codes_set.add(str(c))
+                for p in sub_data.get('params', []) or []:
+                    c = p.get('code')
+                    if c is not None:
+                        try:
+                            codes_set.add(str(int(float(c))))
+                        except (ValueError, TypeError):
+                            codes_set.add(str(c))
                 if codes_set:
                     codes = ','.join(sorted(codes_set, key=lambda x: int(x) if x.isdigit() else 0))
-                    logger.debug(f"[PRED_WORKER] {subname}: 从grouped_data提取codes: {codes}")
+                    logger.debug(f"[PRED_WORKER] {subname}: 从sub_data提取codes: {codes}")
                 else:
                     logger.debug(f"[PRED_WORKER] {subname}: 无监测项目代码，跳过")
                     logger.debug(f"[PRED_WORKER] 可用键: {list(self._sub_itemcodes_cache.keys())[:5]}...")
