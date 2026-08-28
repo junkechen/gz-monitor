@@ -179,6 +179,15 @@ class PredictionWorker(QThread):
             code_to_name = {code: self._code_to_name_map.get(code, code) for code in code_list}
             logger.debug(f"[PRED_WORKER] {subname}: 监测项目 {code_list}")
 
+            # 本排放口是否存在命中「用户选中预测参数」的监测项。
+            # 用于修复：当用户只勾选标准污染物（二氧化硫/氮氧化物/颗粒物等）时，
+            # 鼎鑫/冠锌这类纯 VOCs/流量监测口（参数全是非标准项）不会被整口静默丢弃。
+            if self.prediction_params:
+                port_has_match = any(
+                    nm in self.prediction_params for nm in code_to_name.values())
+            else:
+                port_has_match = False
+
             client_info = self.multi_client.get_client_by_subid(subid)
             if not client_info:
                 logger.debug(f"[PRED_WORKER] {subname}: 无客户端信息，跳过")
@@ -229,8 +238,12 @@ class PredictionWorker(QThread):
                     for code in code_list:
                         param_name = code_to_name.get(code, code)
                         if self.prediction_params and param_name not in self.prediction_params:
-                            logger.debug(f"[PRED_WORKER] {subname}/{param_name}: 不在预测参数列表中，跳过")
-                            continue
+                            # 若该排放口存在其它命中选中项的参数，则仅跳过本参数；
+                            # 若整口零命中（如鼎鑫纯 VOCs/流量监测口），仍预测其全部参数，
+                            # 避免整口被静默丢弃导致用户看不到该排放口。
+                            if port_has_match:
+                                logger.debug(f"[PRED_WORKER] {subname}/{param_name}: 不在预测参数列表中，跳过")
+                                continue
                         val_key = f"val_{code}"
                         
                         # 对于热电厂废气，使用折算数据预测，同时记录实测数据
@@ -392,7 +405,9 @@ class PredictionWorker(QThread):
                     for code in code_list:
                         param_name = code_to_name.get(code, code)
                         if self.prediction_params and param_name not in self.prediction_params:
-                            continue
+                            # 与小时预测一致：整口零命中选中项时仍预测全部参数，避免整口被静默丢弃
+                            if port_has_match:
+                                continue
                         val_key = f"val_{code}"
                         hour_values = [float(r.get(val_key)) for r in rows if r.get(val_key)]
                         if not hour_values:

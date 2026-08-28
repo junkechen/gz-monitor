@@ -246,7 +246,190 @@ def main_fallback():
     return 1
 
 
+def _build_filtered_grouped_data():
+    """
+    构造「参数过滤」专项场景的分组数据。
+
+    A 类 非标准口（3001 鼎鑫彩涂4#）：监测项全部为非标准项，对选中参数【零命中】。
+        210 烟气流量 / 220 碳氢化合物总烃 / 299 甲烷 / 525 烟气温度
+    B 类 标准口（3002 恒润1号机）：既有标准污染物（命中），也有 1 个非标准项（不命中）。
+        201 二氧化硫 / 203 氮氧化物 / 207 颗粒物 / 211 流速
+        —— 211 流速用于验证「本口有其它命中项时，非命中参数仍应被正常过滤掉」，
+           即本次修复没有把参数过滤功能整体失效。
+    """
+    subs = [
+        dict(subid="3001", subtype="废气", subname="鼎鑫彩涂4#", ent_name="鼎鑫公司",
+             params=[{"code": "210", "name": "烟气流量"},
+                     {"code": "220", "name": "碳氢化合物总烃"},
+                     {"code": "299", "name": "甲烷"},
+                     {"code": "525", "name": "烟气温度"}]),
+        dict(subid="3002", subtype="废气", subname="恒润1号机", ent_name="恒润公司",
+             params=[{"code": "201", "name": "二氧化硫"},
+                     {"code": "203", "name": "氮氧化物"},
+                     {"code": "207", "name": "颗粒物"},
+                     {"code": "211", "name": "流速"}]),
+    ]
+    gd = {}
+    for s in subs:
+        gd[f"{s['ent_name']}|{s['subname']}"] = s
+    return gd, subs
+
+
+def main_filtered_params():
+    """
+    参数过滤专项用例（回归「整口零命中被静默丢弃」根因）。
+
+    场景：用户在「预测指标」里只勾选标准污染物
+          ['二氧化硫','氮氧化物','颗粒物','化学需氧量','氨氮']。
+
+    修复前：run() 内 `if param_name not in self.prediction_params: continue` 会把
+            鼎鑫彩涂4# 这类监测项全为非标准项的排放口逐参数跳过，最终整口不产出
+            任何预测，用户在预测结果栏完全看不到该排放口。
+
+    修复后：新增 port_has_match（本口是否至少有一个选中参数）——
+            - port_has_match=True  -> 非命中参数照常跳过（过滤行为不变）
+            - port_has_match=False -> 整口零命中，仍预测该口【全部】参数，保持可见
+
+    断言：
+      1) worker 正常返回预测，不抛异常；
+      2) 【核心守护】鼎鑫彩涂4# 出现在预测结果中，且覆盖其全部 4 个参数；
+      3) 恒润1号机 只产出命中选中项的 3 个参数，非命中的「流速」被正确过滤。
+    """
+    from main_window import PredictionWorker, get_subtype_code, is_water_sub, CODE_TO_NAME
+
+    grouped_data, subs = _build_filtered_grouped_data()
+
+    # 用户只勾选了标准污染物
+    selected = ['二氧化硫', '氮氧化物', '颗粒物', '化学需氧量', '氨氮']
+
+    # 预置 itemcode 缓存（key=f"{subid}_{stc}"），避免触发真实 API
+    itemcode_cache = {}
+    for s in subs:
+        stc = get_subtype_code(s["subtype"])
+        itemcode_cache[f"{s['subid']}_{stc}"] = ",".join(p["code"] for p in s["params"])
+
+    fake = _FakeClient([s["subid"] for s in subs])
+
+    class _FakeMultiClient:
+        def __init__(self, fc):
+            self._fc = fc
+        def get_client_by_subid(self, subid):
+            return self._fc.get_client_by_subid(subid)
+
+    captured = []
+    def _on_done(preds):
+        captured.append(preds)
+
+    worker = PredictionWorker(
+        grouped_data=grouped_data,
+        multi_client=_FakeMultiClient(fake),
+        prediction_horizon=3,
+        prediction_params=selected,   # 关键：只选标准污染物
+        pred_type="小时数据预测",
+        thresholds={},
+        sub_itemcodes_cache=itemcode_cache,
+        api_data_cache={},
+        thresholds_cache={},
+        get_subtype_code_fn=get_subtype_code,
+        is_water_sub_fn=is_water_sub,
+        code_to_name_map=CODE_TO_NAME,
+        intervention_sm=None,
+        get_sub_itemcodes_fn=lambda *a, **k: "",  # 不依赖兜底提取
+    )
+    worker.prediction_done.connect(_on_done)
+    try:
+        worker.run()
+    except Exception as e:  # noqa
+        print(f"[FAIL][过滤] run() 抛出未捕获异常: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    if not captured:
+        print("[FAIL][过滤] worker 未通过 prediction_done 信号返回任何结果")
+        return 1
+
+    preds = captured[0]
+    print(f"[DIAG][过滤] 选中预测参数: {selected}")
+    print(f"[DIAG][过滤] 生成预测条数: {len(preds)}")
+
+    covered = {}
+    for p in preds:
+        covered.setdefault((p["ent_name"], p["subname"]), set()).add(p["param"])
+
+    # 各口全部参数名（以真实 CODE_TO_NAME 为准）
+    all_params = {}
+    for s in subs:
+        all_params[(s["ent_name"], s["subname"])] = set(
+            CODE_TO_NAME.get(p["code"], p["code"]) for p in s["params"]
+        )
+
+    key_a = ("鼎鑫公司", "鼎鑫彩涂4#")   # 非标准口（整口零命中）
+    key_b = ("恒润公司", "恒润1号机")   # 标准口（部分命中）
+
+    print("[DIAG][过滤] 覆盖情况：")
+    for k in (key_a, key_b):
+        got = covered.get(k, set())
+        print(f"  {k[1]}@{k[0]}: 全部{len(all_params[k])}参数 实得{len(got)} -> {sorted(got)}")
+
+    ok = True
+
+    # —— 核心守护点：整口零命中的非标准口，必须完整可见 ——
+    got_a = covered.get(key_a, set())
+    want_a = all_params[key_a]
+    if not got_a:
+        print(f"[FAIL][过滤] 核心回归：非标准口「{key_a[1]}」整口被静默丢弃，"
+              f"预测结果中完全不可见（期望{len(want_a)}参数）")
+        ok = False
+    elif got_a != want_a:
+        print(f"[FAIL][过滤] 核心回归：非标准口「{key_a[1]}」覆盖不全，"
+              f"期望{sorted(want_a)} 实得{sorted(got_a)} 缺={sorted(want_a - got_a)}")
+        ok = False
+    else:
+        print(f"[OK][过滤] 非标准口「{key_a[1]}」零命中仍完整预测 {len(got_a)} 个参数，整口可见")
+
+    # —— 标准口：过滤行为应保持不变（只产出命中项） ——
+    got_b = covered.get(key_b, set())
+    want_b = all_params[key_b] & set(selected)
+    unexpected_b = got_b - set(selected)
+    if got_b != want_b:
+        print(f"[FAIL][过滤] 标准口「{key_b[1]}」过滤行为异常，"
+              f"期望仅命中项{sorted(want_b)} 实得{sorted(got_b)}"
+              f" 多余={sorted(unexpected_b)} 缺={sorted(want_b - got_b)}")
+        ok = False
+    else:
+        print(f"[OK][过滤] 标准口「{key_b[1]}」过滤行为不变，仅产出命中项 {sorted(got_b)}"
+              f"（非命中项已正确过滤）")
+
+    if ok:
+        print("\n=== 参数过滤用例通过：零命中排放口保持可见，命中口过滤行为不变 ===")
+        return 0
+    print("\n=== 参数过滤用例失败 ===")
+    return 1
+
+
 if __name__ == "__main__":
+    print("=" * 60)
+    print("[CASE 1] main() 全参数覆盖")
+    print("=" * 60)
     rc1 = main()
+
+    print("\n" + "=" * 60)
+    print("[CASE 2] main_fallback() 兜底分支")
+    print("=" * 60)
     rc2 = main_fallback()
-    sys.exit(rc1 or rc2)
+
+    print("\n" + "=" * 60)
+    print("[CASE 3] main_filtered_params() 参数过滤/零命中口可见性")
+    print("=" * 60)
+    rc3 = main_filtered_params()
+
+    print("\n" + "=" * 60)
+    print("[SUMMARY] 测试结果汇总")
+    print("=" * 60)
+    for name, rc in (("main", rc1), ("main_fallback", rc2),
+                     ("main_filtered_params", rc3)):
+        print(f"  {name:<24} {'PASS' if rc == 0 else 'FAIL'}")
+    total_rc = rc1 or rc2 or rc3
+    print(f"\n总体: {'ALL PASS' if total_rc == 0 else 'FAILED'}")
+    sys.exit(total_rc)
