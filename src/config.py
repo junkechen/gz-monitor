@@ -18,7 +18,7 @@ AES_IV  = b'1234567890abcdef'
 
 # 内置企业账户（账户名 -> 密码）
 BUILTIN_ACCOUNTS = [
-    {"name": "山东冠洲股份有限公司",              "password": "Gzgfah@163.com1"},
+    {"name": "山东冠洲股份有限公司",              "password": "Gzgfah@163.com"},
     {"name": "山东冠洲鼎鑫板材科技有限公司",       "password": "Gzgfah@163.com"},
     {"name": "冠县恒润热电有限公司",               "password": "Gzgfah@163.com"},
     {"name": "山东冠县冠锌金属材料科技有限公司",    "password": "Gzgfah@163.com"},
