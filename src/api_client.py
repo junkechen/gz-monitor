@@ -23,6 +23,11 @@ def aes_encrypt(text: str) -> str:
 class GZApiClient:
     """GZ安环API客户端"""
 
+    # v5.41: 类级滑块偏移缓存（跨实例/跨登录共享）。
+    # 服务端滑块答案稳定时，命中缓存可把枚举请求从 ~40 次降到 1 次，
+    # 大幅降低高频请求触发风控锁定（haslock）的概率。
+    _trail_cache = None
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -96,35 +101,53 @@ class GZApiClient:
             )
             resp.raise_for_status()
 
-            # 步骤3: 枚举滑块偏移量（40~200，步长3）
+            # 步骤3: 获取滑块偏移量（v5.41: 优先用类级缓存，未命中再枚举 40~200）
             if progress_callback:
-                progress_callback("步骤3/4: 破解滑块验证...")
+                progress_callback("步骤3/4: 滑块验证...")
             trail_found = None
-            fail_count = 0  # 失败计数器
-            for trail in range(40, 201, 3):
-                enc_trail = aes_encrypt(str(trail))
+
+            # 3a. 先试缓存的上次成功偏移：命中则 1 次请求完成（原来约 40 次）
+            cached = GZApiClient._trail_cache
+            if cached is not None:
                 try:
+                    enc_cached = aes_encrypt(str(cached))
                     check_resp = self.session.get(
-                        self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_trail}'),
-                        timeout=3  # 减少超时时间到3秒
+                        self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_cached}'),
+                        timeout=5
                     )
-                    result = check_resp.json()
-                    if result.get('Code') == 0:
-                        trail_found = trail
-                        break
-                except requests.exceptions.ConnectionError:
-                    fail_count += 1
-                    # 如果连续3次连接失败，快速返回
-                    if fail_count >= 3:
-                        return {"success": False, "message": "网络连接失败，请检查网络"}
-                except requests.exceptions.Timeout:
-                    fail_count += 1
-                    # 如果连续3次超时，快速返回
-                    if fail_count >= 3:
-                        return {"success": False, "message": "连接超时，请检查网络"}
+                    if check_resp.json().get('Code') == 0:
+                        trail_found = cached
                 except Exception:
-                    pass
-                time.sleep(0.05)
+                    trail_found = None
+
+            # 3b. 缓存未命中 → 枚举（40~200，步长3）
+            if trail_found is None:
+                fail_count = 0  # 失败计数器
+                for trail in range(40, 201, 3):
+                    enc_trail = aes_encrypt(str(trail))
+                    try:
+                        check_resp = self.session.get(
+                            self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_trail}'),
+                            timeout=3  # 减少超时时间到3秒
+                        )
+                        result = check_resp.json()
+                        if result.get('Code') == 0:
+                            trail_found = trail
+                            GZApiClient._trail_cache = trail  # 更新类级缓存
+                            break
+                    except requests.exceptions.ConnectionError:
+                        fail_count += 1
+                        # 如果连续3次连接失败，快速返回
+                        if fail_count >= 3:
+                            return {"success": False, "message": "网络连接失败，请检查网络"}
+                    except requests.exceptions.Timeout:
+                        fail_count += 1
+                        # 如果连续3次超时，快速返回
+                        if fail_count >= 3:
+                            return {"success": False, "message": "连接超时，请检查网络"}
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
 
             if trail_found is None:
                 return {"success": False, "message": "滑块验证失败，请稍后重试"}
@@ -157,6 +180,25 @@ class GZApiClient:
                 return {"success": False, "message": "密码错误"}
             elif result_text == 'usernotexist':
                 return {"success": False, "message": "用户不存在"}
+            elif result_text.startswith('haslock'):
+                # 服务端返回 haslock|N 表示账号被锁定/限流，N 为锁定秒数
+                parts = result_text.split('|')
+                if len(parts) >= 2:
+                    try:
+                        lock_seconds = int(parts[1])
+                        return {
+                            "success": False,
+                            "message": f"账号被锁定，请稍后再试或到网页端登录解锁（锁定时长约{lock_seconds}秒）",
+                            "lock_seconds": lock_seconds,
+                            "lock_type": "haslock",
+                        }
+                    except (ValueError, TypeError):
+                        pass
+                return {
+                    "success": False,
+                    "message": "账号被锁定，请稍后再试",
+                    "lock_type": "haslock",
+                }
             else:
                 return {"success": False, "message": f"登录失败: {result_text}"}
 

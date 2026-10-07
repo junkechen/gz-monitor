@@ -8,6 +8,7 @@ import sys
 import requests
 import time
 import json
+import random
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
@@ -26,6 +27,31 @@ def _get_log_dir() -> str:
     log_dir = _os.path.join(base, 'logs')
     _os.makedirs(log_dir, exist_ok=True)
     return log_dir
+
+
+# ── v5.41: 会话持久化缓存 ────────────────────────────────────────────────────
+# 登录成功后把 ASP.NET_SessionId 按账号保存到本地；软件重启时先用旧会话
+# 试探有效性，有效则跳过整个 4 步登录（0 次滑块请求），大幅减少登录次数，
+# 降低触发服务端风控锁定（haslock）的概率。只存 session id，不存密码。
+
+def _session_cache_path() -> str:
+    import os as _os
+    return _os.path.join(_get_log_dir(), 'gz_sessions.json')
+
+def _load_session_cache() -> dict:
+    try:
+        with open(_session_cache_path(), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_session_cache(cache: dict):
+    try:
+        with open(_session_cache_path(), 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 
@@ -52,11 +78,16 @@ class GZMultiAccountClient:
     def login_all(self, progress_callback=None) -> dict:
         """
         登录所有账户
-        返回: {"success": bool, "message": str, "success_count": int, "fail_count": int}
+        返回: {"success": bool, "message": str, "success_count": int,
+               "fail_count": int, "total": int, "details": dict}
+        details: {username: login_result_dict}
         """
         success_count = 0
         fail_count = 0
         total = len(self.accounts)
+        details = {}  # {username: login_result_dict}
+        # 用户名->密码映射，供 haslock 账号延迟重试时使用
+        account_map = {acc["username"]: acc["password"] for acc in self.accounts}
 
         for idx, account in enumerate(self.accounts):
             username = account["username"]
@@ -67,21 +98,83 @@ class GZMultiAccountClient:
 
             # 创建单独的客户端
             client = GZApiClient()
-            result = client.login(username, password, progress_callback=None)
+
+            # v5.41: 先尝试用本地持久化会话恢复登录（0 次滑块请求），
+            # 失效才走完整 4 步登录——减少登录次数，降低风控锁定概率
+            resumed = client.try_resume_session(username)
+            if resumed:
+                result = {"success": True, "message": "会话有效，跳过登录"}
+                if progress_callback:
+                    progress_callback(f"✓ {username} 会话有效，跳过登录")
+            else:
+                result = client.login(username, password, progress_callback=None)
 
             # 无论登录成功还是失败，都保留client实例
             self.clients[username] = client
+            details[username] = result
 
             if result["success"]:
                 success_count += 1
-                if progress_callback:
+                if progress_callback and not resumed:
                     progress_callback(f"✓ {username} 登录成功")
             else:
                 fail_count += 1
                 if progress_callback:
                     progress_callback(f"✗ {username} 登录失败: {result['message']}")
 
-            time.sleep(0.5)  # 避免请求过快
+            # 账号间随机等待，降低触发风控的概率（会话恢复无需等待）
+            if resumed:
+                time.sleep(0.3)
+            else:
+                time.sleep(random.uniform(2.0, 5.0))
+
+        # ── 对 haslock（服务端锁定）账号做延迟重试 ─────────────────────────────
+        # 先完成所有账号首次登录，再针对被锁定账号等待锁定期后重试一次；
+        # 重试在后台线程内执行，通过 progress_callback 反馈进度，不会阻塞其他
+        # 已成功账号（它们的 client 已保存在 self.clients 中，可立即被使用）。
+        haslock_names = [
+            name for name, res in details.items()
+            if res.get('lock_type') == 'haslock'
+        ]
+        for name in haslock_names:
+            # v5.41: 观测数据显示锁定倒计时递减极慢（约每分钟 1-2 秒），
+            # 且每次登录尝试可能重置/消耗锁定额度。等待 90 秒重试一次；
+            # 重试仍锁则不再继续尝试（避免反复消耗额度延长锁定），
+            # 明确提示用户到网页端登录解锁后再在客户端重试。
+            wait = 90
+            if progress_callback:
+                progress_callback(f"⏳ {name} 被服务端锁定，等待 {wait} 秒后自动重试一次...")
+            # 以 1 秒粒度等待，期间持续可响应 progress_callback
+            waited = 0
+            while waited < wait:
+                time.sleep(1)
+                waited += 1
+                if progress_callback and waited % 10 == 0:
+                    progress_callback(f"等待 {name} 解锁中 ({waited}/{wait}s)...")
+
+            # 使用全新 client 实例重试，避免沿用被锁定的旧 session
+            if progress_callback:
+                progress_callback(f"↻ 正在重试 {name}...")
+            retry_client = GZApiClient()
+            retry_result = retry_client.login(
+                name, account_map.get(name, ""), progress_callback=None
+            )
+            details[name] = retry_result
+            if retry_result.get('success'):
+                # 首次失败后重试成功：调整计数并替换为新成功的 client
+                self.clients[name] = retry_client
+                success_count += 1
+                fail_count -= 1
+                if progress_callback:
+                    progress_callback(f"✓ {name} 重试登录成功")
+            elif retry_result.get('lock_type') == 'haslock':
+                # 重试仍被锁定：停止尝试（继续尝试只会延长锁定），提示用户网页端解锁
+                if progress_callback:
+                    progress_callback(f"🔒 {name} 仍被服务端锁定，已停止自动重试。请到网页端登录一次该账号解锁后，再在软件中点击重新登录")
+                retry_result['message'] = "账号被服务端锁定且自动重试未解锁，请到网页端登录一次该账号解锁后重试"
+            else:
+                if progress_callback:
+                    progress_callback(f"✗ {name} 重试失败: {retry_result.get('message')}")
 
         if success_count == 0:
             return {
@@ -89,7 +182,8 @@ class GZMultiAccountClient:
                 "message": "所有账户登录失败",
                 "success_count": 0,
                 "fail_count": fail_count,
-                "total": total
+                "total": total,
+                "details": details,
             }
         elif fail_count == 0:
             return {
@@ -97,7 +191,8 @@ class GZMultiAccountClient:
                 "message": "所有账户登录成功",
                 "success_count": success_count,
                 "fail_count": 0,
-                "total": total
+                "total": total,
+                "details": details,
             }
         else:
             return {
@@ -105,7 +200,8 @@ class GZMultiAccountClient:
                 "message": f"部分账户登录成功 ({success_count}/{total})",
                 "success_count": success_count,
                 "fail_count": fail_count,
-                "total": total
+                "total": total,
+                "details": details,
             }
 
     def get_all_enterprise_subs(self) -> dict:
@@ -238,6 +334,11 @@ class GZMultiAccountClient:
 class GZApiClient:
     """单个账户API客户端"""
 
+    # v5.41: 类级滑块偏移缓存（跨实例/跨登录共享）。
+    # 服务端滑块答案稳定时，命中缓存可把枚举请求从 ~40 次降到 1 次，
+    # 大幅降低高频请求触发风控锁定（haslock）的概率。
+    _trail_cache = None
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -304,41 +405,61 @@ class GZApiClient:
                 )
                 resp.raise_for_status()
 
-                # 步骤3: 枚举滑块偏移量（40~200，步长3）
+                # 步骤3: 获取滑块偏移量（v5.41: 优先用类级缓存，未命中再枚举 40~200）
                 if progress_callback:
-                    progress_callback("步骤3/4: 破解滑块验证...")
-                _log("步骤3: 枚举滑块偏移量...")
+                    progress_callback("步骤3/4: 滑块验证...")
+                _log("步骤3: 滑块验证...")
                 trail_found = None
-                fail_count = 0  # 失败计数器
-                for trail in range(40, 201, 3):
-                    enc_trail = aes_encrypt(str(trail))
+
+                # 3a. 先试缓存的上次成功偏移：命中则 1 次请求完成（原来约 40 次）
+                cached = GZApiClient._trail_cache
+                if cached is not None:
                     try:
+                        enc_cached = aes_encrypt(str(cached))
                         check_resp = self.session.get(
-                            self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_trail}'),
-                            timeout=5  # 增加超时到5秒
+                            self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_cached}'),
+                            timeout=5
                         )
-                        result = check_resp.json()
-                        if result.get('Code') == 0:
-                            trail_found = trail
-                            break
-                    except requests.exceptions.ConnectionError:
-                        fail_count += 1
-                        _log(f"连接失败 {fail_count}/3")
-                        # 如果连续3次连接失败，快速返回
-                        if fail_count >= 3:
-                            _log("连续3次连接失败")
-                            break
-                    except requests.exceptions.Timeout:
-                        fail_count += 1
-                        _log(f"超时 {fail_count}/3")
-                        # 如果连续3次超时，快速返回
-                        if fail_count >= 3:
-                            _log("连续3次超时")
-                            break
-                    except Exception as e:
-                        _log(f"枚举异常: {str(e)[:50]}")
-                        pass
-                    time.sleep(0.05)
+                        if check_resp.json().get('Code') == 0:
+                            trail_found = cached
+                    except Exception:
+                        trail_found = None
+                if trail_found is not None:
+                    _log(f"滑块缓存命中: {trail_found}")
+
+                # 3b. 缓存未命中 → 枚举（40~200，步长3）
+                if trail_found is None:
+                    fail_count = 0  # 失败计数器
+                    for trail in range(40, 201, 3):
+                        enc_trail = aes_encrypt(str(trail))
+                        try:
+                            check_resp = self.session.get(
+                                self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_trail}'),
+                                timeout=5  # 增加超时到5秒
+                            )
+                            result = check_resp.json()
+                            if result.get('Code') == 0:
+                                trail_found = trail
+                                GZApiClient._trail_cache = trail  # 更新类级缓存
+                                break
+                        except requests.exceptions.ConnectionError:
+                            fail_count += 1
+                            _log(f"连接失败 {fail_count}/3")
+                            # 如果连续3次连接失败，快速返回
+                            if fail_count >= 3:
+                                _log("连续3次连接失败")
+                                break
+                        except requests.exceptions.Timeout:
+                            fail_count += 1
+                            _log(f"超时 {fail_count}/3")
+                            # 如果连续3次超时，快速返回
+                            if fail_count >= 3:
+                                _log("连续3次超时")
+                                break
+                        except Exception as e:
+                            _log(f"枚举异常: {str(e)[:50]}")
+                            pass
+                        time.sleep(0.05)
 
                 if trail_found is None:
                     _log("滑块验证失败")
@@ -370,6 +491,7 @@ class GZApiClient:
                     self.logged_in = True
                     self.enterprise_name = username
                     self._session_id = self.session.cookies.get('ASP.NET_SessionId', '')
+                    self._save_session(username)  # v5.41: 持久化会话供下次复用
                     _log("登录成功")
                     return {"success": True, "message": "登录成功"}
                 elif result_text == 'errorvalid':
@@ -381,6 +503,26 @@ class GZApiClient:
                 elif result_text == 'usernotexist':
                     _log("用户不存在")
                     return {"success": False, "message": "用户不存在"}
+                elif result_text.startswith('haslock'):
+                    # 服务端返回 haslock|N 表示账号被锁定/限流（终端失败，不立即重试）
+                    _log(f"账号被锁定: {result_text}")
+                    parts = result_text.split('|')
+                    if len(parts) >= 2:
+                        try:
+                            lock_seconds = int(parts[1])
+                            return {
+                                "success": False,
+                                "message": f"账号被锁定，请稍后再试或到网页端登录解锁（锁定时长约{lock_seconds}秒）",
+                                "lock_seconds": lock_seconds,
+                                "lock_type": "haslock",
+                            }
+                        except (ValueError, TypeError):
+                            pass
+                    return {
+                        "success": False,
+                        "message": "账号被锁定，请稍后再试",
+                        "lock_type": "haslock",
+                    }
                 else:
                     _log(f"登录失败: {result_text}")
                     if _retry < MAX_LOGIN_RETRY - 1:
@@ -401,6 +543,49 @@ class GZApiClient:
                     return {"success": False, "message": f"登录异常: {str(e)}"}
         
         return {"success": False, "message": "登录失败（已达最大重试次数）"}
+
+    # ── v5.41: 会话恢复与持久化 ──────────────────────────────────────────────
+    _SESSION_MAX_AGE = 6 * 3600  # 本地会话缓存最长 6 小时（服务端 session 通常更短）
+
+    def _save_session(self, username: str):
+        """登录成功后按账号持久化 session id，供下次启动复用"""
+        try:
+            cache = _load_session_cache()
+            cache[username] = {
+                'session_id': self.session.cookies.get('ASP.NET_SessionId', ''),
+                'saved_at': time.time(),
+            }
+            _save_session_cache(cache)
+        except Exception:
+            pass
+
+    def try_resume_session(self, username: str) -> bool:
+        """
+        尝试用本地缓存的 session 恢复登录状态（v5.41）。
+        有效则置 logged_in 并返回 True，调用方跳过整个 4 步登录；
+        无效/异常返回 False，调用方走正常登录。绝不抛异常。
+        """
+        try:
+            cache = _load_session_cache()
+            info = cache.get(username)
+            if not isinstance(info, dict) or not info.get('session_id'):
+                return False
+            if time.time() - info.get('saved_at', 0) > self._SESSION_MAX_AGE:
+                return False
+            self.session.cookies.set('ASP.NET_SessionId', info['session_id'])
+            # 注意：get_enterprise_subs 内部有 logged_in 门禁，先临时置 True
+            # 才能发出验证请求；验证失败时复位为 False。
+            self.logged_in = True
+            subs = self.get_enterprise_subs()
+            if isinstance(subs, list) and subs:
+                self.enterprise_name = username
+                self._session_id = info['session_id']
+                return True
+            self.logged_in = False
+            return False
+        except Exception:
+            self.logged_in = False
+            return False
 
     def _ensure_session(self):
         """确保Session有效，如果ASP.NET_SessionId丢失则尝试重新获取"""

@@ -613,8 +613,24 @@ def main():
                 # 注意：这里不能把 _login_worker 置 None（线程可能尚未结束，
                 # 提前丢引用会让 QThread 运行时被析构而 qFatal），统一交给
                 # _on_login_worker_finished 在 finished 信号里清理。
+
+                # 打印每个失败账号的失败原因（保留调试信息）
+                if result.get('fail_count', 0) > 0:
+                    for _uname, _res in result.get('details', {}).items():
+                        if not _res.get('success'):
+                            print(f">>> 账号登录失败 [{_uname}]: {_res.get('message')}")
+
+                # 若存在被服务端锁定（haslock）的失败账号，在结果消息中追加提示
+                _has_locked = any(
+                    (not _res.get('success')) and _res.get('lock_type') == 'haslock'
+                    for _res in result.get('details', {}).values()
+                )
+                _result_msg = result.get('message', '')
+                if _has_locked:
+                    _result_msg = _result_msg + "冠洲、鼎鑫等账号因服务端锁定未登录，将在稍后自动重试"
+
                 if result.get('success'):
-                    _login_dialog.set_login_result(True, result.get('message', ''))
+                    _login_dialog.set_login_result(True, _result_msg)
                     print(">>> 登录成功，准备显示主窗口...")
 
                     # 延迟1秒后显示主窗口
@@ -646,7 +662,7 @@ def main():
 
                     QTimer.singleShot(1000, show_main_window)
                 else:
-                    _login_dialog.set_login_result(False, result.get('message', ''))
+                    _login_dialog.set_login_result(False, _result_msg)
                     _login_dialog.login_btn.setEnabled(True)
                     print(">>> 登录失败")
 
