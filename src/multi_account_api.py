@@ -75,12 +75,17 @@ class GZMultiAccountClient:
         """添加账户"""
         self.accounts.append({"username": username, "password": password})
 
-    def login_all(self, progress_callback=None) -> dict:
+    def login_all(self, progress_callback=None, trail_provider=None) -> dict:
         """
         登录所有账户
         返回: {"success": bool, "message": str, "success_count": int,
                "fail_count": int, "total": int, "details": dict}
         details: {username: login_result_dict}
+
+        Args:
+            progress_callback: 进度回调
+            trail_provider: 人工滑块兜底回调（GUI 主线程实现），详见
+                GZApiClient.login 的说明
         """
         success_count = 0
         fail_count = 0
@@ -107,7 +112,8 @@ class GZMultiAccountClient:
                 if progress_callback:
                     progress_callback(f"✓ {username} 会话有效，跳过登录")
             else:
-                result = client.login(username, password, progress_callback=None)
+                result = client.login(username, password, progress_callback=None,
+                                      trail_provider=trail_provider)
 
             # 无论登录成功还是失败，都保留client实例
             self.clients[username] = client
@@ -157,7 +163,8 @@ class GZMultiAccountClient:
                 progress_callback(f"↻ 正在重试 {name}...")
             retry_client = GZApiClient()
             retry_result = retry_client.login(
-                name, account_map.get(name, ""), progress_callback=None
+                name, account_map.get(name, ""), progress_callback=None,
+                trail_provider=trail_provider
             )
             details[name] = retry_result
             if retry_result.get('success'):
@@ -334,11 +341,6 @@ class GZMultiAccountClient:
 class GZApiClient:
     """单个账户API客户端"""
 
-    # v5.41: 类级滑块偏移缓存（跨实例/跨登录共享）。
-    # 服务端滑块答案稳定时，命中缓存可把枚举请求从 ~40 次降到 1 次，
-    # 大幅降低高频请求触发风控锁定（haslock）的概率。
-    _trail_cache = None
-
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -356,11 +358,115 @@ class GZApiClient:
     def _url(self, path: str) -> str:
         return BASE_URL + path
 
-    def login(self, username: str, password: str, progress_callback=None) -> dict:
+    def _check_slider(self, trail: int, timeout: int = 8):
         """
-        完整4步登录流程（带重试机制）
+        提交滑块偏移量给服务端校验。
+
+        Returns:
+            0  —— 校验通过
+            非0 —— 服务端返回的 Code（错误值为 500）
+            None —— 请求异常
+        """
+        enc_trail = aes_encrypt(str(int(trail)))
+        try:
+            resp = self.session.get(
+                self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_trail}'),
+                timeout=timeout
+            )
+            return resp.json().get('Code')
+        except Exception:
+            return None
+
+    def _solve_slider_trail(self, progress_callback=None, _log=None):
+        """
+        自动求解滑块偏移量（NCC 归一化互相关）。
+
+        先用 Top-1 猜测提交一次（实测命中率极高）；若未命中，则在容差
+        附近做少量精调重试。全过程请求数极少，不会触发风控。
+
+        Returns:
+            (trail, code) —— trail 为通过校验的偏移量（失败为 None），
+            code 为服务端返回码（未通过时用于判断是否值得继续）
+        """
+        from slider_solver import fetch_slider_images, refine_candidates, solve_trail
+
+        bg_pil, sl_pil = fetch_slider_images(self.session)
+        trail, score, margin = solve_trail(bg_pil, sl_pil)
+        if trail is None:
+            if _log:
+                _log(f"自动求解滑块失败 (score={score:.4f})")
+            return None, None
+
+        if _log:
+            _log(f"自动求解滑块: trail={trail} score={score:.4f} margin={margin:.4f}")
+
+        code = self._check_slider(trail)
+        if code == 0:
+            return trail, code
+
+        # Top-1 未命中：在 ±6px 内精调（服务端容差实测 ±4px）
+        for candidate in refine_candidates(trail, span=6)[1:]:
+            candidate_code = self._check_slider(candidate)
+            if _log:
+                _log(f"  精调 trail={candidate} -> Code={candidate_code}")
+            if candidate_code == 0:
+                return candidate, candidate_code
+            time.sleep(0.05)
+
+        return None, code
+
+    def _manual_slider_trail(self, username, progress_callback=None, _log=None):
+        """
+        人工拖动兜底：把滑块图片交给用户拖动。
+
+        依赖注入的 ``self._trail_provider``（由 main.py 的 LoginWorker 在
+        **GUI 主线程**创建 SliderDialog 并返回结果），因此本方法在后台
+        线程中调用是安全的。
+
+        Returns:
+            int  —— 用户拖动得到的偏移量
+            None —— 取消 / 未注入 provider / 自动求解与人工均失败
+        """
+        provider = getattr(self, '_trail_provider', None)
+        if not provider:
+            if _log:
+                _log("未注入 trail_provider，无法进行人工滑块验证")
+            return None
+
+        if progress_callback:
+            progress_callback(f"⚠ 请完成滑块验证：{username}")
+
+        try:
+            return provider(username)
+        except Exception as e:
+            if _log:
+                _log(f"人工滑块验证异常: {str(e)[:100]}")
+            return None
+
+    def login(self, username: str, password: str, progress_callback=None,
+              trail_provider=None) -> dict:
+        """
+        完整登录流程（带重试机制）
+
+        流程：
+          步骤1 建会话 → 步骤2 拉滑块图 → 步骤3 解题 → 步骤4 提交登录
+
+        Args:
+            username: 企业账号
+            password: 密码
+            progress_callback: 进度回调（仅用于提示文案）
+            trail_provider: 可选。人工滑块兜底回调
+                ``trail_provider(username) -> int | None``。
+                **必须**由 GUI 主线程实现（内部弹 SliderDialog），
+                在后台线程调用它不会有 Qt 跨线程问题。
+                注意：本方法内部通过 ``self._trail_provider`` 传递，
+                该参数仅为显式声明与兼容，实际取值见 __init__ 调用方。
+
         返回: {"success": bool, "message": str}
         """
+        if trail_provider is not None:
+            self._trail_provider = trail_provider
+
         MAX_LOGIN_RETRY = 3
         import os as _os
         _log_dir = _get_log_dir()
@@ -394,10 +500,10 @@ class GZApiClient:
                         continue
                     return {"success": False, "message": "无法获取会话Cookie，请检查网络连接"}
 
-                # 步骤2: 获取滑块验证码
+                # 步骤2: 拉取滑块验证码图片（同时建立/续用 Session Cookie）
                 if progress_callback:
                     progress_callback("步骤2/4: 获取验证码...")
-                _log("步骤2: 获取滑块验证码...")
+                _log("步骤2: 拉取滑块图片...")
                 resp = self.session.get(
                     self._url('/ajax/SliderValidImg.ashx?method=GetSliderImg'),
                     headers={'X-Requested-With': 'XMLHttpRequest'},
@@ -405,64 +511,39 @@ class GZApiClient:
                 )
                 resp.raise_for_status()
 
-                # 步骤3: 获取滑块偏移量（v5.41: 优先用类级缓存，未命中再枚举 40~200）
+                # 步骤3: 求解滑块偏移量
+                # v5.44: 服务端并未升级为校验鼠标轨迹；旧代码失败的真实原因是
+                # AES 密钥过期（已修正）。现改为「NCC 自动求解 + 少量精调」，
+                # 命中率高且请求数极少（1~2 次），彻底移除旧的枚举循环。
                 if progress_callback:
                     progress_callback("步骤3/4: 滑块验证...")
-                _log("步骤3: 滑块验证...")
-                trail_found = None
+                _log("步骤3: 滑块验证（自动求解）...")
 
-                # 3a. 先试缓存的上次成功偏移：命中则 1 次请求完成（原来约 40 次）
-                cached = GZApiClient._trail_cache
-                if cached is not None:
-                    try:
-                        enc_cached = aes_encrypt(str(cached))
-                        check_resp = self.session.get(
-                            self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_cached}'),
-                            timeout=5
+                trail_found, slider_code = self._solve_slider_trail(
+                    progress_callback=progress_callback, _log=_log
+                )
+
+                # 自动求解失败 → 人工拖动兜底（最多 3 次机会）
+                if trail_found is None:
+                    _log(f"自动求解未通过 (Code={slider_code})，尝试人工拖动")
+                    for attempt in range(3):
+                        manual_trail = self._manual_slider_trail(
+                            username, progress_callback=progress_callback, _log=_log
                         )
-                        if check_resp.json().get('Code') == 0:
-                            trail_found = cached
-                    except Exception:
-                        trail_found = None
-                if trail_found is not None:
-                    _log(f"滑块缓存命中: {trail_found}")
-
-                # 3b. 缓存未命中 → 枚举（40~200，步长3）
-                if trail_found is None:
-                    fail_count = 0  # 失败计数器
-                    for trail in range(40, 201, 3):
-                        enc_trail = aes_encrypt(str(trail))
-                        try:
-                            check_resp = self.session.get(
-                                self._url(f'/ajax/SliderValidImg.ashx?method=CheckSliderImg&p={enc_trail}'),
-                                timeout=5  # 增加超时到5秒
-                            )
-                            result = check_resp.json()
-                            if result.get('Code') == 0:
-                                trail_found = trail
-                                GZApiClient._trail_cache = trail  # 更新类级缓存
-                                break
-                        except requests.exceptions.ConnectionError:
-                            fail_count += 1
-                            _log(f"连接失败 {fail_count}/3")
-                            # 如果连续3次连接失败，快速返回
-                            if fail_count >= 3:
-                                _log("连续3次连接失败")
-                                break
-                        except requests.exceptions.Timeout:
-                            fail_count += 1
-                            _log(f"超时 {fail_count}/3")
-                            # 如果连续3次超时，快速返回
-                            if fail_count >= 3:
-                                _log("连续3次超时")
-                                break
-                        except Exception as e:
-                            _log(f"枚举异常: {str(e)[:50]}")
-                            pass
-                        time.sleep(0.05)
+                        if manual_trail is None:
+                            _log("用户取消滑块验证或人工验证不可用")
+                            return {"success": False, "message": "已取消滑块验证"}
+                        manual_code = self._check_slider(manual_trail)
+                        _log(f"人工第{attempt + 1}次: trail={manual_trail} Code={manual_code}")
+                        if manual_code == 0:
+                            trail_found = manual_trail
+                            break
+                        if progress_callback:
+                            progress_callback(
+                                f"✗ 滑块位置不正确，请重试（剩余 {2 - attempt} 次）")
 
                 if trail_found is None:
-                    _log("滑块验证失败")
+                    _log("滑块验证失败（自动与人工均未通过）")
                     if _retry < MAX_LOGIN_RETRY - 1:
                         continue
                     return {"success": False, "message": "滑块验证失败，请稍后重试"}

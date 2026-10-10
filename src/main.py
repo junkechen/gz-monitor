@@ -503,7 +503,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QDialog
 from PyQt5.QtGui import QFont, QColor, QPalette
 from PyQt5.QtCore import QTimer, Qt, QtMsgType, qInstallMessageHandler, QThread, pyqtSignal
 
@@ -525,18 +525,106 @@ class LoginWorker(QThread):
     串行网络请求）直接跑在主线程，登录期间 UI 完全卡死。现在移入后台线程，
     进度与结果通过 pyqtSignal 桥接回主线程更新登录对话框，绝不跨线程直接
     调用 Qt 控件。
+
+    v5.44：新增人工滑块兜底的跨线程桥接。
+    滑块自动求解失败时，login() 会调用本类提供的 ``trail_provider``，
+    它必须**在 GUI 主线程**创建 SliderDialog。实现方式：
+      后台线程 emit ``slider_requested`` → 主线程槽函数弹出模态对话框 →
+      结果写入共享变量并置位 Event → 后线���的局部 QEventLoop 退出并读取。
+    局部事件循环只阻塞本后台线程，主线程始终在处理事件，因此不会死锁；
+    对话框关闭（取消/确认）都会走到 finally 分支唤醒等待方。
     """
+
     progress = pyqtSignal(str)          # 登录进度消息
     login_finished = pyqtSignal(dict)   # 登录结果 dict
+    slider_requested = pyqtSignal(str)  # 请求主线程弹出滑块对话框（参数=企业名）
+
+    # 人工滑块单次等待上限（秒）。超时后放弃，避免用户离开导致线程永久阻塞
+    SLIDER_DIALOG_TIMEOUT = 300
 
     def __init__(self, multi_client, parent=None):
         super().__init__(parent)
         self._multi_client = multi_client
+        # 跨线程共享的结果槽（后台线程写、主线程读，通过 Event 保证可见性）
+        self._slider_result = None
+        self._slider_done = threading.Event()
+
+    # ── 人工滑块跨线程桥接 ────────────────────────────────────────────────
+    def _on_slider_requested(self, account_name):
+        """
+        主线程槽函数：弹出 SliderDialog 并回传结果。
+
+        该函数运行在 GUI 主线程（由 Qt 队列连接保证），
+        因此可以安全地创建并显示 Qt 控件。
+        """
+        try:
+            from slider_dialog import SliderDialog
+            from slider_solver import fetch_slider_images
+
+            # 复用后台线程已建好的会话拉图，保证 Session Cookie 一致
+            client = self._multi_client.clients.get(account_name)
+            if client is not None:
+                bg_pil, sl_pil = fetch_slider_images(client.session)
+            else:
+                bg_pil = sl_pil = None
+
+            if bg_pil is None or sl_pil is None:
+                print(">>> 无法获取滑块图片（缺少会话）")
+                self._slider_result = None
+                return
+
+            dialog = SliderDialog(background_pil=bg_pil, slider_pil=sl_pil,
+                                  account_name=account_name, parent=_login_dialog)
+            if dialog.exec_() == QDialog.Accepted:
+                self._slider_result = dialog.get_trail()
+                print(f">>> 用户拖动滑块得到偏移量: {self._slider_result}")
+            else:
+                self._slider_result = None
+                print(">>> 用户取消滑块验证")
+        except Exception as e:
+            print(f">>> 滑块对话框异常: {e}")
+            self._slider_result = None
+        finally:
+            # 无论成功/取消/异常都必须唤醒等待方，否则后台线程会一直阻塞
+            self._slider_done.set()
+
+    def request_trail(self, account_name):
+        """
+        供 login() 在后台线程调用：请求主线程弹窗并等待用户拖动结果。
+
+        Returns:
+            int  —— 用户拖动得到的偏移量
+            None —— 用户取消 / 超时 / 弹窗异常
+        """
+        self._slider_result = None
+        self._slider_done.clear()
+        # 队列连接到主线程（自动跨线程投递）
+        self.slider_requested.emit(account_name)
+
+        from PyQt5.QtCore import QEventLoop
+        loop = QEventLoop()
+        # 事件循环退出条件由 _slider_done 驱动；超时兜底防止永久阻塞
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(self.SLIDER_DIALOG_TIMEOUT * 1000)
+        self._slider_done.connect(loop.quit)  # type: ignore[arg-type]
+
+        loop.exec_()
+        try:
+            timer.stop()
+            self._slider_done.disconnect(loop.quit)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        return self._slider_result
 
     def run(self):
         """后台执行 login_all，进度/结果通过信号回主线程"""
         try:
-            result = self._multi_client.login_all(progress_callback=self.progress.emit)
+            result = self._multi_client.login_all(
+                progress_callback=self.progress.emit,
+                trail_provider=self.request_trail
+            )
             self.login_finished.emit(result)
         except Exception as e:
             print(f">>> 登录线程异常: {e}")

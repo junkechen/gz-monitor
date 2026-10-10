@@ -12,14 +12,28 @@ from user_data_manager import (
 # 服务器地址
 BASE_URL = "http://222.175.25.10:8006"
 
-# AES加密参数
-AES_KEY = b'1234567890abcdefghijklmnopqrstuv'
-AES_IV  = b'1234567890abcdef'
+# ── AES加密参数 ─────────────────────────────────────────────────────────
+# v5.44 重大更正：服务端已更换 AES 密钥，旧密钥 1234567890abcdef... 已失效。
+#
+# 旧密钥导致所有 CheckSliderImg 请求一律返回 {"Code":-1,"Mess":"error"}，
+# 被误判为"服务端防自动化升级、枚举滑块答案失效"。真实根因是密钥不匹配。
+#
+# 新密钥还原过程（可复现）：
+#   1. 抓取登录页引用的 /Assets/scripts/chunk.min.js
+#   2. 反混淆其中 Security.EncryptAES，得知算法为
+#      CryptoJS.AES.encrypt(Utf8.parse(d), key, {iv, mode:CBC, padding:Pkcs7})
+#   3. 在 Node 中实跑并拦截 AES.encrypt，捕获真实 key/iv
+#   4. 用 Python 复算，与 JS 输出逐字节比对 100% 一致
+#
+# 注意：CheckSliderImg 对正确值返回 {"Code":0,"Mess":"success"}，
+#      对错误值返回 {"Code":500,"Mess":"error"}，容差 ±4px。
+AES_KEY = b'i7t483eitnweh6phbi0jemr965dhbr63'
+AES_IV  = b'i7t483eitnweh6ph'
 
 # 内置企业账户（账户名 -> 密码）
 BUILTIN_ACCOUNTS = [
     {"name": "山东冠洲股份有限公司",              "password": "Gzgfah@163.com"},
-    {"name": "山东冠洲鼎鑫板材科技有限公司",       "password": "Gzgfah@163.com"},
+    {"name": "山东冠洲鼎鑫板材科技有限公司",       "password": "Gzgfah@163.com1"},
     {"name": "冠县恒润热电有限公司",               "password": "Gzgfah@163.com"},
     {"name": "山东冠县冠锌金属材料科技有限公司",    "password": "Gzgfah@163.com"},
     {"name": "聊城东舜涂料科技有限公司",             "password": "lCdstl5289099@1"},

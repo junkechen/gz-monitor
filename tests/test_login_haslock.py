@@ -34,7 +34,7 @@ class TestLoginHaslock(unittest.TestCase):
         calls = {u: 0 for u in script}
         orig = multi_account_api.GZApiClient.login
 
-        def fake_login(self, username, password, progress_callback=None):
+        def fake_login(self, username, password, progress_callback=None, **kwargs):
             seq = script[username]
             i = min(calls[username], len(seq) - 1)
             calls[username] += 1
@@ -181,14 +181,17 @@ class TestLoginHaslock(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(len(called), 0)  # 过期缓存不应发任何请求
 
-    def test_f_slider_cache_class_attr(self):
-        """滑块缓存：类级属性存在且枚举命中后写回"""
-        self.assertTrue(hasattr(GZApiClient, '_trail_cache'))
-        GZApiClient._trail_cache = None
-        # 模拟 api_client.py 中枚举命中写缓存的行为（与实现一致即可）
-        GZApiClient._trail_cache = 142
-        self.assertEqual(GZApiClient._trail_cache, 142)
-        GZApiClient._trail_cache = None
+    def test_f_slider_subsystem_v544(self):
+        """v5.44 滑块子系统：自动求解器可用 + 人工兜底方法存在 + login 接受 trail_provider"""
+        import inspect
+        import slider_solver
+        # 自动 NCC 求解器为主路径，solve_trail 必须可调用
+        self.assertTrue(callable(slider_solver.solve_trail))
+        # 人工拖动兜底方法存在（后台线程调用 GUI 主线程注入的 trail_provider）
+        self.assertTrue(hasattr(GZApiClient, '_manual_slider_trail'))
+        # login 签名兼容 trail_provider 桥接参数
+        params = inspect.signature(GZApiClient.login).parameters
+        self.assertIn('trail_provider', params)
 
 
 if __name__ == '__main__':
