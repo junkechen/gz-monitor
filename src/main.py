@@ -6,6 +6,7 @@ GZ安环监测系统 - 主程序入口
 import sys
 import os
 import traceback
+import threading
 import time
 from datetime import datetime  # 用于 _write_crash_log 等模块级函数
 
