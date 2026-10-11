@@ -33,11 +33,12 @@ class _FakeClient:
         self.calls = []
 
     def query_history(self, subid, subtype, codes, start, end, index=1,
-                      page=None, rows=None, use_corrected=False, **kw):
+                      page=1, rows=1000, use_corrected=False, **kw):
+        # v5.47：记录 page/rows，用于断言「use_corrected 未被误传为 page」
         self.calls.append({
             'subid': subid, 'subtype': subtype, 'codes': codes,
             'start': start, 'end': end, 'index': index,
-            'use_corrected': use_corrected,
+            'page': page, 'rows': rows, 'use_corrected': use_corrected,
         })
         # 故意返回乱序，验证 worker 会排序
         code_list = [c.strip() for c in codes.split(',') if c.strip()]
@@ -208,6 +209,107 @@ class TestDailyEmissionWorker(unittest.TestCase):
         # 递增序列排序后应识别为上升趋势
         self.assertEqual(p['trend'], 'up')
         self.assertGreater(p['future_daily'][-1], p['future_daily'][0])
+
+
+class TestQueryHistoryArgSafety(unittest.TestCase):
+    """v5.47 回归：use_corrected 曾被误传为 page（位置参数错位）。"""
+
+    def test_a_page_not_polluted(self):
+        """多账号 client 签名下 page 必须为 1，不能被 use_corrected 污染"""
+        class _MultiClient:
+            def query_history(self, subid, subtype, codes, start, end,
+                              index=1, page=1, rows=1000, use_corrected=False):
+                return {'_echo': dict(index=index, page=page, rows=rows,
+                                      use_corrected=use_corrected)}
+
+        r = mw.PredictionWorker._query_history_safe(
+            _MultiClient(), 'S', '01', '201', 'a', 'b',
+            index=2, use_corrected=False, page=1, rows=1000)
+        self.assertEqual(r['_echo']['page'], 1,
+                         "use_corrected=False 被当成 page=0，分页异常")
+        self.assertIs(r['_echo']['use_corrected'], False)
+
+    def test_b_use_corrected_true_preserved(self):
+        """热电厂 use_corrected=True 时，page 仍应为 1 且标志位正确传递"""
+        class _MultiClient:
+            def query_history(self, subid, subtype, codes, start, end,
+                              index=1, page=1, rows=1000, use_corrected=False):
+                return {'_echo': dict(index=index, page=page, rows=rows,
+                                      use_corrected=use_corrected)}
+
+        r = mw.PredictionWorker._query_history_safe(
+            _MultiClient(), 'S', '01', '201', 'a', 'b',
+            index=2, use_corrected=True, page=1, rows=1000)
+        self.assertIs(r['_echo']['use_corrected'], True)
+        self.assertEqual(r['_echo']['page'], 1)
+        self.assertEqual(r['_echo']['index'], 2)
+
+    def test_c_compatible_with_short_signature(self):
+        """单账号 client（无 page/rows）不应因多余关键字报错"""
+        class _SmallClient:
+            def query_history(self, subid, subtype, codes, start, end,
+                              index=1, use_corrected=False):
+                return {'_echo': dict(index=index, use_corrected=use_corrected)}
+
+        r = mw.PredictionWorker._query_history_safe(
+            _SmallClient(), 'S', '01', '201', 'a', 'b',
+            index=2, use_corrected=True, page=1, rows=1000)
+        self.assertIs(r['_echo']['use_corrected'], True)
+        self.assertEqual(r['_echo']['index'], 2)
+
+    def test_d_hour_fallback_when_daily_missing(self):
+        """日数据缺失时必须回退到小时数据聚合，而不是直接返回空"""
+        class _HourOnlyClient:
+            def __init__(self):
+                self.calls = []
+
+            def query_history(self, subid, subtype, codes, start, end,
+                              index=1, page=1, rows=1000, use_corrected=False):
+                self.calls.append(index)
+                if index == 2:
+                    return {'rows': [], 'total': 0}      # 无日数据
+                # 返回 30 天 × 每天 2 条的小时数据
+                out = []
+                for d in range(1, 31):
+                    for h in (8, 20):
+                        out.append({
+                            'DateTime': f'2026-01-{d:02d} {h:02d}:00',
+                            'val_201': str(100.0 + d),
+                        })
+                return {'rows': out, 'total': len(out)}
+
+        client = _HourOnlyClient()
+        worker, _ = _make_worker("日排放量预测", daily_forecast_days=7,
+                                 client=client)
+        captured = []
+        worker.prediction_done.connect(lambda p: captured.append(p))
+        worker.run()
+        self.assertTrue(captured[-1], "日数据缺失时未回退，结果仍为空")
+        self.assertIn('data_source', captured[-1][0])
+        self.assertEqual(captured[-1][0]['data_source'], '小时数据聚合')
+
+    def test_e_skip_reasons_recorded(self):
+        """数据不足时应记录原因，供 UI 提示"""
+        client = _FakeClient({'201': [100.0, 101.0]})   # 仅 2 天
+        worker, _ = _make_worker("日排放量预测", daily_forecast_days=7,
+                                 client=client)
+        worker.run()
+        self.assertTrue(worker.daily_skip_reasons,
+                        "未记录跳过原因，UI 将无法解释空结果")
+        self.assertIn('不足 3 天', worker.daily_skip_reasons[0])
+
+    def test_f_hour_aggregation_helper(self):
+        """小时聚合应按日期求均值"""
+        rows = [
+            {'DateTime': '2026-01-01 08:00', 'val_201': '10'},
+            {'DateTime': '2026-01-01 20:00', 'val_201': '20'},
+            {'DateTime': '2026-01-02 08:00', 'val_201': '30'},
+        ]
+        out = mw.PredictionWorker._aggregate_hour_rows_to_daily(rows)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]['DateTime'], '2026-01-01')
+        self.assertAlmostEqual(out[0]['val_201'], 15.0)
+        self.assertAlmostEqual(out[1]['val_201'], 30.0)
 
 
 if __name__ == '__main__':

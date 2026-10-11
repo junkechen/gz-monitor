@@ -109,6 +109,87 @@ class PredictionWorker(QThread):
         self._get_sub_itemcodes = get_sub_itemcodes_fn
         # v5.46：日排放量预测的未来天数
         self.daily_forecast_days = daily_forecast_days
+        # v5.47：日排放量预测被跳过的原因（供 UI 提示，避免"无结果却不知为何"）
+        self.daily_skip_reasons = []
+
+    # ── v5.47：历史查询兼容层 ────────────────────────────────────────────
+    @staticmethod
+    def _query_history_safe(client, subid, subtype, codes, start, end,
+                            index=1, use_corrected=False, page=1, rows=1000):
+        """
+        安全调用 client.query_history，屏蔽两个实现的签名差异。
+
+        仓库里存在两份 query_history：
+          api_client.py          (subid, subtype, codes, start, end, index, use_corrected)
+          multi_account_api.py   (subid, subtype, codes, start, end, index, page, rows, use_corrected)
+
+        两者第 7/8 个位置参数含义不同。此前用位置参数传 use_corrected，
+        在多账号 client 上会被当成 page（False→page=0），导致服务端分页异常、
+        只返回 0~2 行，表现为"日排放量预测无数据"。
+        这里统一改为按名字传参，并按实际签名裁剪不支持的参数。
+        """
+        import inspect
+
+        fn = client.query_history
+        kwargs = {'index': index, 'use_corrected': use_corrected}
+
+        try:
+            params = inspect.signature(fn).parameters
+            if 'page' in params:
+                kwargs['page'] = page
+            if 'rows' in params:
+                kwargs['rows'] = rows
+        except (TypeError, ValueError):
+            # 拿不到签名时保守处理：按最小参数集调用
+            pass
+
+        try:
+            return fn(subid, subtype, codes, start, end, **kwargs)
+        except TypeError:
+            # 兼容只接受最小签名的实现
+            return fn(subid, subtype, codes, start, end,
+                      index=index, use_corrected=use_corrected)
+
+    @staticmethod
+    def _aggregate_hour_rows_to_daily(hour_rows):
+        """
+        把小时数据行按日期聚合成日均值行（日数据缺失时的兜底数据源）。
+
+        返回结构与日数据一致：每行含 'DateTime'(yyyy-MM-dd) 与各 val_<code> 均值。
+        """
+        from collections import defaultdict
+        import re
+
+        groups = defaultdict(list)
+        for r in hour_rows or []:
+            m = re.match(r'(\d{4}-\d{2}-\d{2})', str(r.get('DateTime', '')))
+            if not m:
+                continue
+            groups[m.group(1)].append(r)
+
+        out = []
+        for day in sorted(groups.keys()):
+            rows = groups[day]
+            agg = {'DateTime': day}
+            # 收集该日出现过的所有 val_* 键
+            val_keys = set()
+            for r in rows:
+                for k in r.keys():
+                    if k.startswith('val_'):
+                        val_keys.add(k)
+            for vk in val_keys:
+                vals = []
+                for r in rows:
+                    v = r.get(vk)
+                    if v in (None, '', '--'):
+                        continue
+                    try:
+                        vals.append(float(v))
+                    except (ValueError, TypeError):
+                        pass
+                agg[vk] = (sum(vals) / len(vals)) if vals else None
+            out.append(agg)
+        return out
 
     def run(self):
         """后台线程执行：遍历所有排放口，执行预测，返回全量预测结果"""
@@ -127,6 +208,7 @@ class PredictionWorker(QThread):
             return data
 
         all_predictions = []
+        self.daily_skip_reasons = []
         total_subs = len(self.grouped_data)
         logger.debug(f"[PRED_WORKER] 开始预测，共 {total_subs} 个排放口，类型: {self.pred_type}")
         
@@ -413,10 +495,33 @@ class PredictionWorker(QThread):
                     cache_key = f"{subid}_daily_{days_back}_{codes}{'_corrected' if use_corrected else ''}"
                     result = _get_cached(
                         cache_key, 600,
-                        client.query_history, subid, subtype_code, codes,
-                        _start_str, _end_str, 2, use_corrected)
-                    rows = result.get('rows', [])
+                        lambda *a, **kw: self._query_history_safe(client, *a, **kw),
+                        subid, subtype_code, codes, _start_str, _end_str,
+                        index=2, use_corrected=use_corrected, page=1, rows=1000)
+                    rows = result.get('rows', []) or []
+                    daily_source = '日数据'
+
+                    # ── v5.47 兜底：日数据为空/不足时，用小时数据聚合为日均值 ──
+                    # 部分排口（尤其 VOCs/废水）服务端不落日数据，仅有小时数据。
+                    # 若直接放弃会表现为"无预测结果"，这里降级聚合以保证功能可用。
+                    if len(rows) < 3:
+                        hour_result = _get_cached(
+                            f"{subid}_hour_{days_back}_{codes}{'_corrected' if use_corrected else ''}",
+                            300,
+                            lambda *a, **kw: self._query_history_safe(client, *a, **kw),
+                            subid, subtype_code, codes, _start_str, _end_str,
+                            index=1, use_corrected=use_corrected, page=1, rows=5000)
+                        hour_rows = hour_result.get('rows', []) or []
+                        if hour_rows:
+                            rows = self._aggregate_hour_rows_to_daily(hour_rows)
+                            daily_source = '小时数据聚合'
+                            logger.debug(
+                                f"[PRED_WORKER] {subname}: 日数据不足，"
+                                f"改用小时数据聚合得到 {len(rows)} 天")
+
                     if not rows:
+                        self.daily_skip_reasons.append(
+                            f"{subname}：无日数据（服务端未返回历史记录）")
                         logger.debug(f"[PRED_WORKER] {subname}: 无日数据，跳过日排放量预测")
                         continue
                     # 服务端可能返回乱序，统一按时间升序排列（外推依赖时间顺序）
@@ -445,6 +550,9 @@ class PredictionWorker(QThread):
                                     pass
                         # 至少需要 3 天历史才有外推意义
                         if len(daily_values) < 3:
+                            reason = (f"{subname}/{param_name}：历史数据仅 "
+                                      f"{len(daily_values)} 天（{daily_source}），不足 3 天")
+                            self.daily_skip_reasons.append(reason)
                             logger.debug(
                                 f"[PRED_WORKER] {subname}/{param_name}: "
                                 f"日数据仅 {len(daily_values)} 天，不足以预测")
@@ -484,6 +592,8 @@ class PredictionWorker(QThread):
                             'warning_level': wl,
                             'is_warning': wl != "正常",
                             'pred_type': '日排放量预测',
+                            # v5.47：标注数据来源，便于用户判断可信度
+                            'data_source': daily_source,
                         })
                 else:
                     cache_key = f"{subid}_today_hour_{codes}{'_corrected' if use_corrected else ''}"
@@ -517,9 +627,17 @@ class PredictionWorker(QThread):
                             'pred_type': '日均预测',
                         })
             except Exception as e:
+                # v5.47：异常不能被静默吞掉。此前失败只在 debug 日志留痕，
+                # 界面表现为"无预测结果"且无任何原因，无法定位问题。
                 error_detail = traceback.format_exc()
-                logger.warning(f"[WARN] 排放口 {subname} 预测失败: {e}")
-                logger.warning(f"[WARN] 详细错误: {error_detail}")
+                logger.error(f"[PRED_WORKER] 排放口 {subname} 预测失败: {e}")
+                logger.debug(f"[PRED_WORKER] 详细错误: {error_detail}")
+                # 摘要（异常类型+首行）上报到 UI，让用户知道"为什么没数据"
+                first_line = next(
+                    (ln.strip() for ln in error_detail.strip().splitlines()
+                     if ln.strip() and not ln.strip().startswith('Traceback')),
+                    str(e))
+                self.daily_skip_reasons.append(f"{subname}：预测异常（{first_line}）")
 
         logger.debug(f"[PRED_WORKER] 预测完成，共生成 {len(all_predictions)} 条预测结果")
         self.prediction_done.emit(all_predictions)
@@ -4399,6 +4517,11 @@ class MainWindow(QMainWindow):
         self._pred_worker.prediction_done.connect(
             lambda preds: self._on_prediction_worker_done(preds, pred_type, silent)
         )
+        # v5.47：预测完成后把"被跳过的原因"从 worker 传到 UI，用于空结果提示
+        def _capture_reasons():
+            self._last_daily_skip_reasons = list(
+                getattr(self._pred_worker, 'daily_skip_reasons', []) or [])
+        self._pred_worker.finished.connect(_capture_reasons)
         self._pred_worker.finished.connect(self._pred_worker.deleteLater)
         self._pred_worker.start()
 
@@ -5011,10 +5134,20 @@ class MainWindow(QMainWindow):
         table.setRowCount(0)
 
         if not predictions:
+            # v5.47：空结果必须说明原因，而不是只显示"暂无预测结果"
+            reasons = getattr(self, '_last_daily_skip_reasons', []) or []
+            if reasons:
+                shown = "；".join(reasons[:3])
+                if len(reasons) > 3:
+                    shown += f"；等共 {len(reasons)} 项"
+                tip = f"暂无预测结果 —— {shown}"
+            else:
+                tip = ("暂无预测结果 —— 未获取到足够的历史日数据"
+                       "（每个参数至少需要 3 天历史记录）")
+            self.pred_result_label.setText(tip)
+            self.pred_chart.clear()
             table.setUpdatesEnabled(True)
             table.viewport().update()
-            self.pred_result_label.setText("暂无预测结果")
-            self.pred_chart.clear()
             return
 
         # 预测天数：取实际结果里最长的序列，避免用户中途改天数导致列错位
