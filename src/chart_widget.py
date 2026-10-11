@@ -407,12 +407,6 @@ class ChartWidget(QWidget):
         selected_set = set(selected_names) if selected_names else set()
         auto_show = bool(selected_set)
 
-        # ── Win7 诊断埋点 ──────────────────────────────────────────────────
-        try:
-            from main import _write_crash_log
-            _write_crash_log('PRED_STEP', f'plot_series entered; n_series={len(series_list or [])} normalize={normalize} auto_show={auto_show}\n')
-        except Exception:
-            pass
         # 保存当前数据
         self._current_times = times
         self._current_series_list = series_list
@@ -560,18 +554,8 @@ class ChartWidget(QWidget):
         self.canvas.set_hover_data(times)
         self.canvas.setup_hover()
 
-        try:
-            from main import _write_crash_log
-            _write_crash_log('PRED_STEP', 'before canvas.draw()\n')
-        except Exception:
-            pass
         # v5.38: 同步 draw() 改为 draw_idle()（异步调度，不阻塞 UI 线程）
         self.canvas.draw_idle()
-        try:
-            from main import _write_crash_log
-            _write_crash_log('PRED_STEP', 'after canvas.draw() OK\n')
-        except Exception:
-            pass
 
     def _toggle_line(self, series_name, state):
         """切换线条显示/隐藏（兼容双轴）。"""

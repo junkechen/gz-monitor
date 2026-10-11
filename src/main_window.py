@@ -91,7 +91,7 @@ class PredictionWorker(QThread):
                  sub_itemcodes_cache, api_data_cache, thresholds_cache,
                  get_subtype_code_fn, is_water_sub_fn,
                  code_to_name_map, intervention_sm=None,
-                 get_sub_itemcodes_fn=None):
+                 get_sub_itemcodes_fn=None, daily_forecast_days=7):
         super().__init__()
         self.grouped_data = grouped_data
         self.multi_client = multi_client
@@ -107,6 +107,8 @@ class PredictionWorker(QThread):
         self._code_to_name_map = code_to_name_map
         self._intervention_sm = intervention_sm
         self._get_sub_itemcodes = get_sub_itemcodes_fn
+        # v5.46：日排放量预测的未来天数
+        self.daily_forecast_days = daily_forecast_days
 
     def run(self):
         """后台线程执行：遍历所有排放口，执行预测，返回全量预测结果"""
@@ -394,6 +396,94 @@ class PredictionWorker(QThread):
                             'predicted': cur_item.get('predicted'),
                             'use_corrected': use_corrected,  # 标记是否使用折算数据
                             'is_thermal_power': use_corrected and not is_water,  # 标记是否为热电厂废气
+                        })
+                elif "日排放量预测" in self.pred_type:
+                    # ── v5.46 新增：日污染物排放量预测 ─────────────────────
+                    # 数据源：拉取最近 N 天的「日数据」(index=2)，逐参数做加权趋势外推。
+                    # 与「当日均值预测」的区别：后者基于当天小时数据内推当日均值，
+                    # 前者基于历史每日排放量外推未来若干天的每日排放量。
+                    days_back = max(30, self.daily_forecast_days * 2)
+                    from datetime import datetime as _dt, timedelta as _td
+                    _end = _dt.now()
+                    _start = _end - _td(days=days_back)
+                    _start_str = _start.strftime('%Y-%m-%d 00:00')
+                    _end_str = _end.strftime('%Y-%m-%d 23:59')
+
+                    # 日数据缓存 TTL 较长（10 分钟）：日数据不会分钟级变化
+                    cache_key = f"{subid}_daily_{days_back}_{codes}{'_corrected' if use_corrected else ''}"
+                    result = _get_cached(
+                        cache_key, 600,
+                        client.query_history, subid, subtype_code, codes,
+                        _start_str, _end_str, 2, use_corrected)
+                    rows = result.get('rows', [])
+                    if not rows:
+                        logger.debug(f"[PRED_WORKER] {subname}: 无日数据，跳过日排放量预测")
+                        continue
+                    # 服务端可能返回乱序，统一按时间升序排列（外推依赖时间顺序）
+                    rows = sorted(rows, key=lambda r: str(r.get('DateTime', '')))
+
+                    horizon_days = self.daily_forecast_days
+                    from data_processor import (
+                        predict_daily_emission, forecast_daily_dates,
+                        get_warning_level as _gwl4,
+                    )
+                    future_dates = forecast_daily_dates(horizon_days)
+
+                    for code in code_list:
+                        param_name = code_to_name.get(code, code)
+                        if self.prediction_params and param_name not in self.prediction_params:
+                            if port_has_match:
+                                continue
+                        val_key = f"val_{code}"
+                        daily_values = []
+                        for r in rows:
+                            raw = r.get(val_key)
+                            if raw not in (None, '', '--', 0):
+                                try:
+                                    daily_values.append(float(raw))
+                                except (ValueError, TypeError):
+                                    pass
+                        # 至少需要 3 天历史才有外推意义
+                        if len(daily_values) < 3:
+                            logger.debug(
+                                f"[PRED_WORKER] {subname}/{param_name}: "
+                                f"日数据仅 {len(daily_values)} 天，不足以预测")
+                            continue
+
+                        threshold = self.thresholds.get(param_name)
+                        if isinstance(threshold, tuple):
+                            threshold = threshold[1]      # 元组取上限
+                        fc = predict_daily_emission(
+                            daily_values, horizon_days=horizon_days,
+                            threshold=threshold)
+                        if fc.get('predicted') is None:
+                            continue
+
+                        future_daily = fc.get('future_daily', [])
+                        # 取预测期内的最高预警等级
+                        wl = "正常"
+                        level_order = {"正常": 0, "黄色预警": 1,
+                                       "橙色预警": 2, "红色预警": 3}
+                        for dval in future_daily:
+                            lv = _gwl4(dval, param_name, self.thresholds)
+                            if level_order.get(lv, 0) > level_order.get(wl, 0):
+                                wl = lv
+
+                        all_predictions.append({
+                            'ent_name': ent_name, 'subname': subname,
+                            'param': param_name,
+                            'cur_pred': fc.get('predicted'),
+                            'predicted': fc.get('predicted'),
+                            'future_daily': future_daily,
+                            'future_dates': future_dates,
+                            'confidences': fc.get('confidences', []),
+                            'trend': fc.get('trend', 'stable'),
+                            'trend_rate': fc.get('trend_rate', 0),
+                            'confidence': fc.get('confidence', 0),
+                            'data_points': fc.get('data_points', 0),
+                            'warning_level': wl,
+                            'is_warning': wl != "正常",
+                            'pred_type': '日排放量预测',
                         })
                 else:
                     cache_key = f"{subid}_today_hour_{codes}{'_corrected' if use_corrected else ''}"
@@ -1022,6 +1112,9 @@ class MainWindow(QMainWindow):
 
         # 未来小时预测数（小时数据预测时向后预测几个小时，默认3小时）
         self.prediction_horizon = 3
+
+        # v5.46：日排放量预测的未来天数（默认7天）
+        self.daily_forecast_days = 7
 
         # ── 三项优化（T01）：历史缓存 / 对比图状态 ──────────────────
         # 必须放在 _init_ui() 之前：_init_ui 内部会读取 self._pred_chart_mode（同排口多参数 同参数多排口）
@@ -1816,8 +1909,13 @@ class MainWindow(QMainWindow):
         # 预测类型
         pred_layout.addWidget(QLabel("预测类型:"))
         self.pred_type_combo = QComboBox()
-        self.pred_type_combo.addItems(["小时数据预测", "当日均值预测"])
+        # v5.46 新增「日排放量预测」：基于历史每日排放量外推未来 N 天
+        self.pred_type_combo.addItems(["小时数据预测", "当日均值预测", "日排放量预测"])
         self.pred_type_combo.currentIndexChanged.connect(self._on_pred_type_changed)
+        self.pred_type_combo.setToolTip(
+            "小时数据预测：外推未来数小时\n"
+            "当日均值预测：预测当日均值\n"
+            "日排放量预测：基于历史日排放量预测未来每日排放量")
         pred_layout.addWidget(self.pred_type_combo)
 
         pred_layout.addSpacing(10)
@@ -1882,13 +1980,32 @@ class MainWindow(QMainWindow):
         pred_layout.addSpacing(15)
 
         # 预测未来小时数（仅小时预测模式有效）
-        pred_layout.addWidget(QLabel("预测未来:"))
+        self._pred_horizon_label = QLabel("预测未来:")
+        pred_layout.addWidget(self._pred_horizon_label)
         self.pred_horizon_combo = QComboBox()
         self.pred_horizon_combo.addItems(["1小时", "2小时", "3小时"])
         self.pred_horizon_combo.setCurrentIndex(self.prediction_horizon - 1)
         self.pred_horizon_combo.currentIndexChanged.connect(self._on_pred_horizon_changed)
         self.pred_horizon_combo.setToolTip("小时数据预测时，向后预测几个小时")
         pred_layout.addWidget(self.pred_horizon_combo)
+
+        pred_layout.addSpacing(10)
+
+        # v5.46 新增：日排放量预测的未来天数（仅「日排放量预测」模式有效）
+        self.daily_horizon_label = QLabel("预测天数:")
+        pred_layout.addWidget(self.daily_horizon_label)
+        self.daily_horizon_combo = QComboBox()
+        self.daily_horizon_combo.addItems(["3天", "7天", "15天", "30天"])
+        self.daily_horizon_combo.setCurrentIndex(1)   # 默认 7 天
+        self.daily_horizon_combo.setFixedWidth(90)
+        self.daily_horizon_combo.setToolTip("日排放量预测时，向后预测未来多少天")
+        self.daily_horizon_combo.currentIndexChanged.connect(
+            self._on_daily_horizon_changed)
+        pred_layout.addWidget(self.daily_horizon_combo)
+
+        # v5.46：默认隐藏，仅在选中「日排放量预测」时显示
+        self.daily_horizon_label.setVisible(False)
+        self.daily_horizon_combo.setVisible(False)
 
         pred_layout.addStretch()
         pred_group.setLayout(pred_layout)
@@ -3931,6 +4048,30 @@ class MainWindow(QMainWindow):
         self.pred_result_label.setText('点击"开始预测"查看预测结果（将对所有排放口的所有参数进行预测）')
         self.pred_chart.clear()
 
+        # v5.46：按预测类型切换"预测未来小时数 / 预测天数"两组控件的可见性，
+        # 避免出现两个语义冲突的设置项同时可见。
+        is_daily = (self.pred_type_combo.currentText() == "日排放量预测")
+        is_hourly = (self.pred_type_combo.currentText() == "小时数据预测")
+        for w in (getattr(self, 'daily_horizon_label', None),
+                  getattr(self, 'daily_horizon_combo', None)):
+            if w is not None:
+                w.setVisible(is_daily)
+        # 「预测未来:」标签与小时下拉框同属一组
+        if getattr(self, '_pred_horizon_label', None) is not None:
+            self._pred_horizon_label.setVisible(is_hourly)
+        if getattr(self, 'pred_horizon_combo', None) is not None:
+            self.pred_horizon_combo.setVisible(is_hourly)
+
+    def _on_daily_horizon_changed(self, index):
+        """预测天数改变（3/7/15/30 天）"""
+        days = [3, 7, 15, 30][index] if 0 <= index < 4 else 7
+        self.daily_forecast_days = days
+        # 清空表格，提示用户重新预测
+        self.pred_table.setRowCount(0)
+        self.pred_result_label.setText(
+            f'已切换为预测未来 {days} 天的每日排放量，请点击"开始预测"更新结果')
+        print(f"[INFO] 日排放量预测天数: {days}")
+
     def _on_sound_alarm_changed(self, state):
         """声音报警开关状态改变"""
         self.sound_alarm_enabled = (state == 2)
@@ -4253,6 +4394,7 @@ class MainWindow(QMainWindow):
             code_to_name_map=CODE_TO_NAME,
             intervention_sm=getattr(self, '_intervention_sm', None),
             get_sub_itemcodes_fn=self._get_sub_itemcodes,
+            daily_forecast_days=getattr(self, 'daily_forecast_days', 7),
         )
         self._pred_worker.prediction_done.connect(
             lambda preds: self._on_prediction_worker_done(preds, pred_type, silent)
@@ -4301,6 +4443,8 @@ class MainWindow(QMainWindow):
         if ui_changed:
             if "小时数据预测" in pred_type:
                 self._show_hour_prediction_table(all_predictions)
+            elif "日排放量预测" in pred_type:
+                self._show_daily_emission_table(all_predictions)
             else:
                 self._show_day_prediction_table(all_predictions)
         else:
@@ -4334,15 +4478,36 @@ class MainWindow(QMainWindow):
                             'confidence':   fh.get('confidence', 1.0),
                         })
             elif p.get('is_warning'):
-                pred_warn_items.append({
-                    'ent_name':     p.get('ent_name', ''),
-                    'subname':      p.get('subname', ''),
-                    'param':        param_name,
-                    'predicted':    p.get('predicted'),
-                    'warning_level': p.get('warning_level', '正常'),
-                    'pred_type':    '日均预测',
-                    'confidence':   p.get('confidence', 1.0),
-                })
+                # v5.46：日排放量预测逐日上报超标项，让声音报警覆盖新功能
+                daily_seq = p.get('future_daily', [])
+                if daily_seq:
+                    _dates = p.get('future_dates', [])
+                    for _i, _dval in enumerate(daily_seq):
+                        if _dval is None:
+                            continue
+                        _dlevel = _gwl(_dval, param_name, self.thresholds)
+                        if _dlevel != '正常':
+                            _confs = p.get('confidences', [])
+                            pred_warn_items.append({
+                                'ent_name':     p.get('ent_name', ''),
+                                'subname':      p.get('subname', ''),
+                                'param':        param_name,
+                                'predicted':    _dval,
+                                'warning_level': _dlevel,
+                                'pred_type':    (_dates[_i] if _i < len(_dates)
+                                                 else f'+{_i+1}天'),
+                                'confidence':   (_confs[_i] if _i < len(_confs) else 0.5),
+                            })
+                else:
+                    pred_warn_items.append({
+                        'ent_name':     p.get('ent_name', ''),
+                        'subname':      p.get('subname', ''),
+                        'param':        param_name,
+                        'predicted':    p.get('predicted'),
+                        'warning_level': p.get('warning_level', '正常'),
+                        'pred_type':    p.get('pred_type', '预测'),
+                        'confidence':   p.get('confidence', 1.0),
+                    })
 
         if pred_warn_items:
             self.warning_system.check_and_alert_predictions(pred_warn_items, self.thresholds)
@@ -4675,9 +4840,12 @@ class MainWindow(QMainWindow):
           - 小时预测：含 'future_preds' 字段（predict_future_hours 返回）
           - 日均预测：含 'cur_pred' / 'predicted' 字段
         """
+        from PyQt5.QtCore import Qt
         from PyQt5.QtGui import QColor
         from PyQt5.QtWidgets import QTableWidgetItem
-        from PyQt5.QtCore import Qt
+        # v5.46 性能修复：把原先位于「每行循环内」的 import 提到函数入口，
+        # 避免 N 行预测就重复执行 N 次模块查找（sys.modules 命中仍需加锁开销）。
+        from data_processor import get_warning_level
 
         self.pred_table.setUpdatesEnabled(False)
         self.pred_table.setRowCount(0)
@@ -4747,8 +4915,6 @@ class MainWindow(QMainWindow):
                     if fval is not None and fconf > 0:
                         cell_text += f"\n({fconf*100:.0f}%)"
                     # 对单个时间点也做预警着色标记（文字颜色）
-                    from PyQt5.QtGui import QBrush
-                    from data_processor import get_warning_level
                     fi_level = get_warning_level(fval, p.get('param', ''), self.thresholds) if fval is not None else "正常"
                     fi_item = QTableWidgetItem(cell_text)
                     fi_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -4824,6 +4990,215 @@ class MainWindow(QMainWindow):
             self._show_prediction_chart(predictions, "当日均值预测")
         else:
             self.pred_chart.clear()
+
+    # ── v5.46：日污染物排放量预测展示 ────────────────────────────────────
+    def _show_daily_emission_table(self, predictions):
+        """显示日排放量预测结果。
+
+        表格列结构：
+          企业/排放口 | 参数 | 历史基线 | D+1 … D+N | 趋势 | 置信度 | 预警状态
+
+        其中 D+N 列为动态列，数量随「预测天数」设置变化。
+        超标单元格以底色高亮，与小时/日均预测保持一致的视觉语言。
+        """
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QColor
+        from PyQt5.QtWidgets import QTableWidgetItem
+        from data_processor import get_warning_level
+
+        table = self.pred_table
+        table.setUpdatesEnabled(False)
+        table.setRowCount(0)
+
+        if not predictions:
+            table.setUpdatesEnabled(True)
+            table.viewport().update()
+            self.pred_result_label.setText("暂无预测结果")
+            self.pred_chart.clear()
+            return
+
+        # 预测天数：取实际结果里最长的序列，避免用户中途改天数导致列错位
+        max_days = 1
+        for p in predictions:
+            max_days = max(max_days, len(p.get('future_daily', []) or []))
+
+        # ── 构建列头（仅当天数变化时重建列结构）─────────────────────────
+        labels = ["企业/排放口", "参数", "历史基线"] + \
+                 [f"D+{i}" for i in range(1, max_days + 1)] + \
+                 ["趋势", "置信度", "预警状态"]
+        if max_days != getattr(self, '_last_daily_days', -1):
+            table.setColumnCount(len(labels))
+            table.setHorizontalHeaderLabels(labels)
+            table.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.ResizeMode.Fixed)
+            table.setColumnWidth(0, 150)
+            for i in range(1, len(labels)):
+                table.horizontalHeader().setSectionResizeMode(
+                    i, QHeaderView.ResizeMode.Stretch)
+            self._last_daily_days = max_days
+        else:
+            for i, lb in enumerate(labels):
+                table.setHorizontalHeaderItem(i, QTableWidgetItem(lb))
+
+        col_trend = 3 + max_days
+        col_conf = col_trend + 1
+        col_warn = col_conf + 1
+
+        warn_text_map = {
+            '正常': '✅ 正常',
+            '黄色预警': '⚠ 黄色预警',
+            '橙色预警': '🔶 橙色预警',
+            '红色预警': '🚨 红色预警',
+        }
+
+        table.setRowCount(len(predictions))
+
+        for row_idx, p in enumerate(predictions):
+            ent = p.get('ent_name', '')
+            sub = p.get('subname', '')
+            item0 = QTableWidgetItem(f"{ent}\n{sub}" if ent else sub)
+            item0.setTextAlignment(Qt.AlignmentFlag.AlignVCenter |
+                                   Qt.AlignmentFlag.AlignLeft)
+            table.setItem(row_idx, 0, item0)
+
+            item1 = QTableWidgetItem(p.get('param', ''))
+            item1.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_idx, 1, item1)
+
+            # ── 历史基线（当日加权趋势基线）──────────────────────────────
+            base_val = p.get('predicted')
+            item_b = QTableWidgetItem(self._fmt_pred_val(base_val))
+            item_b.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_idx, 2, item_b)
+
+            # ── 逐日预测值（超标单元格加深色底）────────────────────────
+            future_daily = p.get('future_daily', []) or []
+            confs = p.get('confidences', []) or []
+            param_name = p.get('param', '')
+            for di in range(max_days):
+                if di < len(future_daily):
+                    dval = future_daily[di]
+                    dconf = confs[di] if di < len(confs) else 0
+                    txt = self._fmt_pred_val(dval)
+                    if dval is not None and dconf > 0:
+                        txt += f"\n({dconf*100:.0f}%)"
+                    level = get_warning_level(dval, param_name,
+                                              self.thresholds) if dval is not None else "正常"
+                else:
+                    dval = None
+                    txt = "—"
+                    level = "正常"
+                it = QTableWidgetItem(txt)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                bg_hex = self._warning_level_color(level)
+                if bg_hex:
+                    it.setBackground(QColor(bg_hex))
+                table.setItem(row_idx, 3 + di, it)
+
+            # ── 趋势 / 置信度 / 预警状态 ───────────────────────────────
+            item_t = QTableWidgetItem(
+                self._trend_text(p.get('trend', 'stable'),
+                                 p.get('trend_rate', 0)))
+            item_t.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_idx, col_trend, item_t)
+
+            item_c = QTableWidgetItem(
+                f"{p.get('confidence', 0)*100:.0f}%")
+            item_c.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_idx, col_conf, item_c)
+
+            warn_level = p.get('warning_level', '正常')
+            item_w = QTableWidgetItem(
+                warn_text_map.get(warn_level, warn_level))
+            item_w.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_idx, col_warn, item_w)
+
+            bg_hex = self._warning_level_color(warn_level)
+            if bg_hex:
+                bg = QColor(bg_hex)
+                for col in (0, 1, col_trend, col_conf, col_warn):
+                    cell = table.item(row_idx, col)
+                    if cell:
+                        cell.setBackground(bg)
+
+        warn_count = sum(1 for p in predictions if p.get('is_warning'))
+        total = len(predictions)
+        if warn_count:
+            summary = (f"共 {total} 条日排放量预测，其中 {warn_count} 条存在超标风险 ⚠"
+                       f"  |  声音报警：{'已开启 🔔' if self.sound_alarm_enabled else '已关闭 🔕'}")
+        else:
+            summary = f"共 {total} 条日排放量预测，未来 {max_days} 天全部正常 ✅"
+        self.pred_result_label.setText(summary)
+        table.setUpdatesEnabled(True)
+        table.viewport().update()
+
+        # ── 趋势图 ─────────────────────────────────────────────────────
+        self._draw_daily_emission_chart(predictions)
+
+    def _draw_daily_emission_chart(self, predictions):
+        """绘制日排放量预测趋势图。
+
+        复用现有 ChartWidget：X 轴为 D+1…D+N，每个「排放口-参数」一条曲线，
+        一次绘制后由顶部复选框控制显隐（与历史/预测图交互一致）。
+        """
+        if not predictions:
+            try:
+                self.pred_chart.clear()
+            except Exception:
+                pass
+            return
+
+        # 以最长序列作为公共时间轴
+        max_days = max(len(p.get('future_daily', []) or []) for p in predictions)
+        if max_days <= 0:
+            try:
+                self.pred_chart.clear()
+            except Exception:
+                pass
+            return
+        dates = predictions[0].get('future_dates', []) or []
+        if len(dates) < max_days:
+            from data_processor import forecast_daily_dates
+            dates = forecast_daily_dates(max_days)
+        times = [dates[i][5:] if i < len(dates) else f"D+{i+1}"
+                 for i in range(max_days)]   # 只取 MM-DD，节省 X 轴空间
+
+        # 曲线数量保护：过多曲线既看不清也拖慢渲染
+        MAX_CURVES = 12
+        series_list = []
+        hidden = 0
+        for p in predictions:
+            if len(series_list) >= MAX_CURVES:
+                hidden += 1
+                continue
+            ent = p.get('ent_name', '')
+            sub = p.get('subname', '')
+            label = f"{ent}-{sub}-{p.get('param', '')}" if ent \
+                else f"{sub}-{p.get('param', '')}"
+            vals = list(p.get('future_daily', []) or [])
+            # 补齐到公共长度
+            if len(vals) < max_days:
+                vals += [None] * (max_days - len(vals))
+            series_list.append({"name": label, "data": vals})
+
+        title = f"日排放量预测趋势（未来 {max_days} 天）"
+        if hidden:
+            title += f"（已隐藏 {hidden} 条）"
+
+        try:
+            # 默认勾选前 5 条，保证首屏即可看到曲线而非空白
+            self.pred_chart.plot_series(
+                times=times,
+                series_list=series_list,
+                title=title,
+                selected_names={s["name"] for s in series_list[:5]},
+            )
+            self.pred_chart._auto_scale()
+            self.pred_chart.canvas.draw_idle()
+        except Exception as e:
+            print(f"[ERROR] 绘制日排放量预测趋势图失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _get_supported_params_for_visible_subs(self):
         """收集当前可见排口（subs）真正支持的参数名称（去重，按 CODE_TO_NAME 的 key 顺序排列）。
@@ -5134,12 +5509,6 @@ class MainWindow(QMainWindow):
         绝不主动清空已显示的趋势图。
         """
         try:
-            from main import _write_crash_log
-            _write_crash_log('PRED_STEP',
-                             f'ondemand_done entered; param={param_name} n_new={len(new_preds) if new_preds else 0}\n')
-        except Exception:
-            pass
-        try:
             existing = getattr(self, '_pred_chart_all_predictions', []) or []
             # 用新结果替换该参数的旧预测，避免重复
             merged = [p for p in existing if p.get('param') != param_name]
@@ -5356,12 +5725,6 @@ class MainWindow(QMainWindow):
              追加预测点 -> pred_chart.plot_series -> canvas.draw_idle()
         全程后台取数，主线程零阻塞（消除切指标卡顿）。
         """
-        # ── Win7 诊断埋点 ──────────────────────────────────────────────────
-        try:
-            from main import _write_crash_log
-            _write_crash_log('PRED_STEP', f'draw_pred_chart_multi entered; n_params={len(checked_params) if checked_params else 0} mode={mode}\n')
-        except Exception:
-            pass
         grouped = getattr(self, 'current_grouped_data', {}) or {}
         if not checked_params or not grouped:
             try:
@@ -5431,20 +5794,7 @@ class MainWindow(QMainWindow):
 
     def _assemble_and_plot_pred_chart(self, checked_params, mode):
         """从 _hist_results 组装 left/right series、追加预测点、归一化、截断并绘制。"""
-        # ── Win7 诊断埋点 ──────────────────────────────────────────────────
-        try:
-            from main import _write_crash_log
-            _write_crash_log('PRED_STEP', f'assemble_plot entered; mode={mode} n_results={len(getattr(self, "_hist_results", {}) or {})}\n')
-        except Exception:
-            pass
         results = getattr(self, '_hist_results', {}) or {}
-        try:
-            from main import _write_crash_log
-            _sel = set(self._get_checked_compare_params()) if getattr(self, '_get_checked_compare_params', None) else set()
-            _write_crash_log('PRED_STEP',
-                             f'assemble: n_hist_results={len(results)} checked={len(_sel)}\n')
-        except Exception:
-            pass
         if not results:
             try:
                 self.pred_chart.clear()
@@ -5556,11 +5906,6 @@ class MainWindow(QMainWindow):
                 _selected_now = set()
             _plotted_names = {c['name'] for c in raw_curves}
             _selected_for_chart = _selected_now & _plotted_names
-            try:
-                from main import _write_crash_log
-                _write_crash_log('PRED_STEP', f'before plot_series; n_curves={len(raw_curves)} normalize={normalize} selected={len(_selected_for_chart)}\n')
-            except Exception:
-                pass
             self.pred_chart.plot_series(
                 times=common_times,
                 series_list=left_series,
@@ -5570,28 +5915,13 @@ class MainWindow(QMainWindow):
                 normalize=normalize,
                 selected_names=_selected_for_chart,
             )
-            try:
-                from main import _write_crash_log
-                _write_crash_log('PRED_STEP', 'plot_series returned OK\n')
-            except Exception:
-                pass
             logger.info(f"[PRED-CHART] plot_series done; now draw_idle")
             # v5.33: 让命中的 line 立刻落在合理 Y 轴范围内（用户无需手动触发）
             try:
                 self.pred_chart._auto_scale()
             except Exception:
                 pass
-            try:
-                from main import _write_crash_log
-                _write_crash_log('PRED_STEP', 'before draw_idle\n')
-            except Exception:
-                pass
             self.pred_chart.canvas.draw_idle()
-            try:
-                from main import _write_crash_log
-                _write_crash_log('PRED_STEP', 'draw_idle returned OK\n')
-            except Exception:
-                pass
             logger.info(f"[PRED-CHART] draw_idle scheduled (Win7 关崩溃点)")
         except Exception as e:
             logger.exception(f"[PRED-CHART] 绘制多指标预测趋势图失败: {e}")

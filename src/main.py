@@ -11,40 +11,143 @@ import time
 from datetime import datetime  # 用于 _write_crash_log 等模块级函数
 
 # ── 全局异常兜底：防止未捕获异常导致程序静默退出 ─────────────────────────────
+_LOG_DIR_CACHE = None
+_LOG_DIR_LOCK = threading.Lock()
+
+
 def _log_dir_for_exe() -> str:
-    """获取日志目录（%APPDATA% 优先，EXE 同级目录次之）。"""
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    # 1) 优先写到 %APPDATA%\GZ_Monitor\logs （权限稳定）
-    appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
-    preferred = os.path.join(appdata, 'GZ_Monitor', 'logs')
+    """获取日志目录（%APPDATA% 优先，EXE 同级目录次之）。
+
+    v5.46 性能修复：结果缓存。原实现每次调用都执行 makedirs + 写权限测试
+    （建临时文件→写入→删除），而绘图热路径每帧要调用 15 次以上，
+    累计产生上千次文件系统调用，是界面卡顿的主要来源之一。
+    目录一旦确定便不再变化，故只探测一次。
+    """
+    global _LOG_DIR_CACHE
+    if _LOG_DIR_CACHE is not None:
+        return _LOG_DIR_CACHE
+
+    with _LOG_DIR_LOCK:
+        if _LOG_DIR_CACHE is not None:      # 双检：避免并发重复探测
+            return _LOG_DIR_CACHE
+
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        # 1) 优先写到 %APPDATA%\GZ_Monitor\logs （权限稳定）
+        appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
+        preferred = os.path.join(appdata, 'GZ_Monitor', 'logs')
+        resolved = None
+        try:
+            os.makedirs(preferred, exist_ok=True)
+            # 写权限测试
+            test = os.path.join(preferred, '.write_test')
+            with open(test, 'w', encoding='utf-8') as f:
+                f.write('1')
+            os.remove(test)
+            resolved = preferred
+        except Exception:
+            pass
+        # 2) 回退到 EXE 同级 logs/
+        if resolved is None:
+            fallback = os.path.join(base, 'logs')
+            try:
+                os.makedirs(fallback, exist_ok=True)
+                resolved = fallback
+            except Exception:
+                resolved = None
+
+        _LOG_DIR_CACHE = resolved
+        return resolved
+
+
+# ── v5.46 性能修复：崩溃日志缓冲写入 ──────────────────────────────────────────
+# 诊断埋点（PRED_STEP / UNRAISABLE 等）在渲染热路径上高频触发，
+# 原实现每次都 open/write/close，同步阻塞 UI 线程。
+# 现在统一先入内存环形缓冲，再由后台守护线程按节流间隔批量落盘。
+_LOG_BUFFER_MAX = 512          # 缓冲上限，防止日志风暴吃内存
+_LOG_FLUSH_INTERVAL = 2.0      # 最长 2 秒落盘一次
+_LOG_CRITICAL_PREFIXES = frozenset(('UNCAUGHT', 'UNRAISABLE', 'CLEAN_EXIT'))
+
+_log_buffer = []
+_log_buffer_lock = threading.Lock()
+_log_flush_thread = None
+_log_flush_stop = threading.Event()
+
+
+def _format_log_entry(prefix: str, text: str) -> str:
+    return f"\n===== {prefix} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n{text}\n"
+
+
+def _log_flush_once() -> None:
+    """把缓冲区内容批量落盘（由后台线程或关键事件同步调用）。"""
     try:
-        os.makedirs(preferred, exist_ok=True)
-        # 写权限测试
-        test = os.path.join(preferred, '.write_test')
-        with open(test, 'w', encoding='utf-8') as f:
-            f.write('1')
-        os.remove(test)
-        return preferred
+        with _log_buffer_lock:
+            if not _log_buffer:
+                return
+            payload = ''.join(_log_buffer)
+            _log_buffer.clear()
+
+        log_dir = _log_dir_for_exe()
+        if not log_dir:
+            return
+        path = os.path.join(log_dir, 'crash.log')
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(payload)
     except Exception:
-        pass
-    # 2) 回退到 EXE 同级 logs/
-    fallback = os.path.join(base, 'logs')
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
+        # 落盘失败时 silent fallback：至少把内容打到 stderr
+        try:
+            sys.stderr.write("[CRASH-LOG-FLUSH-FAILED]\n")
+        except Exception:
+            pass
+
+
+def _log_flush_loop():
+    """后台守护线程：按节流间隔批量落盘，避免阻塞 UI 线程。"""
+    while not _log_flush_stop.wait(_LOG_FLUSH_INTERVAL):
+        _log_flush_once()
+
+
+def _ensure_flush_thread():
+    global _log_flush_thread
+    if _log_flush_thread is not None and _log_flush_thread.is_alive():
+        return
+    _log_flush_stop.clear()
+    _log_flush_thread = threading.Thread(
+        target=_log_flush_loop, name='CrashLogFlusher', daemon=True)
+    _log_flush_thread.start()
 
 
 def _write_crash_log(prefix: str, text: str) -> None:
-    """把崩溃信息追加写入 crash.log（永不抛异常）。"""
+    """把崩溃信息写入日志（永不抛异常）。
+
+    v5.46 性能修复：关键事件（未捕获异常/不可捕获异常/正常退出）同步落盘，
+    保证进程被杀时日志不丢；诊断埋点则入内存缓冲 + 后台节流落盘，
+    消除渲染热路径上的同步文件 I/O。
+    """
     try:
-        log_dir = _log_dir_for_exe()
-        path = os.path.join(log_dir, 'crash.log')
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(f"\n===== {prefix} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-            f.write(text)
-            f.write("\n")
+        entry = _format_log_entry(prefix, text)
+
+        if prefix in _LOG_CRITICAL_PREFIXES:
+            with _log_buffer_lock:
+                _log_buffer.append(entry)
+            _log_flush_once()
+            return
+
+        with _log_buffer_lock:
+            _log_buffer.append(entry)
+            # 缓冲满则丢弃最旧条目，避免日志风暴无限增长
+            if len(_log_buffer) > _LOG_BUFFER_MAX:
+                del _log_buffer[:len(_log_buffer) - _LOG_BUFFER_MAX]
+                # 已超出上限：立刻落盘一次，防止持续高频时缓冲失效
+                over = True
+            else:
+                over = False
+        if over:
+            _log_flush_once()
+        else:
+            _ensure_flush_thread()
     except Exception:
         # 写日志失败时 silent fallback：至少把内容打到 stderr
         try:
@@ -90,6 +193,9 @@ import atexit
 def _atexit_clean_exit():
     try:
         _write_crash_log('CLEAN_EXIT', f'process exiting cleanly; pid={os.getpid()}\n')
+        # v5.46：停掉后台刷盘线程前，把尚未落盘的诊断条目补写一次
+        _log_flush_stop.set()
+        _log_flush_once()
     except Exception:
         pass
 atexit.register(_atexit_clean_exit)

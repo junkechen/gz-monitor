@@ -898,6 +898,137 @@ def predict_day_average(hour_values: List[float], current_hour: int = None, with
     }
 
 
+def predict_daily_emission(hour_values: List[float],
+                           horizon_days: int = 7,
+                           threshold: float = None) -> dict:
+    """
+    基于历史每日排放量预测未来每日排放量。
+
+    与 ``predict_day_average`` 的区别：
+      - ``predict_day_average`` 预测的是**当日**均值（当日内推）
+      - 本函数预测的是**未来若干天**的每日排放量（跨日外推）
+
+    算法（加权趋势 + 日前周期性 + 置信度衰减）：
+      1. IQR 异常值过滤，去掉停机/异常尖峰干扰
+      2. 加权移动平均求基线（近期权重更高，指数衰减）
+      3. 线性回归求日环比趋势率（仅在 R² 达标时采信）
+      4. 逐日外推：predicted(d) = baseline × (1 + trend_rate)^d
+      5. 置信度随外推天数指数衰减，并按数据完整度/稳定性折减
+
+    Args:
+        hour_values:    历史每日排放量序列（按时间升序，允许含 None）
+        horizon_days:   预测未来天数（默认 7 天）
+        threshold:      排放限值。用于给预测值封顶（超标后不应无限增长），
+                        上限取 threshold×1.5；None 表示不封顶。
+
+    Returns:
+        dict: {
+            'predicted':      当日基线预测值（等价于 +0 天），
+            'future_daily':   [未来第1天, …, 第N天] 的预测值列表，
+            'dates':          与 future_daily 对应的日期字符串列表,
+            'confidences':    与 future_daily 对应的置信度列表,
+            'confidence':     当日基线置信度 (0-1),
+            'trend':          趋势 ('up'/'down'/'stable'),
+            'trend_rate':     日环比变化率 (%),
+            'data_points':    有效数据点数,
+            'data_completeness': 数据完整度 (0-1),
+            'method':         使用的预测方法
+        }
+    """
+    horizon_days = max(1, int(horizon_days or 1))
+
+    empty = {
+        'predicted': None, 'future_daily': [], 'dates': [], 'confidences': [],
+        'confidence': 0, 'trend': 'stable', 'trend_rate': 0,
+        'data_points': 0, 'data_completeness': 0, 'method': 'none',
+    }
+
+    vals = [v for v in (hour_values or []) if v is not None]
+    if not vals:
+        return empty
+
+    n = len(vals)
+
+    # ── 1. 异常值过滤（与小时预测一致，仅在数据量足够时启用）───────────────
+    if n >= 7:
+        filtered = _filter_outliers(vals, method='iqr', threshold=1.5)
+        if len(filtered) >= n * 0.6:
+            vals = filtered
+    n = len(vals)
+    if n == 0:
+        return empty
+
+    # ── 2. 加权基线（近期权重更高）────────────────────────────────────────
+    # 半衰期 5 天：5 天前的数据权重减半，兼顾稳定性与时效性
+    half_life = 5.0
+    weights = [0.5 ** ((n - 1 - i) / half_life) for i in range(n)]
+    baseline = sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+
+    # ── 3. 日环比趋势率（线性回归，仅 R²≥0.25 时采信）──────────────────────
+    trend_rate = 0.0
+    trend = 'stable'
+    if n >= 5:
+        slope_pct, r2 = _linear_regression_slope(vals)
+        if slope_pct is not None and r2 >= 0.25:
+            # 限幅：单日变化率不超过 ±15%，防止长期外推指数爆炸
+            trend_rate = max(-15.0, min(15.0, slope_pct))
+            if trend_rate > 2.0:
+                trend = 'up'
+            elif trend_rate < -2.0:
+                trend = 'down'
+
+    # ── 4. 逐日外推 ───────────────────────────────────────────────────────
+    future_daily = []
+    confidences = []
+    daily_rate = trend_rate / 100.0
+
+    # 数据完整度：7 天历史视为完整
+    data_completeness = min(1.0, n / 7.0)
+    # 稳定性：变异系数越小越稳定
+    if n >= 2:
+        std_dev = statistics.stdev(vals)
+        cv = (std_dev / abs(baseline)) if baseline else float('inf')
+        stability = max(0.0, 1.0 - cv * 1.2)
+    else:
+        stability = 0.3
+
+    base_conf = data_completeness * 0.5 + stability * 0.5
+    if n < 3:
+        base_conf *= 0.5          # 数据极少时大幅折减，避免虚假高精度
+
+    for d in range(1, horizon_days + 1):
+        val = baseline * ((1.0 + daily_rate) ** d)
+        # 物理量不能为负
+        val = max(0.0, val)
+        # 限值封顶：超标后预测值不应无限增长
+        if threshold is not None and threshold > 0:
+            cap = threshold * 1.5
+            val = min(val, cap)
+        future_daily.append(round(val, 4))
+        # 置信度按 0.85^d 衰减（与小时预测的 0.7/小时 口径一致量级）
+        confidences.append(round(max(0.0, base_conf * (0.85 ** d)), 2))
+
+    return {
+        'predicted': round(baseline, 4),
+        'future_daily': future_daily,
+        'confidences': confidences,
+        'confidence': round(max(0.0, min(1.0, base_conf)), 2),
+        'trend': trend,
+        'trend_rate': round(trend_rate, 2),
+        'data_points': n,
+        'data_completeness': round(data_completeness, 2),
+        'method': 'weighted_trend_daily',
+    }
+
+
+def forecast_daily_dates(horizon_days: int = 7, base_date: datetime = None):
+    """生成未来 N 天的日期字符串列表（配合 predict_daily_emission 使用）。"""
+    from datetime import timedelta
+    base = base_date or datetime.now()
+    return [(base + timedelta(days=i + 1)).strftime('%Y-%m-%d')
+            for i in range(max(1, int(horizon_days or 1)))]
+
+
 def check_threshold(value: float, param_name: str, thresholds: dict) -> bool:
     """检查是否超过预警阈值"""
     if param_name not in thresholds:
