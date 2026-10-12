@@ -42,6 +42,43 @@ class TestParamUnits(unittest.TestCase):
         self.assertEqual(missing, [],
                          f"以下参数缺少单位定义: {missing}")
 
+    def test_a2_server_mapping_matches_code(self):
+        """CODE_TO_NAME 必须与服务端实时接口返回的 name 一致（v5.52 实证）
+
+        服务端 `GetEnterpriseRealtimeData` 每项自带 C0001_ITEM_CODE +
+        C0001_ITEM_NAME，是 code->name 的权威来源。探测结果见
+        docs/code_mapping_probe.txt（冠县恒润热电，subid=1789「1-2号机组」
+        与 subid=9910「恒润热电排污口」）。
+
+        此处把 201/203/207 的映射锁死，防止被 docs/数据接口文档.md 2.5 节
+        的错误描述（原写 201=非甲烷总烃/203=二氧化硫/207=氮氧化物）带偏。
+        """
+        # 服务端实测返回值（去掉单位后缀后与代码名等价）
+        SERVER_MAP = {
+            '201': '二氧化硫', '203': '氮氧化物', '207': '颗粒物',
+            '209': '氧气',     '210': '流量',     '211': '流速',
+            '525': '烟气温度', '526': '烟气压力', '527': '烟气湿度',
+            '301': '水温',     '302': 'PH',       '311': '氨氮',
+            '316': '化学需氧量', '494': '流量',
+        }
+        # 服务端名与代码名的等价关系（命名差异，非映射差异）
+        # 按 code 指定，因为「流量」一名对应 210(代码名烟气流量) 与
+        # 494(代码名流量) 两个不同参数，不能共用一个全局映射。
+        EQUIV = {
+            '209': {'氧气': '烟气含氧量'},
+            '302': {'PH': 'pH值'},
+            '526': {'千帕': 'kPa'},
+            '210': {'流量': '烟气流量'},
+        }
+
+        for code, srv_name in SERVER_MAP.items():
+            code_name = CODE_TO_NAME.get(code)
+            self.assertIsNotNone(code_name, f"code {code} 不在 CODE_TO_NAME 中")
+            expected = EQUIV.get(code, {}).get(srv_name, srv_name)
+            self.assertEqual(
+                code_name, expected,
+                f"code {code}: 服务端={srv_name} 代码={code_name}，映射不一致")
+
     def test_b_string_codes_covered(self):
         """字符串 code（SO2/NOx/PM）也应有单位"""
         for code in ('SO2', 'NOx', 'PM'):
@@ -66,13 +103,21 @@ class TestParamUnits(unittest.TestCase):
             self.assertEqual(get_param_unit(code), 'mg/L', f"{code} 单位不符")
 
     def test_f_non_concentration_units(self):
-        """非浓度参数单位各自独立"""
+        """非浓度参数单位各自独立（v5.52：流量单位按服务端口径改为 m³）"""
         self.assertEqual(get_param_unit('302'), '无量纲')   # pH
         self.assertEqual(get_param_unit('209'), '%')        # 含氧量
-        self.assertEqual(get_param_unit('210'), 'm³/h')     # 烟气流量
+        self.assertEqual(get_param_unit('210'), 'm³')       # 烟气流量（期间累计）
         self.assertEqual(get_param_unit('525'), '℃')        # 温度
         self.assertEqual(get_param_unit('211'), 'm/s')      # 流速
         self.assertEqual(get_param_unit('495'), 'm³')       # 累计流量
+        self.assertEqual(get_param_unit('492'), 'm³')       # 废水流量
+        self.assertEqual(get_param_unit('494'), 'm³')       # 流量
+
+    def test_f2_flow_units_are_cumulative(self):
+        """流量参数单位必须是 m³（期间累计），不能是 m³/h（v5.52 实证）"""
+        for code in ('210', '492', '494', '495'):
+            self.assertEqual(get_param_unit(code), 'm³',
+                             f"{code} 单位应为 m³（服务端口径）")
 
     def test_g_unknown_code(self):
         """未知 code 返回空串（调用方应显示 --）"""
@@ -80,14 +125,14 @@ class TestParamUnits(unittest.TestCase):
 
     # ── 3. 排放量计算 ────────────────────────────────────────────────────
     def test_h_waste_gas_emission(self):
-        """废气：浓度(mg/m³) × 流量(m³/h) / 1e6 = kg/h"""
-        # 100 mg/m³ × 10000 m³/h = 1e6 mg/h = 1 kg/h
+        """废气：实测浓度(mg/m³) × 期间累计流量(m³) / 1e6 = kg"""
+        # 100 mg/m³ × 10000 m³ = 1e6 mg = 1 kg
         v = calc_emission_rate(100.0, 10000.0, '203')
         self.assertAlmostEqual(v, 1.0, places=6)
 
     def test_i_waste_water_emission(self):
-        """废水：浓度(mg/L) × 流量(m³/h) / 1e3 = kg/h"""
-        # 200 mg/L × 50 m³/h = 10000 mg/L·m³/h = 10 kg/h
+        """废水：实测浓度(mg/L) × 期间累计流量(m³) / 1e3 = kg"""
+        # 200 mg/L × 50 m³ = 10000 mg/L·m³ = 10 kg
         v = calc_emission_rate(200.0, 50.0, '316')
         self.assertAlmostEqual(v, 10.0, places=6)
 
