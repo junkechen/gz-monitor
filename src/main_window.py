@@ -194,10 +194,11 @@ class PredictionWorker(QThread):
     @staticmethod
     def _extract_flow_value(rows, code_list):
         """
-        从历史/实时数据行中提取该排口的瞬时流量值（m³/h）。
+        从历史/实时数据行中提取该排口的期间累计流量（m³）。
 
-        排放量 = 浓度 × 流量，而接口只返回浓度，故需在此取流量。
-        取**最新**一个非空流量值（rows 按时间升序，故从尾部取）。
+        排放量 = 实测浓度 × 期间累计流量（kg），而接口只返回浓度，
+        故需在此取流量。取**最新**一个非空 val_{flow} 值
+        （rows 按时间升序，故从尾部取）。
 
         Returns:
             (flow_value, flow_code)：任一为空表示无法计算排放量
@@ -3363,7 +3364,10 @@ class MainWindow(QMainWindow):
             # 取不到再按公式计算。
             emis_val = extract_emission_mass(param, code)
             if emis_val is None and is_concentration_param(code) and flow_value:
-                base_conc = corrected if (is_thermal_power and corrected is not None) else value
+                # v5.51：排放量用**实测值**，不用折算值。
+                # 网页端实证（2026-10-13 截图）：SO2 实测13.7×127021/1e6=1.74
+                # 与网页一致；若用折算14.5 则得 1.84，不符。
+                base_conc = value
                 if base_conc is not None:
                     emis_val = calc_emission_rate(base_conc, flow_value, code)
             self.realtime_table.setItem(
@@ -4109,14 +4113,15 @@ class MainWindow(QMainWindow):
                     cvt = row.get(cvt_key)
                     self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
                     self.history_table.setItem(row_idx, base_col + 1, QTableWidgetItem(str(cvt) if cvt else "--"))
-                    # 排放量：服务端字段优先，取不到再按 浓度×累计流量 计算
+                    # 排放量：服务端字段优先，取不到再按 实测浓度×累计流量 计算
                     emis = None
                     if is_concentration_param(code):
                         emis = extract_emission_mass(row, code)
-                        if emis is None:
-                            base_conc = cvt if cvt not in (None, '', '--') else val
-                            if base_conc not in (None, '', '--'):
-                                emis = calc_emission_rate(base_conc, _row_flow(row), code)
+                        # v5.51：排放量用**实测值**，不用折算值。
+                        # 网页端实证：SO2 实测13.7×127021/1e6=1.74 与网页一致；
+                        # 若用折算14.5 则得 1.84，不符。
+                        if emis is None and val not in (None, '', '--'):
+                            emis = calc_emission_rate(val, _row_flow(row), code)
                     self.history_table.setItem(
                         row_idx, base_col + 2,
                         QTableWidgetItem(format_emission_rate(emis)))

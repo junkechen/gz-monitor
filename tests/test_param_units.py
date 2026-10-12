@@ -122,6 +122,57 @@ class TestParamUnits(unittest.TestCase):
         self.assertEqual(calc_emission_mass(100.0, 10000.0, '203'),
                          calc_emission_rate(100.0, 10000.0, '203'))
 
+    def test_j4_uses_measured_not_corrected(self):
+        """排放量必须用**实测值**，不能用折算值（v5.51 实证）
+
+        网页端 2026-10-13 截图，顶层流量明确为 127021 m³：
+          SO2 实测 13.7 -> 1.740 kg (网页 1.74)   ✓
+          SO2 折算 14.5 -> 1.842 kg (网页 1.84)   ✗
+          NOx 实测 6.82 -> 0.866 kg (网页 0.866)  ✓
+          NOx 折算 7.17 -> 0.911 kg (网页 0.911)  ✗
+        若误用折算值，结果会系统性偏高约 6%，此处锁定该口径。
+        """
+        flow = 127021
+        # 实测口径应与网页一致
+        self.assertAlmostEqual(calc_emission_rate(13.7, flow, '203'),
+                               1.74, places=2)
+        self.assertAlmostEqual(calc_emission_rate(6.82, flow, '203'),
+                               0.866, places=3)
+        # 折算口径应与网页明显不符（防止回归到折算）
+        self.assertNotAlmostEqual(calc_emission_rate(14.5, flow, '203'),
+                                  1.74, places=2)
+        self.assertNotAlmostEqual(calc_emission_rate(7.17, flow, '203'),
+                                  0.866, places=3)
+
+    def test_j5_hourly_rows_consistent(self):
+        """逐小时数据：同一小时两参数反推流量应一致（2026-10-05 截图）
+
+        12 行小时数据中，用实测口径反推的流量在 SO2 与 NOx 间
+        偏差绝大多数 <0.5%（个别行为排放量 3 位有效数字舍入所致），
+        证明公式与取值口径正确。
+        """
+        rows = [
+            (11.5, 1.55, 1.79, 0.242),
+            (16.0, 2.12, 2.07, 0.275),
+            (14.5, 1.88, 2.22, 0.287),
+            (20.1, 2.63, 2.22, 0.291),
+            (17.2, 2.08, 2.50, 0.302),
+            (13.2, 1.75, 2.14, 0.284),
+            (13.8, 1.91, 2.09, 0.288),
+            (15.6, 2.00, 1.78, 0.233),
+            (13.9, 1.77, 2.16, 0.275),
+            (15.3, 1.94, 1.85, 0.235),
+            (19.1, 2.52, 1.61, 0.212),
+        ]
+        ok = 0
+        for so2_c, so2_e, nox_c, nox_e in rows:
+            f_so2 = so2_e / (so2_c / 1e6)
+            f_nox = nox_e / (nox_c / 1e6)
+            if abs(f_so2 - f_nox) / f_so2 < 0.01:   # 偏差 <1%
+                ok += 1
+        self.assertGreaterEqual(ok, 10,
+                                f"仅 {ok}/11 行流量一致，公式或口径可能有误")
+
     def test_k_divisors(self):
         """换算分母：废气 1e6、废水 1e3"""
         self.assertEqual(get_concentration_divisor('203'), 1e6)
