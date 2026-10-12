@@ -191,6 +191,31 @@ class PredictionWorker(QThread):
             out.append(agg)
         return out
 
+    @staticmethod
+    def _extract_flow_value(rows, code_list):
+        """
+        从历史/实时数据行中提取该排口的瞬时流量值（m³/h）。
+
+        排放量 = 浓度 × 流量，而接口只返回浓度，故需在此取流量。
+        取**最新**一个非空流量值（rows 按时间升序，故从尾部取）。
+
+        Returns:
+            (flow_value, flow_code)：任一为空表示无法计算排放量
+        """
+        from param_units import find_flow_code
+        flow_code = find_flow_code(code_list)
+        if not flow_code or not rows:
+            return None, flow_code
+        for r in reversed(list(rows)):
+            v = r.get(f'val_{flow_code}')
+            if v in (None, '', '--'):
+                continue
+            try:
+                return float(v), flow_code
+            except (ValueError, TypeError):
+                continue
+        return None, flow_code
+
     def run(self):
         """后台线程执行：遍历所有排放口，执行预测，返回全量预测结果"""
         import time as _time
@@ -463,6 +488,8 @@ class PredictionWorker(QThread):
                                             fh['warning_level_cap'] = "橙色预警"
 
                         cur_item = future_seq[0] if future_seq else {}
+                        # v5.49：流量值用于预测排放量计算（浓度×流量）
+                        _flow_val, _flow_code = self._extract_flow_value(rows, code_list)
                         all_predictions.append({
                             'ent_name': ent_name, 'subname': subname,
                             'param': param_name,
@@ -476,6 +503,8 @@ class PredictionWorker(QThread):
                             'is_warning': max_level != "正常",
                             'pred_type': '小时预测',
                             'predicted': cur_item.get('predicted'),
+                            'flow_value': _flow_val,
+                            'flow_code': _flow_code,
                             'use_corrected': use_corrected,  # 标记是否使用折算数据
                             'is_thermal_power': use_corrected and not is_water,  # 标记是否为热电厂废气
                         })
@@ -592,6 +621,9 @@ class PredictionWorker(QThread):
                             'warning_level': wl,
                             'is_warning': wl != "正常",
                             'pred_type': '日排放量预测',
+                            # v5.49：流量值用于排放量计算
+                            'flow_value': self._extract_flow_value(rows, code_list)[0],
+                            'flow_code': self._extract_flow_value(rows, code_list)[1],
                             # v5.47：标注数据来源，便于用户判断可信度
                             'data_source': daily_source,
                         })
@@ -625,6 +657,9 @@ class PredictionWorker(QThread):
                             'warning_level': wl,
                             'is_warning': wl != "正常",
                             'pred_type': '日均预测',
+                            # v5.49：流量值用于排放量计算
+                            'flow_value': self._extract_flow_value(rows, code_list)[0],
+                            'flow_code': self._extract_flow_value(rows, code_list)[1],
                         })
             except Exception as e:
                 # v5.47：异常不能被静默吞掉。此前失败只在 debug 日志留痕，
@@ -1603,8 +1638,12 @@ class MainWindow(QMainWindow):
         table_layout = QVBoxLayout()
 
         self.realtime_table = QTableWidget()
-        self.realtime_table.setColumnCount(7)
-        self.realtime_table.setHorizontalHeaderLabels(["监测参数", "实测浓度", "折算浓度", "单位", "排放标准", "折算状态", "监测状态"])
+        # v5.49：新增「排放量」列（接口不返回排放量，由 浓度×流量 计算得出）；
+        # 原「单位」列此前写死为空字符串，现改为填充真实单位。
+        self.realtime_table.setColumnCount(8)
+        self.realtime_table.setHorizontalHeaderLabels(
+            ["监测参数", "实测浓度", "折算浓度", "单位",
+             "排放量(kg/h)", "排放标准", "折算状态", "监测状态"])
         self.realtime_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.realtime_table.setStyleSheet(f"""
             QTableWidget {{
@@ -3222,7 +3261,31 @@ class MainWindow(QMainWindow):
                 })
 
         # ── 渲染表格（三项优化 T03：差量更新包裹，消除整表重绘闪烁）──────
-        # 列顺序: 0=监测参数, 1=实测浓度, 2=折算浓度, 3=单位, 4=排放标准, 5=折算状态, 6=监测状态
+        # v5.49 列顺序: 0=监测参数, 1=实测浓度, 2=折算浓度, 3=单位,
+        #              4=排放量(kg/h), 5=排放标准, 6=折算状态, 7=监测状态
+        # 排放量 = 浓度 × 流量（见 param_units 模块）
+        from param_units import (
+            get_param_unit, calc_emission_rate, find_flow_code,
+            format_emission_rate, is_concentration_param,
+        )
+        # 找出本排口的流量参数 code（排放量计算的乘数来源）
+        flow_code = find_flow_code(code_list)
+        # 从实时/补充数据中取流量值
+        flow_value = None
+        for p in filtered_params:
+            try:
+                pc = str(int(float(p.get('code', ''))))
+            except (ValueError, TypeError):
+                pc = str(p.get('code', '')).strip()
+            if flow_code and pc == flow_code:
+                fv = p.get('value')
+                if fv not in (None, '', '--'):
+                    try:
+                        flow_value = float(fv)
+                    except (ValueError, TypeError):
+                        flow_value = None
+                break
+
         self.realtime_table.setUpdatesEnabled(False)
         if not filtered_params:
             # 三项优化 T05：空状态占位，避免整表空白造成"卡死"误判
@@ -3288,7 +3351,20 @@ class MainWindow(QMainWindow):
                 self.realtime_table.setItem(row, 2, QTableWidgetItem("--"))
 
             # ── 单位列 ─────────────────────────────────────────────────
-            self.realtime_table.setItem(row, 3, QTableWidgetItem(""))
+            # v5.49：此前写死为空字符串；现填充真实单位
+            unit = get_param_unit(code)
+            self.realtime_table.setItem(row, 3, QTableWidgetItem(unit if unit else "--"))
+
+            # ── 排放量列（v5.49 新增）────────────────────────────────
+            # 排放量 = 浓度 × 流量。浓度优先用折算值（热电厂），否则用实测值。
+            # 该排口没有流量参数、或本参数不是浓度类参数时显示 "--"。
+            emis_val = None
+            if is_concentration_param(code) and flow_value:
+                base_conc = corrected if (is_thermal_power and corrected is not None) else value
+                if base_conc is not None:
+                    emis_val = calc_emission_rate(base_conc, flow_value, code)
+            self.realtime_table.setItem(
+                row, 4, QTableWidgetItem(format_emission_rate(emis_val)))
 
             # ── 排放标准列 ─────────────────────────────────────────────
             # 热电厂废气显示折算标准，其他显示实测标准
@@ -3296,7 +3372,7 @@ class MainWindow(QMainWindow):
                 display_std = corrected_standards.get(code, std)
             else:
                 display_std = std
-            self.realtime_table.setItem(row, 4, QTableWidgetItem(str(display_std) if display_std else str(std)))
+            self.realtime_table.setItem(row, 5, QTableWidgetItem(str(display_std) if display_std else str(std)))
 
             # ── 折算状态列（热电厂废气显示折算是否超标）────────────────
             if is_thermal_power:
@@ -3333,9 +3409,9 @@ class MainWindow(QMainWindow):
                     cvt_status_color = QColor("#888888")
                 cvt_status_item = QTableWidgetItem(cvt_status_text)
                 cvt_status_item.setForeground(cvt_status_color)
-                self.realtime_table.setItem(row, 5, cvt_status_item)
+                self.realtime_table.setItem(row, 6, cvt_status_item)
             else:
-                self.realtime_table.setItem(row, 5, QTableWidgetItem("--"))
+                self.realtime_table.setItem(row, 6, QTableWidgetItem("--"))
 
             # ── 监测状态列 ─────────────────────────────────────────────
             # 热电厂废气：使用折算值判断是否超标；其他：使用实测值判断
@@ -3366,7 +3442,7 @@ class MainWindow(QMainWindow):
                     status_color = QColor(COLORS['warning']) if is_exceed else QColor(COLORS['success'])
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(status_color)
-            self.realtime_table.setItem(row, 6, status_item)
+            self.realtime_table.setItem(row, 7, status_item)
         self.realtime_table.setUpdatesEnabled(True)
 
     def _on_time_type_changed(self, index):
@@ -3956,25 +4032,43 @@ class MainWindow(QMainWindow):
 
         # 构建代码到名称的映射
         from data_processor import CODE_TO_NAME
+        from param_units import (
+            get_param_unit, calc_emission_rate, find_flow_code,
+            format_emission_rate, is_concentration_param,
+        )
         code_to_display = {code: CODE_TO_NAME.get(code, code) for code in code_list}
 
         # 检查是否为热电厂废气
         is_thermal_power = getattr(self, '_history_is_thermal_power', False)
 
-        # 只显示有代码的参数
-        display_params_filtered = [code_to_display.get(code, code) for code in code_list if code]
+        # 只显示有代码的参数（表头带单位：'二氧化硫(mg/m³)'）
+        display_params_filtered = []
+        for code in code_list:
+            if not code:
+                continue
+            pname = code_to_display.get(code, code)
+            unit = get_param_unit(code)
+            display_params_filtered.append(
+                f"{pname}({unit})" if unit else pname)
+
+        # v5.49：本排口流量参数 code（排放量 = 浓度 × 流量）
+        flow_code = find_flow_code(code_list)
 
         if is_thermal_power:
-            # 热电厂废气：时间 + 实测1 + 折算1 + 实测2 + 折算2 + ...
-            # 每个参数占2列
-            total_cols = 1 + len(display_params_filtered) * 2
+            # 热电厂废气：时间 + 每参数[实测, 折算, 排放量]
+            total_cols = 1 + len(display_params_filtered) * 3
             headers = ["时间"]
             for param in display_params_filtered:
                 headers.append(f"{param}(实测)")
                 headers.append(f"{param}(折算)")
+                headers.append(f"{param}(排放量)")
         else:
-            total_cols = len(display_params_filtered) + 1
-            headers = ["时间"] + display_params_filtered
+            # 非热电厂：时间 + 每参数[实测, 排放量]
+            total_cols = 1 + len(display_params_filtered) * 2
+            headers = ["时间"]
+            for param in display_params_filtered:
+                headers.append(f"{param}(实测)")
+                headers.append(f"{param}(排放量)")
 
         self.history_table.setColumnCount(total_cols)
         self.history_table.setHorizontalHeaderLabels(headers)
@@ -3985,25 +4079,54 @@ class MainWindow(QMainWindow):
         for i in range(1, total_cols):
             self.history_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
 
+        # 取本行流量值（同一时间点的流量）
+        def _row_flow(r):
+            if not flow_code:
+                return None
+            fv = r.get(f"val_{flow_code}")
+            if fv in (None, '', '--'):
+                return None
+            try:
+                return float(fv)
+            except (ValueError, TypeError):
+                return None
+
         self.history_table.setUpdatesEnabled(False)
         self.history_table.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             self.history_table.setItem(row_idx, 0, QTableWidgetItem(row.get('DateTime', '')))
             if is_thermal_power:
-                # 热电厂废气：每个参数2列（实测 + 折算）
+                # 热电厂废气：每个参数3列（实测 + 折算 + 排放量）
                 for col_idx, code in enumerate(code_list):
-                    base_col = 1 + col_idx * 2
+                    base_col = 1 + col_idx * 3
                     val_key = f"val_{code}"
                     cvt_key = f"cvt_{code}"
                     val = row.get(val_key)
                     cvt = row.get(cvt_key)
                     self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
                     self.history_table.setItem(row_idx, base_col + 1, QTableWidgetItem(str(cvt) if cvt else "--"))
+                    # 排放量：浓度优先用折算值，否则用实测值
+                    emis = None
+                    if is_concentration_param(code):
+                        base_conc = cvt if cvt not in (None, '', '--') else val
+                        if base_conc not in (None, '', '--'):
+                            emis = calc_emission_rate(base_conc, _row_flow(row), code)
+                    self.history_table.setItem(
+                        row_idx, base_col + 2,
+                        QTableWidgetItem(format_emission_rate(emis)))
             else:
-                for col_idx, code in enumerate(code_list, 1):
+                # 非热电厂：每个参数2列（实测 + 排放量）
+                for col_idx, code in enumerate(code_list):
+                    base_col = 1 + col_idx * 2
                     val_key = f"val_{code}"
                     val = row.get(val_key)
-                    self.history_table.setItem(row_idx, col_idx, QTableWidgetItem(str(val) if val else "--"))
+                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
+                    emis = None
+                    if is_concentration_param(code) and val not in (None, '', '--'):
+                        emis = calc_emission_rate(val, _row_flow(row), code)
+                    self.history_table.setItem(
+                        row_idx, base_col + 1,
+                        QTableWidgetItem(format_emission_rate(emis)))
         self.history_table.setUpdatesEnabled(True)
 
 
@@ -4901,6 +5024,29 @@ class MainWindow(QMainWindow):
         return "→ 平稳"
 
     @staticmethod
+    def _calc_pred_emission(concentration, flow, param_name):
+        """
+        预测排放量 = 预测浓度 × 流量（kg/h）。
+
+        预测结果只带参数名（如"二氧化硫"），不带 code，
+        故先通过 NAME_TO_CODE 反查 code，再交给 param_units 换算。
+        非浓度类参数（pH/温度/流速等）返回 None。
+
+        Args:
+            concentration: 预测浓度值
+            flow:          该排口流量值（m³/h）
+            param_name:    参数中文名
+        """
+        if concentration is None or not flow:
+            return None
+        from data_processor import NAME_TO_CODE
+        from param_units import calc_emission_rate, is_concentration_param
+        code = NAME_TO_CODE.get(param_name)
+        if code is None or not is_concentration_param(code):
+            return None
+        return calc_emission_rate(concentration, flow, code)
+
+    @staticmethod
     def _warning_level_color(level):
         """预警等级 → 背景色"""
         return {
@@ -4912,12 +5058,13 @@ class MainWindow(QMainWindow):
     def _rebuild_pred_table_columns(self, horizon: int):
         """
         根据 horizon 动态重建 pred_table 的列结构。
-        固定列：企业/排放口 | 参数 | 趋势 | 当前置信度 | 预警状态
+        固定列：企业/排放口 | 参数 | 排放量 | 趋势 | 当前置信度 | 预警状态
         动态列（插在参数之后）：当前小时 | +1小时 | +2小时 | …
         """
-        # 固定列：企业/排放口(0)、参数(1)、[动态预测列]、趋势、置信度、预警状态
+        # v5.49：新增「排放量(kg/h)」列（接口不返回排放量，由 预测浓度×流量 计算）
         pred_labels = ["当前小时"] + [f"+{i}小时" for i in range(1, horizon + 1)]
-        headers = ["企业/排放口", "参数"] + pred_labels + ["趋势", "置信度", "预警状态"]
+        headers = ["企业/排放口", "参数"] + pred_labels + \
+                  ["排放量(kg/h)", "趋势", "置信度", "预警状态"]
         ncols = len(headers)
 
         self.pred_table.setColumnCount(ncols)
@@ -4998,10 +5145,12 @@ class MainWindow(QMainWindow):
                 2, QTableWidgetItem("当日均值预测"))
 
         total_pred_cols = len(pred_labels)     # 预测值列数
-        # 列索引：企业/排放口=0, 参数=1, 预测值[2…2+total_pred_cols-1], 趋势, 置信度, 预警状态
-        col_trend  = 2 + total_pred_cols
-        col_conf   = col_trend + 1
-        col_warn   = col_conf  + 1
+        # 列索引：企业/排放口=0, 参数=1, 预测值[2…2+total_pred_cols-1],
+        #         排放量, 趋势, 置信度, 预警状态
+        col_emis  = 2 + total_pred_cols
+        col_trend = col_emis + 1
+        col_conf  = col_trend + 1
+        col_warn  = col_conf  + 1
 
         # 预警状态文字映射
         warn_text_map = {
@@ -5010,6 +5159,17 @@ class MainWindow(QMainWindow):
             '橙色预警': '🔶 橙色预警',
             '红色预警': '🚨 红色预警',
         }
+
+        # v5.49：排放量计算（预测浓度 × 该排口流量）
+        from param_units import (
+            calc_emission_rate, format_emission_rate, is_concentration_param,
+        )
+        _emis_flow = None
+        _emis_code = None
+        for p in predictions:
+            if p.get('flow_value'):
+                _emis_flow = p['flow_value']
+                break
 
         self.pred_table.setRowCount(len(predictions))
 
@@ -5060,6 +5220,29 @@ class MainWindow(QMainWindow):
                 item_d.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.pred_table.setItem(row_idx, 2, item_d)
 
+            # ── 排放量列（v5.49 新增）──────────────────────────────────
+            # 排放量 = 预测浓度 × 该排口流量。浓度取首个预测值（当前小时/日均值）。
+            # 非浓度参数（pH/温度/流速等）或该排口无流量时显示 "--"。
+            emis_text = "--"
+            if _emis_flow:
+                code_for_emis = p.get('flow_code')   # 占位：见下方按 code 判断
+                # 用参数名反查是否浓度类：直接尝试计算，calc 内部会校验
+                emis_val = None
+                # 取该行的基准预测浓度
+                if horizon > 0:
+                    base_pred = p.get('predicted')
+                else:
+                    base_pred = p.get('cur_pred') if 'cur_pred' in p else p.get('predicted')
+                if base_pred is not None:
+                    # 通过预测结果里的 flow_code 找到对应浓度参数的换算分母：
+                    # 这里用参数名匹配单位表（预测结果不带 code，用名称兜底）
+                    emis_val = self._calc_pred_emission(
+                        base_pred, _emis_flow, p.get('param', ''))
+                emis_text = format_emission_rate(emis_val)
+            item_e = QTableWidgetItem(emis_text)
+            item_e.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.pred_table.setItem(row_idx, col_emis, item_e)
+
             # ── 趋势列 ───────────────────────────────────────────────────────
             trend      = p.get('trend', 'stable')
             trend_rate = p.get('trend_rate', 0)
@@ -5083,7 +5266,7 @@ class MainWindow(QMainWindow):
             bg_hex = self._warning_level_color(warn_level)
             if bg_hex:
                 bg = QColor(bg_hex)
-                for col in [0, 1, col_trend, col_conf, col_warn]:
+                for col in [0, 1, col_emis, col_trend, col_conf, col_warn]:
                     cell = self.pred_table.item(row_idx, col)
                     if cell:
                         cell.setBackground(bg)
@@ -5158,7 +5341,7 @@ class MainWindow(QMainWindow):
             max_days = max(max_days, len(p.get('future_daily', []) or []))
 
         # ── 构建列头（仅当天数变化时重建列结构）─────────────────────────
-        labels = ["企业/排放口", "参数", "历史基线"] + \
+        labels = ["企业/排放口", "参数", "历史基线", "日均排放量(kg/天)"] + \
                  [f"D+{i}" for i in range(1, max_days + 1)] + \
                  ["趋势", "置信度", "预警状态"]
         if max_days != getattr(self, '_last_daily_days', -1):
@@ -5178,7 +5361,9 @@ class MainWindow(QMainWindow):
             for i, lb in enumerate(labels):
                 table.setHorizontalHeaderItem(i, QTableWidgetItem(lb))
 
-        col_trend = 3 + max_days
+        # v5.49：列索引因新增「日均排放量」列整体后移
+        col_emis  = 3
+        col_trend = 4 + max_days
         col_conf = col_trend + 1
         col_warn = col_conf + 1
 
@@ -5212,6 +5397,25 @@ class MainWindow(QMainWindow):
             item_b.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row_idx, 2, item_b)
 
+            # ── 日均排放量列（v5.49 新增）────────────────────────────
+            # 日排放量 = 日均浓度 × 流量 × 24h，单位 kg/天
+            # （浓度 mg/m³ 或 mg/L × m³/h × 24 → 按 param_units 分母换算）
+            emis_text = "--"
+            _flow = p.get('flow_value')
+            if base_val is not None and _flow:
+                from param_units import (
+                    calc_emission_rate, is_concentration_param,
+                )
+                from data_processor import NAME_TO_CODE
+                _code = NAME_TO_CODE.get(p.get('param', ''))
+                if _code and is_concentration_param(_code):
+                    _hourly = calc_emission_rate(base_val, _flow, _code)
+                    if _hourly is not None:
+                        emis_text = f"{_hourly * 24:.3f}"
+            item_e = QTableWidgetItem(emis_text)
+            item_e.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_idx, col_emis, item_e)
+
             # ── 逐日预测值（超标单元格加深色底）────────────────────────
             future_daily = p.get('future_daily', []) or []
             confs = p.get('confidences', []) or []
@@ -5234,7 +5438,8 @@ class MainWindow(QMainWindow):
                 bg_hex = self._warning_level_color(level)
                 if bg_hex:
                     it.setBackground(QColor(bg_hex))
-                table.setItem(row_idx, 3 + di, it)
+                # v5.49：D+N 列起始索引因新增排放量列而后移一位
+                table.setItem(row_idx, col_emis + 1 + di, it)
 
             # ── 趋势 / 置信度 / 预警状态 ───────────────────────────────
             item_t = QTableWidgetItem(
@@ -5257,7 +5462,7 @@ class MainWindow(QMainWindow):
             bg_hex = self._warning_level_color(warn_level)
             if bg_hex:
                 bg = QColor(bg_hex)
-                for col in (0, 1, col_trend, col_conf, col_warn):
+                for col in (0, 1, col_emis, col_trend, col_conf, col_warn):
                     cell = table.item(row_idx, col)
                     if cell:
                         cell.setBackground(bg)

@@ -140,7 +140,7 @@ class TestDailyEmissionUI(unittest.TestCase):
 
     # ── 3/4. 表格填充 ───────────────────────────────────────────────────
     def test_d_table_fills(self):
-        """表格应按 预测天数 正确构建列与行"""
+        """表格应按 预测天数 正确构建列与行（含排放量列）"""
         win = self._make_window()
         self._stub_table_helpers(win)
 
@@ -148,8 +148,8 @@ class TestDailyEmissionUI(unittest.TestCase):
         win._show_daily_emission_table(preds)
 
         self.assertEqual(win.pred_table.rowCount(), 3)
-        # 列 = 企业/排放口 + 参数 + 基线 + 7天 + 趋势 + 置信度 + 预警 = 13
-        self.assertEqual(win.pred_table.columnCount(), 3 + 7 + 3)
+        # 列 = 企业/排放口 + 参数 + 历史基线 + 日均排放量 + 7天 + 趋势 + 置信度 + 预警 = 14
+        self.assertEqual(win.pred_table.columnCount(), 3 + 1 + 7 + 3)
         self.assertEqual(win._last_daily_days, 7)
 
     def test_e_column_count_follows_days(self):
@@ -158,13 +158,13 @@ class TestDailyEmissionUI(unittest.TestCase):
         self._stub_table_helpers(win)
 
         win._show_daily_emission_table(_mk_preds(days=3, n_rows=1))
-        self.assertEqual(win.pred_table.columnCount(), 3 + 3 + 3)
+        self.assertEqual(win.pred_table.columnCount(), 3 + 1 + 3 + 3)
 
         win._show_daily_emission_table(_mk_preds(days=15, n_rows=1))
-        self.assertEqual(win.pred_table.columnCount(), 3 + 15 + 3)
+        self.assertEqual(win.pred_table.columnCount(), 3 + 1 + 15 + 3)
 
     def test_f_header_labels(self):
-        """表头应含 D+N 动态列与关键字段"""
+        """表头应含 D+N 动态列、排放量列与关键字段"""
         win = self._make_window()
         self._stub_table_helpers(win)
 
@@ -173,8 +173,10 @@ class TestDailyEmissionUI(unittest.TestCase):
                    for i in range(win.pred_table.columnCount())]
         self.assertEqual(headers[0], '企业/排放口')
         self.assertEqual(headers[2], '历史基线')
-        self.assertEqual(headers[3], 'D+1')
-        self.assertEqual(headers[9], 'D+7')
+        # v5.49：新增日均排放量列
+        self.assertEqual(headers[3], '日均排放量(kg/天)')
+        self.assertEqual(headers[4], 'D+1')
+        self.assertEqual(headers[10], 'D+7')
         self.assertEqual(headers[-3], '趋势')
         self.assertEqual(headers[-2], '置信度')
         self.assertEqual(headers[-1], '预警状态')
