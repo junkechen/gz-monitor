@@ -28,7 +28,7 @@ from param_units import (
     PARAM_UNITS, FLOW_CODES, EMISSION_UNIT,
     normalize_code, get_param_unit, is_concentration_param,
     get_concentration_divisor, calc_emission_rate, find_flow_code,
-    format_emission_rate,
+    format_emission_rate, calc_emission_mass, extract_emission_mass,
 )
 from data_processor import CODE_TO_NAME
 
@@ -92,8 +92,35 @@ class TestParamUnits(unittest.TestCase):
         self.assertAlmostEqual(v, 10.0, places=6)
 
     def test_j_emission_unit_constant(self):
-        """排放量单位常量应为 kg/h"""
-        self.assertEqual(EMISSION_UNIT, 'kg/h')
+        """排放量单位常量应为 kg（期间质量，非 kg/h）
+
+        v5.50 修正：经与网页端核对，网页「排放量(kg)」列用的是期间累计流量
+        （如日累计 127021 m³），故单位为 kg 而非 kg/h。
+        """
+        self.assertEqual(EMISSION_UNIT, 'kg')
+
+    def test_j2_matches_web_values(self):
+        """公式必须与网页端显示值一致（2026-10-13 截图实证）
+
+        截图数据：
+          冠县恒润热电：SO2 13.7 mg/m³ × 127021 m³ / 1e6 = 1.74 kg
+                        NOx 6.82 × 127021 / 1e6 = 0.866 kg
+          山东冠洲VOCs：非甲烷总烃 1.05 × 117370 / 1e6 = 0.12 kg
+                        甲烷     0.45 × 117370 / 1e6 = 0.05 kg
+        """
+        self.assertAlmostEqual(
+            calc_emission_rate(13.7, 127021, '203'), 1.74, places=2)
+        self.assertAlmostEqual(
+            calc_emission_rate(6.82, 127021, '203'), 0.866, places=3)
+        self.assertAlmostEqual(
+            calc_emission_rate(1.05, 117370, '383'), 0.12, places=2)
+        self.assertAlmostEqual(
+            calc_emission_rate(0.45, 117370, '299'), 0.05, places=2)
+
+    def test_j3_mass_alias(self):
+        """calc_emission_mass 应与 calc_emission_rate 等价（语义化别名）"""
+        self.assertEqual(calc_emission_mass(100.0, 10000.0, '203'),
+                         calc_emission_rate(100.0, 10000.0, '203'))
 
     def test_k_divisors(self):
         """换算分母：废气 1e6、废水 1e3"""
@@ -159,10 +186,58 @@ class TestParamUnits(unittest.TestCase):
         self.assertEqual(format_emission_rate('abc'), '--')
         self.assertEqual(format_emission_rate(float('nan')), '--')
 
-    def test_u_daily_emission_conversion(self):
-        """日排放量 = 小时排放量 × 24"""
-        hourly = calc_emission_rate(100.0, 10000.0, '203')   # 1 kg/h
-        self.assertAlmostEqual(hourly * 24, 24.0, places=6)  # 24 kg/天
+    def test_u_period_emission_no_24x(self):
+        """期间排放量不应再乘 24（v5.50 修正）
+
+        接口 val_{flow} 返回的是**期间累计流量**（如日累计 127021 m³），
+        浓度 × 累计流量 / 1e6 即为该期间排放质量，无需按 24h 折算。
+        v5.49 曾误乘 24，与网页端口径不符。
+        """
+        daily = calc_emission_rate(13.7, 127021, '203')
+        self.assertAlmostEqual(daily, 1.74, places=2)   # 非 41.77
+        self.assertNotAlmostEqual(daily * 24, 1.74, places=2)
+
+    # ── 8. 服务端排放量字段提取 ──────────────────────────────────────────
+    def test_v_extract_from_server_pf_field(self):
+        """命中 pf_{code} 字段时应返回服务端权威值"""
+        row = {'val_203': '13.7', 'pf_203': '1.74'}
+        self.assertEqual(extract_emission_mass(row, '203'), 1.74)
+
+    def test_w_extract_fallback_candidates(self):
+        """各候选字段名均应能命中"""
+        cases = [
+            ({'pf_203': '1.5'}, 1.5),
+            ({'pfl_203': '2.5'}, 2.5),
+            ({'flow_203': '3.5'}, 3.5),
+            ({'emission_203': '4.5'}, 4.5),
+            ({'pf203': '5.5'}, 5.5),
+        ]
+        for row, expected in cases:
+            self.assertEqual(extract_emission_mass(row, '203'), expected,
+                             f"未命中字段 {list(row.keys())[0]}")
+
+    def test_x_extract_none_when_absent(self):
+        """无任何候选字段时返回 None（调用方回退计算）"""
+        row = {'val_203': '13.7', 'cvt_203': '14.5'}
+        self.assertIsNone(extract_emission_mass(row, '203'))
+
+    def test_y_extract_rejects_invalid(self):
+        """空值/占位符/非数字/NaN 均应被拒绝"""
+        for bad in ('', '--', '/', None, 'abc', float('nan')):
+            self.assertIsNone(extract_emission_mass({'pf_203': bad}, '203'),
+                              f"无效值 {bad!r} 被误接受")
+
+    def test_z_extract_code_normalization(self):
+        """code 归一化后提取（'203.0' 应命中 pf_203）"""
+        row = {'pf_203': '1.74'}
+        self.assertEqual(extract_emission_mass(row, '203.0'), 1.74)
+        self.assertEqual(extract_emission_mass(row, 203), 1.74)
+
+    def test_z2_extract_non_dict_safe(self):
+        """非 dict 输入不应抛异常"""
+        self.assertIsNone(extract_emission_mass(None, '203'))
+        self.assertIsNone(extract_emission_mass('str', '203'))
+        self.assertIsNone(extract_emission_mass({}, None))
 
 
 if __name__ == '__main__':

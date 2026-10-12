@@ -1643,7 +1643,7 @@ class MainWindow(QMainWindow):
         self.realtime_table.setColumnCount(8)
         self.realtime_table.setHorizontalHeaderLabels(
             ["监测参数", "实测浓度", "折算浓度", "单位",
-             "排放量(kg/h)", "排放标准", "折算状态", "监测状态"])
+             "排放量(kg)", "排放标准", "折算状态", "监测状态"])
         self.realtime_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.realtime_table.setStyleSheet(f"""
             QTableWidget {{
@@ -3262,11 +3262,12 @@ class MainWindow(QMainWindow):
 
         # ── 渲染表格（三项优化 T03：差量更新包裹，消除整表重绘闪烁）──────
         # v5.49 列顺序: 0=监测参数, 1=实测浓度, 2=折算浓度, 3=单位,
-        #              4=排放量(kg/h), 5=排放标准, 6=折算状态, 7=监测状态
+        #              4=排放量(kg), 5=排放标准, 6=折算状态, 7=监测状态
         # 排放量 = 浓度 × 流量（见 param_units 模块）
         from param_units import (
             get_param_unit, calc_emission_rate, find_flow_code,
             format_emission_rate, is_concentration_param,
+            extract_emission_mass,
         )
         # 找出本排口的流量参数 code（排放量计算的乘数来源）
         flow_code = find_flow_code(code_list)
@@ -3356,10 +3357,12 @@ class MainWindow(QMainWindow):
             self.realtime_table.setItem(row, 3, QTableWidgetItem(unit if unit else "--"))
 
             # ── 排放量列（v5.49 新增）────────────────────────────────
-            # 排放量 = 浓度 × 流量。浓度优先用折算值（热电厂），否则用实测值。
-            # 该排口没有流量参数、或本参数不是浓度类参数时显示 "--"。
-            emis_val = None
-            if is_concentration_param(code) and flow_value:
+            # 排放量 = 浓度 × 期间累计流量。浓度优先用折算值（热电厂），
+            # 否则用实测值。该排口无流量参数、或本参数非浓度类时显示 "--"。
+            # v5.50：先试服务端字段（实时接口文档未记录，防御性兼容），
+            # 取不到再按公式计算。
+            emis_val = extract_emission_mass(param, code)
+            if emis_val is None and is_concentration_param(code) and flow_value:
                 base_conc = corrected if (is_thermal_power and corrected is not None) else value
                 if base_conc is not None:
                     emis_val = calc_emission_rate(base_conc, flow_value, code)
@@ -4035,6 +4038,7 @@ class MainWindow(QMainWindow):
         from param_units import (
             get_param_unit, calc_emission_rate, find_flow_code,
             format_emission_rate, is_concentration_param,
+            extract_emission_mass,
         )
         code_to_display = {code: CODE_TO_NAME.get(code, code) for code in code_list}
 
@@ -4105,12 +4109,14 @@ class MainWindow(QMainWindow):
                     cvt = row.get(cvt_key)
                     self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
                     self.history_table.setItem(row_idx, base_col + 1, QTableWidgetItem(str(cvt) if cvt else "--"))
-                    # 排放量：浓度优先用折算值，否则用实测值
+                    # 排放量：服务端字段优先，取不到再按 浓度×累计流量 计算
                     emis = None
                     if is_concentration_param(code):
-                        base_conc = cvt if cvt not in (None, '', '--') else val
-                        if base_conc not in (None, '', '--'):
-                            emis = calc_emission_rate(base_conc, _row_flow(row), code)
+                        emis = extract_emission_mass(row, code)
+                        if emis is None:
+                            base_conc = cvt if cvt not in (None, '', '--') else val
+                            if base_conc not in (None, '', '--'):
+                                emis = calc_emission_rate(base_conc, _row_flow(row), code)
                     self.history_table.setItem(
                         row_idx, base_col + 2,
                         QTableWidgetItem(format_emission_rate(emis)))
@@ -4122,8 +4128,11 @@ class MainWindow(QMainWindow):
                     val = row.get(val_key)
                     self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
                     emis = None
-                    if is_concentration_param(code) and val not in (None, '', '--'):
-                        emis = calc_emission_rate(val, _row_flow(row), code)
+                    if is_concentration_param(code):
+                        # v5.50：服务端字段优先，取不到再计算
+                        emis = extract_emission_mass(row, code)
+                        if emis is None and val not in (None, '', '--'):
+                            emis = calc_emission_rate(val, _row_flow(row), code)
                     self.history_table.setItem(
                         row_idx, base_col + 1,
                         QTableWidgetItem(format_emission_rate(emis)))
@@ -5026,7 +5035,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _calc_pred_emission(concentration, flow, param_name):
         """
-        预测排放量 = 预测浓度 × 流量（kg/h）。
+        预测排放量 = 预测浓度 × 期间累计流量（kg）。
 
         预测结果只带参数名（如"二氧化硫"），不带 code，
         故先通过 NAME_TO_CODE 反查 code，再交给 param_units 换算。
@@ -5061,10 +5070,10 @@ class MainWindow(QMainWindow):
         固定列：企业/排放口 | 参数 | 排放量 | 趋势 | 当前置信度 | 预警状态
         动态列（插在参数之后）：当前小时 | +1小时 | +2小时 | …
         """
-        # v5.49：新增「排放量(kg/h)」列（接口不返回排放量，由 预测浓度×流量 计算）
+        # v5.49：新增「排放量(kg)」列（接口不返回排放量，由 预测浓度×流量 计算）
         pred_labels = ["当前小时"] + [f"+{i}小时" for i in range(1, horizon + 1)]
         headers = ["企业/排放口", "参数"] + pred_labels + \
-                  ["排放量(kg/h)", "趋势", "置信度", "预警状态"]
+                  ["排放量(kg)", "趋势", "置信度", "预警状态"]
         ncols = len(headers)
 
         self.pred_table.setColumnCount(ncols)
@@ -5341,7 +5350,7 @@ class MainWindow(QMainWindow):
             max_days = max(max_days, len(p.get('future_daily', []) or []))
 
         # ── 构建列头（仅当天数变化时重建列结构）─────────────────────────
-        labels = ["企业/排放口", "参数", "历史基线", "日均排放量(kg/天)"] + \
+        labels = ["企业/排放口", "参数", "历史基线", "日均排放量(kg)"] + \
                  [f"D+{i}" for i in range(1, max_days + 1)] + \
                  ["趋势", "置信度", "预警状态"]
         if max_days != getattr(self, '_last_daily_days', -1):
@@ -5397,21 +5406,22 @@ class MainWindow(QMainWindow):
             item_b.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row_idx, 2, item_b)
 
-            # ── 日均排放量列（v5.49 新增）────────────────────────────
-            # 日排放量 = 日均浓度 × 流量 × 24h，单位 kg/天
-            # （浓度 mg/m³ 或 mg/L × m³/h × 24 → 按 param_units 分母换算）
+            # ── 日均排放量列（v5.49 新增，v5.50 修正口径）──────────────
+            # 日均排放量(kg) = 日均浓度 × 当日累计流量 / 分母
+            # 注：接口 val_{flow} 返回的是**期间累计流量**（非瞬时 m³/h），
+            # 故无需再乘 24（v5.49 曾误乘 24，与网页端口径不符）。
             emis_text = "--"
             _flow = p.get('flow_value')
             if base_val is not None and _flow:
                 from param_units import (
-                    calc_emission_rate, is_concentration_param,
+                    calc_emission_mass, is_concentration_param,
                 )
                 from data_processor import NAME_TO_CODE
                 _code = NAME_TO_CODE.get(p.get('param', ''))
                 if _code and is_concentration_param(_code):
-                    _hourly = calc_emission_rate(base_val, _flow, _code)
-                    if _hourly is not None:
-                        emis_text = f"{_hourly * 24:.3f}"
+                    _mass = calc_emission_mass(base_val, _flow, _code)
+                    if _mass is not None:
+                        emis_text = f"{_mass:.3f}"
             item_e = QTableWidgetItem(emis_text)
             item_e.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row_idx, col_emis, item_e)

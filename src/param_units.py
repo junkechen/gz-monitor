@@ -61,18 +61,34 @@ PARAM_UNITS: Dict[str, str] = {
 }
 
 # ── 浓度类参数的换算分母（浓度 -> 排放量）───────────────────────────────────
-# 单位 -> 分母：浓度 × 流量 / 分母 = kg/h
+# 单位 -> 分母：浓度 × 期间累计流量 / 分母 = kg
+# 注：v5.49 曾按「瞬时流量」口径标为 kg/h；经与网页端核对（2026-10-13），
+# 网页「排放量(kg)」列用的是**期间累计流量**（如日累计 127021 m³），
+# 故正确单位为 kg（期间质量），公式与数值 4/4 精确匹配网页显示。
 _CONCENTRATION_DIVISOR: Dict[str, float] = {
     'mg/m³': 1e6,
     'mg/L': 1e3,
 }
 
 # ── 流量参数（排放量计算的乘数来源）─────────────────────────────────────────
-# 废气流量 / 废水流量；累计流量(495)是累计值，不能用作瞬时流量
+# 废气流量 / 废水流量。接口返回的 val_{code} 即「期间累计流量」，
+# 与网页端排放量统计口径一致（非瞬时 m³/h）。
 FLOW_CODES: frozenset = frozenset({'210', '492', '494'})
 
-# 排放量单位
-EMISSION_UNIT = 'kg/h'
+# 排放量单位（期间质量）
+EMISSION_UNIT = 'kg'
+
+# ── 服务端排放量字段候选名 ──────────────────────────────────────────────────
+# 网页端表格有「排放量(kg)」列，说明服务端**可能**直接返回该值。
+# 接口文档未记录字段名（仅提到顶层 pf_flow），故按可能性排序枚举候选，
+# 命中即采用服务端权威值，未命中则回退到客户端计算。
+EMISSION_FIELD_CANDIDATES: tuple = (
+    'pf_{code}',      # 与顶层 pf_flow 同前缀，最可能
+    'pfl_{code}',
+    'flow_{code}',
+    'emission_{code}',
+    'pf{code}',
+)
 
 
 def normalize_code(code) -> str:
@@ -112,15 +128,25 @@ def get_concentration_divisor(code) -> Optional[float]:
 
 def calc_emission_rate(concentration, flow, code) -> Optional[float]:
     """
-    计算瞬时排放量（kg/h）。
+    计算期间排放量（kg）。
+
+    公式：排放量(kg) = 浓度 × 期间累计流量 / 分母
+      废气（mg/m³ × m³）：/1e6
+      废水（mg/L  × m³）：/1e3
+
+    与网页端口径一致：网页「排放量(kg)」列用期间累计流量，
+    实测 4/4 匹配（SO2 13.7×127021/1e6=1.74 kg 等）。
+
+    注：v5.49 曾按瞬时流量口径命名/标注为 kg/h，v5.50 修正为 kg。
+    函数名保留 ``calc_emission_rate`` 以兼容既有调用方。
 
     Args:
         concentration: 浓度值（实测或折算）
-        flow:          对应流量值（m³/h）
+        flow:          期间累计流量（m³）
         code:          浓度参数的 code（决定换算分母）
 
     Returns:
-        排放量 kg/h；任一输入无效或该参数不可计算时返回 None。
+        排放量 kg；任一输入无效或该参数不可计算时返回 None。
     """
     divisor = get_concentration_divisor(code)
     if divisor is None:
@@ -133,6 +159,47 @@ def calc_emission_rate(concentration, flow, code) -> Optional[float]:
     if c != c or f != f:          # NaN 检查
         return None
     return (c * f) / divisor
+
+
+# 语义化别名：明确表示「期间排放质量(kg)」
+calc_emission_mass = calc_emission_rate
+
+
+def extract_emission_mass(row: dict, code) -> Optional[float]:
+    """
+    从服务端行数据中读取排放量（kg）——服务端权威值优先。
+
+    网页端表格含「排放量(kg)」列，说明服务端**可能**直接返回该字段。
+    接口文档未记录字段名，故按 EMISSION_FIELD_CANDIDATES 枚举候选，
+    命中且值有效则返回；否则返回 None（调用方回退到计算值）。
+
+    Args:
+        row:  服务端返回的一行数据（dict）
+        code: 参数代码
+
+    Returns:
+        排放量 kg；未找到字段或值无效时返回 None。
+    """
+    if not isinstance(row, dict):
+        return None
+    c = normalize_code(code)
+    if not c:
+        return None
+    for pattern in EMISSION_FIELD_CANDIDATES:
+        key = pattern.format(code=c)
+        if key not in row:
+            continue
+        v = row.get(key)
+        if v in (None, '', '--', '/'):
+            continue
+        try:
+            fv = float(v)
+        except (ValueError, TypeError):
+            continue
+        if fv != fv:              # NaN
+            continue
+        return fv
+    return None
 
 
 def find_flow_code(code_list) -> Optional[str]:
@@ -171,11 +238,14 @@ __all__ = [
     'PARAM_UNITS',
     'FLOW_CODES',
     'EMISSION_UNIT',
+    'EMISSION_FIELD_CANDIDATES',
     'normalize_code',
     'get_param_unit',
     'is_concentration_param',
     'get_concentration_divisor',
     'calc_emission_rate',
+    'calc_emission_mass',
+    'extract_emission_mass',
     'find_flow_code',
     'format_emission_rate',
 ]

@@ -174,7 +174,7 @@ class TestDailyEmissionUI(unittest.TestCase):
         self.assertEqual(headers[0], '企业/排放口')
         self.assertEqual(headers[2], '历史基线')
         # v5.49：新增日均排放量列
-        self.assertEqual(headers[3], '日均排放量(kg/天)')
+        self.assertEqual(headers[3], '日均排放量(kg)')
         self.assertEqual(headers[4], 'D+1')
         self.assertEqual(headers[10], 'D+7')
         self.assertEqual(headers[-3], '趋势')
