@@ -5020,6 +5020,8 @@ class MainWindow(QMainWindow):
             col0_text = f"{ent}\n{sub}" if ent else sub
             item0 = QTableWidgetItem(col0_text)
             item0.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            # v5.48：窗口较窄列被压缩时，悬停可看完整名称
+            item0.setToolTip(col0_text.replace('\n', ' / '))
             self.pred_table.setItem(row_idx, 0, item0)
 
             # ── 列1：参数 ────────────────────────────────────────────────────
@@ -5164,7 +5166,10 @@ class MainWindow(QMainWindow):
             table.setHorizontalHeaderLabels(labels)
             table.horizontalHeader().setSectionResizeMode(
                 0, QHeaderView.ResizeMode.Fixed)
-            table.setColumnWidth(0, 150)
+            # v5.48：150px 放不下"山东冠洲股份有限公司"这类 10 字企业名+排口名，
+            # 加宽到 230px；同时开启文字换行，超长时自动折行而不截断。
+            table.setColumnWidth(0, 230)
+            table.setWordWrap(True)
             for i in range(1, len(labels)):
                 table.horizontalHeader().setSectionResizeMode(
                     i, QHeaderView.ResizeMode.Stretch)
@@ -5189,9 +5194,12 @@ class MainWindow(QMainWindow):
         for row_idx, p in enumerate(predictions):
             ent = p.get('ent_name', '')
             sub = p.get('subname', '')
-            item0 = QTableWidgetItem(f"{ent}\n{sub}" if ent else sub)
+            col0_text = f"{ent}\n{sub}" if ent else sub
+            item0 = QTableWidgetItem(col0_text)
             item0.setTextAlignment(Qt.AlignmentFlag.AlignVCenter |
                                    Qt.AlignmentFlag.AlignLeft)
+            # v5.48：悬停显示完整企业/排口名，兜底极端长名
+            item0.setToolTip(col0_text.replace('\n', ' / '))
             table.setItem(row_idx, 0, item0)
 
             item1 = QTableWidgetItem(p.get('param', ''))
@@ -5263,6 +5271,8 @@ class MainWindow(QMainWindow):
             summary = f"共 {total} 条日排放量预测，未来 {max_days} 天全部正常 ✅"
         self.pred_result_label.setText(summary)
         table.setUpdatesEnabled(True)
+        # v5.48：企业/排口名换行后行高需自适应，否则折行文字仍会被裁剪
+        table.resizeRowsToContents()
         table.viewport().update()
 
         # ── 趋势图 ─────────────────────────────────────────────────────

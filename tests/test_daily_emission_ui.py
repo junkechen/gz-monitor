@@ -220,6 +220,43 @@ class TestDailyEmissionUI(unittest.TestCase):
         win.pred_chart = mw.ChartWidget()
         win._draw_daily_emission_chart([])
 
+    # ── v5.48：企业/排放口列显示不全修复 ─────────────────────────────────
+    def test_l_first_col_wide_enough(self):
+        """企业/排放口列宽度必须 >= 230px（150px 放不下 10 字企业名）"""
+        win = self._make_window()
+        self._stub_table_helpers(win)
+        win._show_daily_emission_table(_mk_preds(days=7, n_rows=1))
+        self.assertGreaterEqual(win.pred_table.columnWidth(0), 230,
+                                "企业/排放口列仍过窄，长名称会被截断")
+        self.assertTrue(win.pred_table.wordWrap(),
+                        "未开启文字换行，超长名称会显示省略号")
+
+    def test_m_first_col_tooltip(self):
+        """企业/排放口单元格必须带完整名称的悬停提示"""
+        win = self._make_window()
+        self._stub_table_helpers(win)
+        preds = _mk_preds(days=7, n_rows=1)
+        preds[0]['ent_name'] = '山东冠洲股份有限公司'
+        preds[0]['subname'] = '1#窑炉排气筒'
+        win._show_daily_emission_table(preds)
+        item = win.pred_table.item(0, 0)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.toolTip(), '山东冠洲股份有限公司 / 1#窑炉排气筒')
+
+    def test_n_hour_pred_table_tooltip(self):
+        """小时/日均预测表的企业列也应有悬停提示"""
+        from PyQt5.QtWidgets import QTableWidgetItem
+        win = self._make_window()
+        win.pred_table.setColumnCount(3)
+        win.pred_table.setRowCount(1)
+        ent, sub = '冠县恒润热电有限公司', '1#锅炉排放口'
+        col0_text = f"{ent}\n{sub}"
+        item0 = QTableWidgetItem(col0_text)
+        item0.setToolTip(col0_text.replace('\n', ' / '))
+        win.pred_table.setItem(0, 0, item0)
+        self.assertEqual(win.pred_table.item(0, 0).toolTip(),
+                         f'{ent} / {sub}')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
