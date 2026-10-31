@@ -789,11 +789,16 @@ def main():
                 except RuntimeError:
                     _login_worker = None
 
-            # 创建多账户客户端并添加所有内置账户
+            # 创建多账户客户端并添加账户
+            # v5.54：从本地配置 load_accounts() 载入（已被登录对话框的
+            # 「保存账号修改」更新），而非硬编码 BUILTIN_ACCOUNTS，
+            # 这样登录前修改的企业名称/密码才会真正生效。
             multi_client = GZMultiAccountClient()
-            for account in BUILTIN_ACCOUNTS:
+            from account_manager import load_accounts as _load_accounts
+            _cfg_accounts = _load_accounts()
+            for account in _cfg_accounts:
                 multi_client.add_account(account['name'], account['password'])
-            print(f">>> 已添加 {len(BUILTIN_ACCOUNTS)} 个账户")
+            print(f">>> 已添加 {len(_cfg_accounts)} 个账户（来自本地配置）")
 
             # 登录所有账户（v5.38: 后台线程执行，不阻塞主线程）
             _login_dialog.login_btn.setEnabled(False)

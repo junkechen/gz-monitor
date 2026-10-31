@@ -903,13 +903,22 @@ class LoginDialog(QDialog):
         account_layout = QVBoxLayout()
 
         account_list_widget = QTableWidget()
-        account_list_widget.setColumnCount(2)
-        account_list_widget.setHorizontalHeaderLabels(["企业名称", "登录状态"])
-        account_list_widget.horizontalHeader().setStretchLastSection(True)
+        # v5.54：企业名称与密码可直接在登录前编辑，避免输错密码被服务端锁定
+        account_list_widget.setColumnCount(3)
+        account_list_widget.setHorizontalHeaderLabels(["企业名称", "密码", "登录状态"])
+        account_list_widget.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        account_list_widget.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        account_list_widget.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
         account_list_widget.setRowCount(len(self.accounts))
-        account_list_widget.setMaximumHeight(200)
+        account_list_widget.setMaximumHeight(220)
         account_list_widget.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        account_list_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        # 允许双击编辑企业名称与密码
+        account_list_widget.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked |
+            QTableWidget.EditTrigger.EditKeyPressed)
         account_list_widget.horizontalHeader().setStyleSheet(f"""
             QHeaderView::section {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -923,17 +932,45 @@ class LoginDialog(QDialog):
         """)
 
         for idx, account in enumerate(self.accounts):
-            name_item = QTableWidgetItem(account['name'])
+            name_item = QTableWidgetItem(account.get('name', ''))
             name_item.setFont(QFont("Microsoft YaHei", 10))
+            name_item.setToolTip("双击可修改企业账号名称")
+            pwd_item = QTableWidgetItem(account.get('password', ''))
+            pwd_item.setFont(QFont("Microsoft YaHei", 10))
+            pwd_item.setToolTip("双击可修改密码（明文保存在本地配置）")
             status_item = QTableWidgetItem("● 待登录")
             status_item.setForeground(QColor(COLORS['text_secondary']))
             status_item.setFont(QFont("Microsoft YaHei", 9))
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             account_list_widget.setItem(idx, 0, name_item)
-            account_list_widget.setItem(idx, 1, status_item)
+            account_list_widget.setItem(idx, 1, pwd_item)
+            account_list_widget.setItem(idx, 2, status_item)
 
         account_layout.addWidget(account_list_widget)
         account_group.setLayout(account_layout)
         layout.addWidget(account_group)
+
+        # 账号编辑提示
+        edit_tip = QLabel("💡 登录前可双击「企业名称」「密码」直接修改，改完点「保存账号修改」")
+        edit_tip.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        layout.addWidget(edit_tip)
+
+        # 保存账号修改按钮
+        self.save_btn = QPushButton("💾 保存账号修改")
+        self.save_btn.setFont(QFont("Microsoft YaHei", 11, QFont.Weight.Bold))
+        self.save_btn.setMinimumHeight(38)
+        self.save_btn.clicked.connect(self._save_account_edits)
+        self.save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['bg_input']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 6px;
+                padding: 8px 16px;
+            }}
+            QPushButton:hover {{ border-color: {COLORS['accent']}; }}
+        """)
+        layout.addWidget(self.save_btn)
 
         # 保存引用以便更新状态
         self.account_list_widget = account_list_widget
@@ -997,7 +1034,7 @@ class LoginDialog(QDialog):
         # 更新账户列表状态
         if self.account_list_widget.rowCount() > 0:
             for row in range(self.account_list_widget.rowCount()):
-                status_item = self.account_list_widget.item(row, 1)
+                status_item = self.account_list_widget.item(row, 2)
                 if status_item:
                     status_item.setText("● 登录中...")
                     status_item.setForeground(QColor(COLORS['accent']))
@@ -1018,7 +1055,7 @@ class LoginDialog(QDialog):
             # 更新所有账户状态为已登录
             if self.account_list_widget.rowCount() > 0:
                 for row in range(self.account_list_widget.rowCount()):
-                    status_item = self.account_list_widget.item(row, 1)
+                    status_item = self.account_list_widget.item(row, 2)
                     if status_item:
                         status_item.setText("● 已登录")
                         status_item.setForeground(QColor(COLORS['success']))
@@ -1038,6 +1075,25 @@ class LoginDialog(QDialog):
         # 新版本使用main.py中的多账户登录流程
         # 这里只保留空实现作为兼容
         pass
+
+    def _save_account_edits(self):
+        """把表格中编辑过的企业名称/密码写回本地配置（登录前可修改）。"""
+        from account_manager import save_accounts
+        for row in range(self.account_list_widget.rowCount()):
+            name_item = self.account_list_widget.item(row, 0)
+            pwd_item = self.account_list_widget.item(row, 1)
+            if row < len(self.accounts):
+                new_name = (name_item.text().strip() if name_item else "")
+                new_pwd = (pwd_item.text() if pwd_item else "")
+                if new_name:
+                    self.accounts[row]['name'] = new_name
+                self.accounts[row]['password'] = new_pwd
+        if save_accounts(self.accounts):
+            QMessageBox.information(self, "已保存",
+                                    "账号名称/密码已保存到本地配置，\n"
+                                    "点击「一键登录所有企业」将使用修改后的信息登录。")
+        else:
+            QMessageBox.warning(self, "保存失败", "账号配置保存失败，请检查写入权限。")
 
     def _change_password(self):
         """修改当前账户密码"""
