@@ -771,6 +771,62 @@ def get_app_version():
     return 1  # 默认版本一
 
 
+# ==================== 在线版本检测（升级提示）====================
+class VersionCheckWorker(QThread):
+    """后台线程：查询 GitHub 仓库最新 tag，发现新版本则发信号。
+
+    在独立线程中用 urllib 拉取 tags（带超时），不阻塞 UI；网络失败/离线时
+    静默放弃，绝不影响主程序使用。
+    """
+    update_available = pyqtSignal(str, str)  # (latest_version_str, current_version_str)
+    finished = pyqtSignal()
+
+    def __init__(self, current_version, api_url, parent=None):
+        super().__init__(parent)
+        self._current = current_version
+        self._api_url = api_url
+
+    @staticmethod
+    def _parse_version(tag: str):
+        """'v5.56' / '5.56' -> (5, 56)，无法解析返回 None。"""
+        t = tag.strip()
+        if t.lower().startswith('v'):
+            t = t[1:]
+        parts = t.split('.')
+        try:
+            return tuple(int(p) for p in parts)
+        except (ValueError, TypeError):
+            return None
+
+    def run(self):
+        import json
+        import ssl
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                self._api_url,
+                headers={'User-Agent': 'GZ-Monitor-VersionCheck'})
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            best = None
+            for item in data:
+                name = item.get('name', '')
+                v = self._parse_version(name)
+                if v is not None and (best is None or v > best[0]):
+                    best = (v, name)
+            if best is None:
+                return
+            cur = self._parse_version(self._current)
+            if cur is not None and best[0] > cur:
+                self.update_available.emit(best[1], 'v' + self._current)
+        except Exception:
+            # 离线 / 超时 / 解析失败：静默忽略，不弹任何提示
+            pass
+        finally:
+            self.finished.emit()
+
+
 # ==================== 登录对话框 ====================
 class LoginDialog(QDialog):
     login_success = pyqtSignal(str)  # username
@@ -1656,6 +1712,9 @@ class MainWindow(QMainWindow):
             }}
         """)
         self._update_status_bar()
+
+        # v5.57：启动后异步检测 GitHub 上是否有新版本，旧版运行也能收到升级提示
+        self._start_version_check()
 
     def _create_realtime_tab(self):
         """创建实时监控标签页"""
@@ -2985,16 +3044,19 @@ class MainWindow(QMainWindow):
             logger.error(f"tab切换处理异常: {e}", exc_info=True)
 
     def _on_tab_changed_impl(self, index):
-        # 切换到历史数据tab时，重新渲染图表
+        # 切换到历史数据tab时，仅在数据有更新（脏标记）时重绘曲线，避免每次切换都
+        # 同步重跑 matplotlib 导致页面卡顿
         if index == 1:  # 历史数据tab
-            all_rows = getattr(self, '_history_all_rows', [])
-            display_params = getattr(self, '_history_display_params', [])
-            codes = getattr(self, '_history_codes', '')
-            if all_rows and display_params and codes:
-                try:
-                    self._display_history_chart(all_rows, display_params, codes)
-                except Exception as e:
-                    print(f"[ERROR] 切换tab时显示曲线失败: {e}")
+            if getattr(self, '_history_chart_dirty', False):
+                all_rows = getattr(self, '_history_all_rows', [])
+                display_params = getattr(self, '_history_display_params', [])
+                codes = getattr(self, '_history_codes', '')
+                if all_rows and display_params and codes:
+                    try:
+                        self._display_history_chart(all_rows, display_params, codes)
+                        self._history_chart_dirty = False
+                    except Exception as e:
+                        print(f"[ERROR] 切换tab时显示曲线失败: {e}")
 
         # 切换到预测tab时，如果有预测数据则重新显示
         elif index == 2:  # 预测tab
@@ -3879,10 +3941,13 @@ class MainWindow(QMainWindow):
             # 显示第一页
             self._render_history_page()
 
-            # 显示曲线（全量数据）
-            if all_rows:
+            # 显示曲线（全量数据）：仅在历史页当前可见时立即绘制，否则标记脏、
+            # 待用户切到该页时再绘制（避免后台隐藏绘制 + 切页二次绘制造成卡顿）
+            self._history_chart_dirty = bool(all_rows)
+            if all_rows and self.right_panel.currentIndex() == 1:
                 try:
                     self._display_history_chart(all_rows, display_params, codes)
+                    self._history_chart_dirty = False
                 except Exception as e:
                     print(f"[ERROR] 显示曲线失败: {e}")
                     # 曲线显示失败不影响表格，只打印日志
@@ -7127,6 +7192,40 @@ class MainWindow(QMainWindow):
                 self._show_changelog(auto=True)
         except Exception:
             pass
+
+    # ── v5.57：在线版本检测（升级提示）─────────────────────────────────────
+    def _start_version_check(self):
+        """启动后台线程检测 GitHub 最新版本，发现新版本则弹非模态提示。"""
+        try:
+            api_url = "https://api.github.com/repos/junkechen/gz-monitor/tags"
+            self._version_worker = VersionCheckWorker(APP_RELEASE_VERSION, api_url)
+            self._version_worker.update_available.connect(self._on_update_available)
+            self._version_worker.finished.connect(self._version_worker.deleteLater)
+            self._version_worker.start()
+        except Exception:
+            pass
+
+    def _on_update_available(self, latest, current):
+        """收到新版本信号：记录已通知版本，非模态提示用户前往下载。"""
+        try:
+            from user_data_manager import load_app_info, save_app_info
+            info = load_app_info()
+            if info.get("last_update_notice_version") == latest:
+                return  # 同一版本已提示过，避免重复打扰
+            info["last_update_notice_version"] = latest
+            save_app_info(info)
+        except Exception:
+            pass
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setWindowTitle("发现新版本")
+        msg.setText(
+            f"检测到新版本 {latest}（当前 {current}）。\n\n"
+            f"请前往 GitHub 仓库下载更新：\n"
+            f"github.com/junkechen/gz-monitor")
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.setModal(False)  # 非模态：不打断当前操作
+        msg.show()
 
     def _stop_pred_workers(self):
         """安全停止所有在途预测/取数线程，防止窗口关闭时 QThread 仍在运行被析构而 qFatal。"""
