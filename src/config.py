@@ -33,10 +33,10 @@ AES_IV  = b'i7t483eitnweh6ph'
 # 内置企业账户（账户名 -> 密码）
 BUILTIN_ACCOUNTS = [
     {"name": "山东冠洲股份有限公司",              "password": "Gzgfah@163.com"},
-    {"name": "山东冠洲鼎鑫板材科技有限公司",       "password": "Gzgfah@163.com1"},
+    {"name": "山东冠洲鼎鑫板材科技有限公司",       "password": "Gzgfah@163.com"},
     {"name": "冠县恒润热电有限公司",               "password": "Gzgfah@163.com"},
     {"name": "山东冠县冠锌金属材料科技有限公司",    "password": "Gzgfah@163.com"},
-    {"name": "聊城东舜涂料科技有限公司",             "password": "lCdstl5289099@1"},
+    {"name": "聊城东舜涂料科技有限公司",             "password": "lCdstl5289099@"},
 ]
 
 # 默认刷新时间（秒）
@@ -45,6 +45,12 @@ DEFAULT_REFRESH_INTERVAL = 60  # 1分钟
 # 版本权限密码
 VERSION2_ADD_PASS = "3C123@"    # 版本二：可添加2个账户
 VERSION3_MANAGE_PASS = "3C323@" # 版本三：自由管理账户
+
+# ── 软件发布版本号（唯一来源）──────────────────────────────────────────────
+# 注意：本常量用于「更新变化介绍」弹窗与版本自增发布脚本（tools/build_release.py），
+# 与 get_app_version()/LoginDialog.version 里的 v1/v2/v3（账户管理模式）是两回事。
+# 修改版本号请统一改这里（或运行发布脚本自动递增），不要硬编码到别处。
+APP_RELEASE_VERSION = "5.54"
 
 # ── 默认预警阈值（支持上下限）─────────────────────────────────────────────
 # 格式：单个浮点数 = 只有上限；(lower, upper) 元组 = 下限+上限

@@ -67,7 +67,8 @@ from data_processor import (
 from warning_system import WarningSystem, PredictionWarning
 from chart_widget import ChartWidget
 from config import (COLORS, WATER_DISPLAY_PARAMS, GAS_DISPLAY_PARAMS, RIGHT_AXIS_PARAMS,
-                    HISTORY_TTL, HISTORY_INDEX, SERIES_CAP, FIG_DPI, THROTTLE_MS, EMPTY_PLACEHOLDER)
+                    HISTORY_TTL, HISTORY_INDEX, SERIES_CAP, FIG_DPI, THROTTLE_MS, EMPTY_PLACEHOLDER,
+                    APP_RELEASE_VERSION)
 from refresh_utils import TableDiff, classify_axis
 from history_fetch_worker import HistoryFetchWorker, make_history_cache_key
 from pred_param_selector import ParamPickerPanel
@@ -91,7 +92,8 @@ class PredictionWorker(QThread):
                  sub_itemcodes_cache, api_data_cache, thresholds_cache,
                  get_subtype_code_fn, is_water_sub_fn,
                  code_to_name_map, intervention_sm=None,
-                 get_sub_itemcodes_fn=None, daily_forecast_days=7):
+                 get_sub_itemcodes_fn=None, daily_forecast_days=7,
+                 cache_lock=None):
         super().__init__()
         self.grouped_data = grouped_data
         self.multi_client = multi_client
@@ -107,6 +109,7 @@ class PredictionWorker(QThread):
         self._code_to_name_map = code_to_name_map
         self._intervention_sm = intervention_sm
         self._get_sub_itemcodes = get_sub_itemcodes_fn
+        self._cache_lock = cache_lock
         # v5.46：日排放量预测的未来天数
         self.daily_forecast_days = daily_forecast_days
         # v5.47：日排放量预测被跳过的原因（供 UI 提示，避免"无结果却不知为何"）
@@ -224,13 +227,26 @@ class PredictionWorker(QThread):
 
         def _get_cached(sub_key, ttl, fetch_fn, *args, **kwargs):
             now = _time.time()
-            entry = self._api_data_cache.get(sub_key)
-            if entry is not None:
-                ts, data = entry
-                if now - ts < ttl:
-                    return data
+            lock = getattr(self, '_cache_lock', None)
+            if lock:
+                lock.acquire()
+            try:
+                entry = self._api_data_cache.get(sub_key)
+                if entry is not None:
+                    ts, data = entry
+                    if now - ts < ttl:
+                        return data
+            finally:
+                if lock:
+                    lock.release()
             data = fetch_fn(*args, **kwargs)
-            self._api_data_cache[sub_key] = (now, data)
+            if lock:
+                lock.acquire()
+            try:
+                self._api_data_cache[sub_key] = (now, data)
+            finally:
+                if lock:
+                    lock.release()
             return data
 
         all_predictions = []
@@ -248,8 +264,16 @@ class PredictionWorker(QThread):
             # 尝试两种键格式获取监测项目代码
             cache_key_tuple = (subid, subname, subtype_code)
             cache_key_str = f"{subid}_{subtype_code}"
-            codes = self._sub_itemcodes_cache.get(cache_key_tuple) or self._sub_itemcodes_cache.get(cache_key_str)
-            
+            lock = getattr(self, '_cache_lock', None)
+            if lock:
+                lock.acquire()
+            try:
+                codes = (self._sub_itemcodes_cache.get(cache_key_tuple)
+                         or self._sub_itemcodes_cache.get(cache_key_str))
+            finally:
+                if lock:
+                    lock.release()
+
             # 如果缓存中没有，尝试主动获取
             if not codes and self._get_sub_itemcodes:
                 try:
@@ -257,7 +281,13 @@ class PredictionWorker(QThread):
                     codes = self._get_sub_itemcodes(subid, subname, subtype_code)
                     if codes:
                         # 更新缓存
-                        self._sub_itemcodes_cache[cache_key_str] = codes
+                        if lock:
+                            lock.acquire()
+                        try:
+                            self._sub_itemcodes_cache[cache_key_str] = codes
+                        finally:
+                            if lock:
+                                lock.release()
                         logger.debug(f"[PRED_WORKER] {subname}: 成功获取监测项目代码: {codes}")
                     else:
                         logger.debug(f"[PRED_WORKER] {subname}: 获取监测项目代码返回空")
@@ -839,7 +869,7 @@ class LoginDialog(QDialog):
         """)
         logo_layout.addWidget(logo_label)
 
-        version_label = QLabel(f"版本 {self.version} | 多企业一键登录")
+        version_label = QLabel(f"版本 v{APP_RELEASE_VERSION} | 多企业一键登录")
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         version_label.setStyleSheet(f"""
             color: {COLORS['accent']};
@@ -1246,6 +1276,9 @@ class MainWindow(QMainWindow):
         # 排放口代码缓存（已有）
         self._sub_itemcodes_cache = {}
 
+        # v5.53：多线程共享缓存锁，防止刷新/预测 worker 与主线程并发读写 dict 导致崩溃
+        self._cache_lock = threading.RLock()
+
         # ── 内存管理 ──────────────────────────────────────────────────────────
         self._gc_counter = 0              # GC计数器，每N次刷新执行一次GC
         self._gc_interval = 10             # 每10次刷新执行一次垃圾回收
@@ -1490,6 +1523,10 @@ class MainWindow(QMainWindow):
         self.sub_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)  # 支持手动调整列宽
         self.sub_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.sub_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sub_list.setWordWrap(True)
+        self.sub_list.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.sub_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.sub_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.sub_list.itemClicked.connect(self._on_sub_selected)
         # 添加滚动条，确保所有排放口都能显示
         self.sub_list.setMinimumHeight(600)
@@ -1646,6 +1683,8 @@ class MainWindow(QMainWindow):
             ["监测参数", "实测浓度", "折算浓度", "单位",
              "排放量(kg)", "排放标准", "折算状态", "监测状态"])
         self.realtime_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.realtime_table.setWordWrap(True)
+        self.realtime_table.verticalHeader().setDefaultSectionSize(32)
         self.realtime_table.setStyleSheet(f"""
             QTableWidget {{
                 background: {COLORS['bg_input']};
@@ -2682,19 +2721,28 @@ class MainWindow(QMainWindow):
     def _cleanup_expired_cache(self):
         """清理过期的缓存数据"""
         now = time.time()
-        # 清理API缓存
-        expired_keys = [
-            k for k, v in self._api_data_cache.items()
-            if now - v[0] > self._api_cache_ttl
-        ]
-        for k in expired_keys:
-            self._api_data_cache.pop(k, None)
-
-        # 限制API缓存大小
-        if len(self._api_data_cache) > 500:
-            sorted_keys = sorted(self._api_data_cache, key=lambda k: self._api_data_cache[k][0])
-            for k in sorted_keys[:len(sorted_keys) // 3]:
+        # v5.53：worker 线程可能并发写入，遍历 + 删除必须持锁，
+        # 否则会抛 "dictionary changed size during iteration"。
+        lock = getattr(self, '_cache_lock', None)
+        if lock:
+            lock.acquire()
+        try:
+            # 清理API缓存
+            expired_keys = [
+                k for k, v in self._api_data_cache.items()
+                if now - v[0] > self._api_cache_ttl
+            ]
+            for k in expired_keys:
                 self._api_data_cache.pop(k, None)
+
+            # 限制API缓存大小
+            if len(self._api_data_cache) > 500:
+                sorted_keys = sorted(self._api_data_cache, key=lambda k: self._api_data_cache[k][0])
+                for k in sorted_keys[:len(sorted_keys) // 3]:
+                    self._api_data_cache.pop(k, None)
+        finally:
+            if lock:
+                lock.release()
 
         # 清理预测结果缓存
         if len(self._pred_result_cache) > self._pred_cache_max:
@@ -2713,7 +2761,7 @@ class MainWindow(QMainWindow):
             exe_info = ""
         self.statusBar().showMessage(
             f"✓ 已登录: {self.username} | "
-            f"📊 版本 {self.version} | "
+            f"📊 版本 v{APP_RELEASE_VERSION} | "
             f"🔄 自动刷新: {interval_seconds}秒 | "
             f"{exe_info} | "
             f"📡 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -2867,7 +2915,13 @@ class MainWindow(QMainWindow):
             self.pred_chart_toggle_btn.setText("▲ 收起")
 
     def _on_tab_changed(self, index):
-        """tab切换事件处理，确保图表正确显示"""
+        """tab切换事件处理，确保图表正确显示（v5.53：加异常护栏）"""
+        try:
+            self._on_tab_changed_impl(index)
+        except BaseException as e:
+            logger.error(f"tab切换处理异常: {e}", exc_info=True)
+
+    def _on_tab_changed_impl(self, index):
         # 切换到历史数据tab时，重新渲染图表
         if index == 1:  # 历史数据tab
             all_rows = getattr(self, '_history_all_rows', [])
@@ -2950,7 +3004,11 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_refresh_data_ready(self, payload):
-        """后台取数完成：在主线程更新 UI（v5.38）"""
+        """后台取数完成：在主线程更新 UI（v5.38）
+
+        v5.53：捕获 BaseException —— 该槽由 worker 信号触发，槽内未捕获异常
+        会被 PyQt5 转成 qFatal 直接终止进程。
+        """
         try:
             grouped_data, grouped_data_for_warning = payload
             # 实时监控和预警系统都使用包含折算值的数据（主线程更新，供预测 worker 等读取）
@@ -2970,8 +3028,13 @@ class MainWindow(QMainWindow):
             # 不再在每次数据刷新内叠加调用，避免重复预测导致卡顿
 
             logger.info(f"数据刷新完成，共 {len(grouped_data)} 个排放口")
-        except Exception as e:
+        except BaseException as e:
             logger.error(f"刷新数据后处理异常: {e}", exc_info=True)
+            try:
+                from main import _write_crash_log
+                _write_crash_log('REFRESH_UI_ERROR', traceback.format_exc())
+            except Exception:
+                pass
 
     def _on_refresh_fetch_failed(self, msg):
         """后台取数失败：仅提示，不弹窗阻塞定时器（v5.38）"""
@@ -2984,14 +3047,17 @@ class MainWindow(QMainWindow):
 
     def _on_refresh_worker_finished(self):
         """后台刷新线程结束：清理引用，允许下一次刷新（v5.38）"""
-        self._refresh_worker_running = False
-        w = getattr(self, '_refresh_worker', None)
-        self._refresh_worker = None
-        if w is not None:
-            try:
-                w.deleteLater()
-            except Exception:
-                pass
+        try:
+            self._refresh_worker_running = False
+            w = getattr(self, '_refresh_worker', None)
+            self._refresh_worker = None
+            if w is not None:
+                try:
+                    w.deleteLater()
+                except Exception:
+                    pass
+        except BaseException as e:
+            logger.error(f"刷新线程清理异常: {e}", exc_info=True)
 
     def _update_sub_list(self, grouped_data):
         """更新排放口列表（支持多企业）"""
@@ -3004,7 +3070,9 @@ class MainWindow(QMainWindow):
 
             # 显示格式：企业名称 - 排口名称
             display_text = f"{ent_name} - {subname}" if ent_name else subname
-            self.sub_list.setItem(idx, 0, QTableWidgetItem(display_text))
+            name_item = QTableWidgetItem(display_text)
+            name_item.setToolTip(display_text)
+            self.sub_list.setItem(idx, 0, name_item)
             status_item = QTableWidgetItem(status)
             status_item.setForeground(QColor(COLORS['success']) if status == '正常' else QColor(COLORS['warning']))
             self.sub_list.setItem(idx, 1, status_item)
@@ -3014,9 +3082,22 @@ class MainWindow(QMainWindow):
             if exists == -1:
                 self.history_sub_combo.addItem(display_text, unique_key)
         self.sub_list.setUpdatesEnabled(True)
+        self.sub_list.resizeRowsToContents()
 
     def _on_sub_selected(self, item):
-        """排放口选择事件"""
+        """排放口选择事件（itemClicked 信号槽，需异常护栏：槽内未捕获异常会被 PyQt5 qFatal 杀进程）"""
+        try:
+            self._on_sub_selected_impl(item)
+        except BaseException:
+            logger.exception("[REALTIME] 排放口切换处理异常（已忽略，避免闪退）")
+            try:
+                from main import _write_crash_log
+                _write_crash_log('SUB_SELECT_ERROR', traceback.format_exc())
+            except Exception:
+                pass
+
+    def _on_sub_selected_impl(self, item):
+        """排放口选择事件（实际实现）"""
         row = item.row()
         text_item = self.sub_list.item(row, 0)
         if text_item:
@@ -3188,10 +3269,12 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"[WARN] 获取热电厂折算数据失败: {e}")
 
+        # v5.53：hist_latest 提到 if 之外声明 —— 流量参数可能不在 display_params 里，
+        # 此时排口列表没有流量行，需要用这份补充历史数据兜底算排放量。
+        hist_latest = {}
+        hist_latest_time = {}
         if missing_display and codes_str:
             # 查最近2小时历史（分钟数据 index=-1），取最新有效分钟值
-            hist_latest = {}
-            hist_latest_time = {}
             try:
                 from datetime import datetime as _dt, timedelta as _td
                 client_info = self.multi_client.get_client_by_subid(subid)
@@ -3253,6 +3336,7 @@ class MainWindow(QMainWindow):
 
                 filtered_params.append({
                     'name': missing_name,
+                    'code': code,
                     'value': hist_val,
                     'std': std_val,
                     'is_exceed': False,
@@ -3286,7 +3370,23 @@ class MainWindow(QMainWindow):
                         flow_value = float(fv)
                     except (ValueError, TypeError):
                         flow_value = None
+                    # 服务端用 -9999 表示无效值
+                    if flow_value is not None and flow_value <= 0:
+                        flow_value = None
                 break
+        # v5.53：兜底 —— 排口列表里没有流量行（流量参数不在 display_params 中）时，
+        # 用补充历史数据里的流量值，否则所有浓度参数的排放量都会显示 "--"。
+        if flow_value is None and flow_code and hist_latest:
+            _hf = hist_latest.get(flow_code)
+            if _hf not in (None, '', '--'):
+                try:
+                    flow_value = float(_hf)
+                    if flow_value <= 0:
+                        flow_value = None
+                except (ValueError, TypeError):
+                    flow_value = None
+        if flow_code and flow_value is None:
+            logger.debug(f"[REALTIME] {ent_name}/{subname}: 流量参数 code={flow_code} 无有效值，排放量显示 --")
 
         self.realtime_table.setUpdatesEnabled(False)
         if not filtered_params:
@@ -3316,6 +3416,13 @@ class MainWindow(QMainWindow):
             self.realtime_table.setItem(row, 0, QTableWidgetItem(name))
 
             # ── 实测浓度列 ──────────────────────────────────────────────
+            # v5.53：-9999 等哨兵值统一显示 '--'，不当作真实数值
+            if value is not None:
+                try:
+                    if float(value) <= -9998:
+                        value = None
+                except (ValueError, TypeError):
+                    pass
             if value is not None:
                 val_text = str(value) + ("  (历史)" if is_hist else "")
             else:
@@ -3451,6 +3558,7 @@ class MainWindow(QMainWindow):
             status_item.setForeground(status_color)
             self.realtime_table.setItem(row, 7, status_item)
         self.realtime_table.setUpdatesEnabled(True)
+        self.realtime_table.resizeRowsToContents()
 
     def _on_time_type_changed(self, index):
         """数据类型切换时，智能显示/隐藏时分控件，并调整默认时间范围"""
@@ -3866,8 +3974,15 @@ class MainWindow(QMainWindow):
         """
         # 检查缓存
         cache_key = f"{subid}_{subtype_code}"
-        if hasattr(self, '_sub_itemcodes_cache') and cache_key in self._sub_itemcodes_cache:
-            return self._sub_itemcodes_cache[cache_key]
+        _lock = getattr(self, '_cache_lock', None)
+        if _lock:
+            _lock.acquire()
+        try:
+            if hasattr(self, '_sub_itemcodes_cache') and cache_key in self._sub_itemcodes_cache:
+                return self._sub_itemcodes_cache[cache_key]
+        finally:
+            if _lock:
+                _lock.release()
 
         # 根据subid找到对应的client和username
         client_info = self.multi_client.get_client_by_subid(subid)
@@ -3955,7 +4070,13 @@ class MainWindow(QMainWindow):
                     # 缓存结果
                     if not hasattr(self, '_sub_itemcodes_cache'):
                         self._sub_itemcodes_cache = {}
-                    self._sub_itemcodes_cache[cache_key] = itemcode
+                    if _lock:
+                        _lock.acquire()
+                    try:
+                        self._sub_itemcodes_cache[cache_key] = itemcode
+                    finally:
+                        if _lock:
+                            _lock.release()
                     print(f"[DEBUG] 从排口列表获取itemCode: {itemcode}")
                     return itemcode
                 else:
@@ -4021,7 +4142,14 @@ class MainWindow(QMainWindow):
                 # 缓存结果
                 if not hasattr(self, '_sub_itemcodes_cache'):
                     self._sub_itemcodes_cache = {}
-                self._sub_itemcodes_cache[cache_key] = itemcode_str
+                _lock = getattr(self, '_cache_lock', None)
+                if _lock:
+                    _lock.acquire()
+                try:
+                    self._sub_itemcodes_cache[cache_key] = itemcode_str
+                finally:
+                    if _lock:
+                        _lock.release()
                 print(f"[DEBUG] 从实时数据提取itemCode: {itemcode_str} (共{len(itemcodes)}个监测项目)")
                 return itemcode_str
             else:
@@ -4081,11 +4209,13 @@ class MainWindow(QMainWindow):
         self.history_table.setColumnCount(total_cols)
         self.history_table.setHorizontalHeaderLabels(headers)
 
-        # 设置列宽：时间列固定宽度，其他列自动拉伸
+        # 设置列宽：时间列固定宽度，其他列按内容自适应，文字换行避免截断
         self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.history_table.setColumnWidth(0, 150)  # 时间列固定150像素
+        self.history_table.setWordWrap(True)
         for i in range(1, total_cols):
-            self.history_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+            self.history_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.horizontalHeader().setMinimumSectionSize(70)
 
         # 取本行流量值（同一时间点的流量）
         def _row_flow(r):
@@ -4095,9 +4225,23 @@ class MainWindow(QMainWindow):
             if fv in (None, '', '--'):
                 return None
             try:
-                return float(fv)
+                v = float(fv)
             except (ValueError, TypeError):
                 return None
+            # 服务端用 -9999/0 表示无效流量
+            return v if v > 0 else None
+
+        # v5.53：服务端用 -9999 表示"无效/未监测"，直接展示会像脏数据，
+        # 统一显示 '--'（同时避免污染排放量计算）。
+        def _fmt_val(v):
+            if v in (None, '', '--'):
+                return '--'
+            try:
+                if float(v) <= -9998:      # -9999 / -99999 等哨兵值
+                    return '--'
+            except (ValueError, TypeError):
+                pass
+            return str(v)
 
         self.history_table.setUpdatesEnabled(False)
         self.history_table.setRowCount(len(rows))
@@ -4111,8 +4255,8 @@ class MainWindow(QMainWindow):
                     cvt_key = f"cvt_{code}"
                     val = row.get(val_key)
                     cvt = row.get(cvt_key)
-                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
-                    self.history_table.setItem(row_idx, base_col + 1, QTableWidgetItem(str(cvt) if cvt else "--"))
+                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(_fmt_val(val)))
+                    self.history_table.setItem(row_idx, base_col + 1, QTableWidgetItem(_fmt_val(cvt)))
                     # 排放量：服务端字段优先，取不到再按 实测浓度×累计流量 计算
                     emis = None
                     if is_concentration_param(code):
@@ -4131,7 +4275,7 @@ class MainWindow(QMainWindow):
                     base_col = 1 + col_idx * 2
                     val_key = f"val_{code}"
                     val = row.get(val_key)
-                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(str(val) if val else "--"))
+                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(_fmt_val(val)))
                     emis = None
                     if is_concentration_param(code):
                         # v5.50：服务端字段优先，取不到再计算
@@ -4142,6 +4286,7 @@ class MainWindow(QMainWindow):
                         row_idx, base_col + 1,
                         QTableWidgetItem(format_emission_rate(emis)))
         self.history_table.setUpdatesEnabled(True)
+        self.history_table.resizeRowsToContents()
 
 
     def _display_history_chart(self, rows, display_params, codes_str):
@@ -4158,14 +4303,23 @@ class MainWindow(QMainWindow):
 
         times = [r.get('DateTime', '') for r in rows]
 
+        def _to_point(v):
+            """v5.53：'-9999' 等哨兵值不画点，避免曲线被拉到负值区。"""
+            if v in (None, '', '--'):
+                return None
+            try:
+                fv = float(v)
+            except (ValueError, TypeError):
+                return None
+            return None if fv <= -9998 else fv
+
         series_list = []
         for code in code_list:
             # 实测曲线
             values = []
             for row in rows:
                 val_key = f"val_{code}"
-                val = row.get(val_key)
-                values.append(float(val) if val else None)
+                values.append(_to_point(row.get(val_key)))
             series_list.append({"name": code_to_display.get(code, code) + "(实测)", "data": values})
 
             # 折算曲线（仅热电厂废气）
@@ -4173,8 +4327,7 @@ class MainWindow(QMainWindow):
                 cvt_values = []
                 for row in rows:
                     cvt_key = f"cvt_{code}"
-                    cvt = row.get(cvt_key)
-                    cvt_values.append(float(cvt) if cvt else None)
+                    cvt_values.append(_to_point(row.get(cvt_key)))
                 series_list.append({"name": code_to_display.get(code, code) + "(折算)", "data": cvt_values})
 
         self.chart_widget.plot_series(times, series_list, title="历史数据曲线")
@@ -4570,13 +4723,13 @@ class MainWindow(QMainWindow):
             print("预测自动更新已暂停")
 
     def _auto_update_prediction(self):
-        """自动更新预测数据"""
+        """自动更新预测数据（prediction_timer 定时器槽，v5.53：加异常护栏）"""
         if not self.auto_update_prediction:
             return
         try:
             self._run_prediction(silent=True)
-        except Exception as e:
-            print(f"自动更新预测失败: {e}")
+        except BaseException as e:
+            logger.error(f"自动更新预测失败: {e}", exc_info=True)
 
     def _run_prediction(self, silent=False, predict_all_params=True):
         """运行预测 —— 遍历所有排放口，预测全量参数（异步模式，API调用在后台线程）
@@ -4650,6 +4803,7 @@ class MainWindow(QMainWindow):
             intervention_sm=getattr(self, '_intervention_sm', None),
             get_sub_itemcodes_fn=self._get_sub_itemcodes,
             daily_forecast_days=getattr(self, 'daily_forecast_days', 7),
+            cache_lock=self._cache_lock,
         )
         self._pred_worker.prediction_done.connect(
             lambda preds: self._on_prediction_worker_done(preds, pred_type, silent)
@@ -4663,7 +4817,29 @@ class MainWindow(QMainWindow):
         self._pred_worker.start()
 
     def _on_prediction_worker_done(self, all_predictions, pred_type, silent):
-        """后台线程完成后在主线程执行UI更新"""
+        """后台线程完成后在主线程执行UI更新。
+
+        v5.53：整体异常护栏。此槽由预测定时器（默认 60s）触发，
+        PyQt5 在槽内未捕获异常时会调用 qFatal → abort() 直接杀进程，
+        表现为"运行约 1 分钟后闪退"且 crash.log 无 CLEAN_EXIT。
+        这里捕获 BaseException（含 MemoryError/SystemError），记日志后不再上抛。
+        """
+        try:
+            self._on_prediction_worker_done_impl(all_predictions, pred_type, silent)
+        except BaseException:
+            logger.exception("[PRED] 预测结果 UI 更新异常（已忽略，避免闪退）")
+            try:
+                from main import _write_crash_log
+                _write_crash_log('PRED_UI_ERROR', traceback.format_exc())
+            except Exception:
+                pass
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+
+    def _on_prediction_worker_done_impl(self, all_predictions, pred_type, silent):
+        """后台线程完成后在主线程执行UI更新（实际实现，由外层护栏调用）"""
         # ── Win7 诊断：定位静默崩溃环节 ─────────────────────────────────────
         try:
             from main import _write_crash_log
@@ -4784,20 +4960,33 @@ class MainWindow(QMainWindow):
         返回 (rows, from_cache)
         """
         now = time.time()
-        entry = self._api_data_cache.get(cache_key)
-        if entry is not None:
-            ts, data = entry
-            if now - ts < ttl:
-                return data, True
+        lock = getattr(self, '_cache_lock', None)
+        if lock:
+            lock.acquire()
+        try:
+            entry = self._api_data_cache.get(cache_key)
+            if entry is not None:
+                ts, data = entry
+                if now - ts < ttl:
+                    return data, True
+        finally:
+            if lock:
+                lock.release()
         # 缓存过期或不存在，重新请求
         data = fetch_fn(*args, **kwargs)
-        self._api_data_cache[cache_key] = (now, data)
-        # 防止缓存无限膨胀
-        if len(self._api_data_cache) > 500:
-            # 删除最老的1/3条目
-            sorted_keys = sorted(self._api_data_cache, key=lambda k: self._api_data_cache[k][0])
-            for k in sorted_keys[:166]:
-                self._api_data_cache.pop(k, None)
+        if lock:
+            lock.acquire()
+        try:
+            self._api_data_cache[cache_key] = (now, data)
+            # 防止缓存无限膨胀
+            if len(self._api_data_cache) > 500:
+                # 删除最老的1/3条目
+                sorted_keys = sorted(self._api_data_cache, key=lambda k: self._api_data_cache[k][0])
+                for k in sorted_keys[:166]:
+                    self._api_data_cache.pop(k, None)
+        finally:
+            if lock:
+                lock.release()
         return data, False
 
     def _do_prediction_for_sub(self, client, subid, subtype_code, codes,
@@ -5013,8 +5202,8 @@ class MainWindow(QMainWindow):
         """自动刷新预测数据（切换排放口时触发，静默模式）"""
         try:
             self._run_prediction(silent=True)
-        except Exception as e:
-            print(f"[DEBUG] 自动刷新预测失败: {e}")
+        except BaseException as e:
+            logger.error(f"自动刷新预测失败: {e}", exc_info=True)
 
     # ── 预测结果表格显示 ────────────────────────────────────────────────────
 
@@ -5826,6 +6015,7 @@ class MainWindow(QMainWindow):
                 code_to_name_map=CODE_TO_NAME,
                 intervention_sm=getattr(self, '_intervention_sm', None),
                 get_sub_itemcodes_fn=self._get_sub_itemcodes,
+                cache_lock=self._cache_lock,
             )
             # 用默认参数 pn=param_name 固化闭包，避免循环变量延迟绑定
             worker.prediction_done.connect(
@@ -6142,18 +6332,29 @@ class MainWindow(QMainWindow):
 
     def _on_hist_result(self, payload):
         """后台逐 sub 回传：累加历史 series。"""
-        subid = payload.get('subid')
-        if subid is not None:
-            self._hist_results[subid] = payload
+        try:
+            subid = payload.get('subid')
+            if subid is not None:
+                self._hist_results[subid] = payload
+        except BaseException as e:
+            logger.error(f"历史数据累加异常: {e}", exc_info=True)
 
     def _on_hist_fetch_finished(self, checked_params, mode, worker):
         """后台取数完成：组装并绘制。"""
-        if self._hist_worker is not worker:
-            # 已有新的取数任务，放弃本次过期结果
-            return
-        self._hist_worker = None
-        self._pred_chart_loading = False
-        self._assemble_and_plot_pred_chart(checked_params, mode)
+        try:
+            if self._hist_worker is not worker:
+                # 已有新的取数任务，放弃本次过期结果
+                return
+            self._hist_worker = None
+            self._pred_chart_loading = False
+            self._assemble_and_plot_pred_chart(checked_params, mode)
+        except BaseException as e:
+            logger.error(f"预测趋势图组装异常: {e}", exc_info=True)
+            try:
+                from main import _write_crash_log
+                _write_crash_log('PRED_CHART_ERROR', traceback.format_exc())
+            except Exception:
+                pass
 
     def _assemble_and_plot_pred_chart(self, checked_params, mode):
         """从 _hist_results 组装 left/right series、追加预测点、归一化、截断并绘制。"""
@@ -6546,6 +6747,10 @@ class MainWindow(QMainWindow):
         tutorial_action = help_menu.addAction("❓ 重看教学演示")
         tutorial_action.triggered.connect(lambda: self.start_onboarding(force=True))
 
+        # 查看更新变化（手动入口）
+        changelog_action = help_menu.addAction("📝 更新变化介绍")
+        changelog_action.triggered.connect(self._show_changelog)
+
     def _relogin(self):
         """重新登录"""
         reply = QMessageBox.question(
@@ -6738,7 +6943,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "关于 GZ安环监测系统",
-            f"版本：v1.0.0\n\n"
+            f"版本：v{APP_RELEASE_VERSION}\n\n"
             f"GZ安环监测系统 - 跨电脑部署版本\n\n"
             f"功能特点：\n"
             f"• 五个企业账户一键登录\n"
@@ -6749,6 +6954,116 @@ class MainWindow(QMainWindow):
             f"• 完全便携，跨电脑使用\n\n"
             f"开发日期：2026-03-21"
         )
+
+    # ── 更新变化介绍（v5.54） ──────────────────────────────────────────────
+    def _find_changelog_path(self):
+        """定位 CHANGELOG.md：onefile 打包时会在 sys._MEIPASS；源码运行时在项目根目录。"""
+        import os as _os
+        candidates = []
+        # 1) 源码 / 工作目录（脚本所在项目根的上级）
+        try:
+            base = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            candidates.append(_os.path.join(base, "CHANGELOG.md"))
+        except Exception:
+            pass
+        # 2) onefile 临时解压目录
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(_os.path.join(meipass, "CHANGELOG.md"))
+        # 3) 当前工作目录
+        candidates.append(_os.path.join(_os.getcwd(), "CHANGELOG.md"))
+        for p in candidates:
+            if p and _os.path.exists(p):
+                return p
+        return None
+
+    def _parse_latest_changelog(self):
+        """解析 CHANGELOG.md 中最新一个版本段落（首个 '## v...' 到下一个 '## ' 之间）。
+
+        返回 (title, body_md)；找不到时返回 (None, None)。
+        """
+        path = self._find_changelog_path()
+        if not path:
+            return None, None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            return None, None
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("## ") and "v" in ln[:8]:
+                start = i
+                break
+        if start is None:
+            return None, None
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if lines[j].startswith("## "):
+                end = j
+                break
+        block = lines[start:end]
+        title = block[0].lstrip("# ").strip()
+        body = "\n".join(block[1:]).strip()
+        return title, body
+
+    def _show_changelog(self, auto=False):
+        """显示「更新变化介绍」对话框。
+
+        auto=True 表示启动自动弹窗（用于版本变化检测），此时关闭后更新已读版本；
+        auto=False 表示手动从菜单触发，不修改已读标记。
+        """
+        title, body = self._parse_latest_changelog()
+        if not body:
+            QMessageBox.information(self, "更新变化介绍",
+                                    "未找到更新日志（CHANGELOG.md）。")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"📝 更新变化介绍 — {title}")
+        dlg.setMinimumSize(720, 480)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {COLORS['bg_dark']}; color: {COLORS['text_primary']}; }}
+            QLabel#Title {{ font-size: 15px; font-weight: 700; color: {COLORS['accent']}; }}
+        """)
+        layout = QVBoxLayout(dlg)
+        t_label = QLabel(title)
+        t_label.setObjectName("Title")
+        layout.addWidget(t_label)
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(False)
+        browser.setStyleSheet(f"""
+            QTextBrowser {{ background: {COLORS['bg_card']}; color: {COLORS['text_primary']};
+                           border: 1px solid {COLORS['border']}; border-radius: 6px;
+                           padding: 8px; font-size: 13px; }}
+        """)
+        try:
+            browser.setMarkdown(body)  # Qt >= 5.14 支持
+        except Exception:
+            browser.setPlainText(body)
+        layout.addWidget(browser)
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(dlg.reject)
+        layout.addWidget(btn_box)
+        dlg.exec_()
+        if auto:
+            try:
+                from user_data_manager import load_app_info, save_app_info
+                info = load_app_info()
+                info["last_changelog_version"] = APP_RELEASE_VERSION
+                save_app_info(info)
+            except Exception:
+                pass
+
+    def _maybe_show_changelog_on_startup(self):
+        """启动检测：版本变化则自动弹出更新介绍。"""
+        try:
+            from user_data_manager import load_app_info
+            info = load_app_info()
+            last = info.get("last_changelog_version")
+            if last != APP_RELEASE_VERSION:
+                self._show_changelog(auto=True)
+        except Exception:
+            pass
 
     def _stop_pred_workers(self):
         """安全停止所有在途预测/取数线程，防止窗口关闭时 QThread 仍在运行被析构而 qFatal。"""

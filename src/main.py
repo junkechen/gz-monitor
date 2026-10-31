@@ -840,6 +840,12 @@ def main():
                             _main_window.show()
                             print(">>> 主窗口已显示")
 
+                            # v5.54：版本变化自动弹出「更新变化介绍」（一次性）
+                            try:
+                                _main_window._maybe_show_changelog_on_startup()
+                            except Exception as e:
+                                print(f"[WARN] 启动更新介绍检查失败: {e}")
+
                             # 首次启动教学引导：延迟触发，等主窗口布局稳定后展示遮罩
                             try:
                                 from user_data_manager import is_first_run
