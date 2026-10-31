@@ -783,7 +783,8 @@ class LoginDialog(QDialog):
         self.api_client = GZApiClient()
         self.login_progress_label = QLabel("")  # 用于显示多账户登录进度
         self.setWindowTitle("GZ安环 - 一键登录")
-        self.setFixedSize(600, 500)
+        # v5.56：原 600x500 高度不足，账户表格被挤压只剩表头、标题被裁顶，加大窗口
+        self.setFixedSize(640, 720)
         self.setStyleSheet(f"""
             QDialog {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -851,8 +852,9 @@ class LoginDialog(QDialog):
 
     def _init_ui(self):
         layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(30, 30, 30, 30)
+        # v5.56：窗口加高后适当压缩间距，保证所有元素完整显示
+        layout.setSpacing(12)
+        layout.setContentsMargins(30, 24, 30, 24)
 
         # Logo区域 - 增加视觉冲击力
         logo_container = QWidget()
@@ -861,11 +863,12 @@ class LoginDialog(QDialog):
 
         logo_label = QLabel("GZ安环监测系统")
         logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo_label.setFont(QFont("Microsoft YaHei", 32, QFont.Weight.Bold))
+        # v5.56：32pt 在固定窗口内被垂直裁顶，降到 24pt 并减小内边距
+        logo_label.setFont(QFont("Microsoft YaHei", 24, QFont.Weight.Bold))
         logo_label.setStyleSheet(f"""
             color: {COLORS['secondary']};
             background: transparent;
-            padding: 10px;
+            padding: 4px;
         """)
         logo_layout.addWidget(logo_label)
 
@@ -913,7 +916,11 @@ class LoginDialog(QDialog):
         account_list_widget.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents)
         account_list_widget.setRowCount(len(self.accounts))
-        account_list_widget.setMaximumHeight(220)
+        # v5.56：账户行被挤压不可见——给表格最小高度、固定行高并启用换行
+        account_list_widget.setMinimumHeight(210)
+        account_list_widget.verticalHeader().setDefaultSectionSize(40)
+        account_list_widget.setWordWrap(True)
+        account_list_widget.setMaximumHeight(265)
         account_list_widget.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # 允许双击编辑企业名称与密码
         account_list_widget.setEditTriggers(
