@@ -4556,23 +4556,22 @@ class MainWindow(QMainWindow):
         from param_units import (
             get_param_unit, calc_emission_rate, find_flow_code,
             format_emission_rate, is_concentration_param,
-            extract_emission_mass, pick_flow_code,
+            extract_emission_mass, pick_flow_code, EMISSION_UNIT,
         )
         code_to_display = {code: CODE_TO_NAME.get(code, code) for code in code_list}
 
         # 检查是否为热电厂废气
         is_thermal_power = getattr(self, '_history_is_thermal_power', False)
 
-        # 只显示有代码的参数（表头带单位：'二氧化硫(mg/m³)'）
-        display_params_filtered = []
+        # 只显示有代码的参数（名称与单位分开保存，避免单位重复拼接）
+        display_param_names = []     # 纯参数名：非甲烷总烃
+        display_param_units = []     # 单位：mg/m³ / m³ / ℃ …
         display_param_codes = []
         for code in code_list:
             if not code:
                 continue
-            pname = code_to_display.get(code, code)
-            unit = get_param_unit(code)
-            display_params_filtered.append(
-                f"{pname}({unit})" if unit else pname)
+            display_param_names.append(code_to_display.get(code, code))
+            display_param_units.append(get_param_unit(code))
             display_param_codes.append(code)
 
         # v5.49：本排口流量参数 code（排放量 = 浓度 × 流量）
@@ -4580,26 +4579,39 @@ class MainWindow(QMainWindow):
         # 否则总排口这类多流量参数排口排放量整列为 '--'
         flow_code = pick_flow_code(rows, code_list) or find_flow_code(code_list)
 
-        if is_thermal_power:
-            # 热电厂废气：时间 + 每参数[实测, 折算, 排放量]
-            total_cols = 1 + len(display_params_filtered) * 3
-            headers = ["时间"]
-            for param, code in zip(display_params_filtered, display_param_codes):
-                headers.append(f"{param}(实测)")
-                headers.append(f"{param}(折算)")
-                # v5.63：排放量单位是 kg，不再误标为浓度单位
-                headers.append(f"{param}(kg)(排放量)"
-                               if is_concentration_param(code)
-                               else f"{param}(排放量)")
-        else:
-            # 非热电厂：时间 + 每参数[实测, 排放量]
-            total_cols = 1 + len(display_params_filtered) * 2
-            headers = ["时间"]
-            for param, code in zip(display_params_filtered, display_param_codes):
-                headers.append(f"{param}(实测)")
-                headers.append(f"{param}(kg)(排放量)"
-                               if is_concentration_param(code)
-                               else f"{param}(排放量)")
+        # v5.65：表头改写为「参数名+字段(单位)」的清晰形式，
+        # 例如「非甲烷总烃实测(mg/m³)」「非甲烷总烃排放量(kg)」，
+        # 彻底消除「(mg/m³)(mg/m³)(kg)(排放量)」这类重复堆叠。
+        def _hdr_measured(name, unit):
+            return f"{name}实测({unit})" if unit else f"{name}实测"
+
+        def _hdr_corrected(name, unit):
+            return f"{name}折算({unit})" if unit else f"{name}折算"
+
+        def _hdr_emission(name, code):
+            if is_concentration_param(code):
+                return f"{name}排放量({EMISSION_UNIT})"
+            return f"{name}排放量"
+
+        # v5.65：动态列布局——只有"浓度类"参数才生成「折算/排放量」列；
+        # 流量、温度、含氧量、流速、湿度、压力等过程参数只保留实测列，
+        # 避免出现「烟气流量排放量」这类没有物理意义的列。
+        col_plan = []      # [(code, base_col, with_cvt, with_emis)]
+        headers = ["时间"]
+        col = 1
+        for name, unit, code in zip(display_param_names, display_param_units,
+                                    display_param_codes):
+            conc = is_concentration_param(code)
+            with_cvt = bool(is_thermal_power) and conc
+            with_emis = conc
+            headers.append(_hdr_measured(name, unit))
+            if with_cvt:
+                headers.append(_hdr_corrected(name, unit))
+            if with_emis:
+                headers.append(_hdr_emission(name, code))
+            col_plan.append((code, col, with_cvt, with_emis))
+            col += 1 + int(with_cvt) + int(with_emis)
+        total_cols = col
 
         self.history_table.setColumnCount(total_cols)
         self.history_table.setHorizontalHeaderLabels(headers)
@@ -4642,44 +4654,25 @@ class MainWindow(QMainWindow):
         self.history_table.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             self.history_table.setItem(row_idx, 0, QTableWidgetItem(row.get('DateTime', '')))
-            if is_thermal_power:
-                # 热电厂废气：每个参数3列（实测 + 折算 + 排放量）
-                for col_idx, code in enumerate(code_list):
-                    base_col = 1 + col_idx * 3
-                    val_key = f"val_{code}"
-                    cvt_key = f"cvt_{code}"
-                    val = row.get(val_key)
-                    cvt = row.get(cvt_key)
-                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(_fmt_val(val)))
-                    self.history_table.setItem(row_idx, base_col + 1, QTableWidgetItem(_fmt_val(cvt)))
-                    # 排放量：服务端字段优先，取不到再按 实测浓度×累计流量 计算
-                    emis = None
-                    if is_concentration_param(code):
-                        emis = extract_emission_mass(row, code)
-                        # v5.51：排放量用**实测值**，不用折算值。
-                        # 网页端实证：SO2 实测13.7×127021/1e6=1.74 与网页一致；
-                        # 若用折算14.5 则得 1.84，不符。
-                        if emis is None and val not in (None, '', '--'):
-                            emis = calc_emission_rate(val, _row_flow(row), code)
+            # v5.65：按 col_plan 动态填列（浓度类才有 折算/排放量 列）
+            for code, base_col, with_cvt, with_emis in col_plan:
+                val = row.get(f"val_{code}")
+                self.history_table.setItem(
+                    row_idx, base_col, QTableWidgetItem(_fmt_val(val)))
+                c = base_col + 1
+                if with_cvt:
                     self.history_table.setItem(
-                        row_idx, base_col + 2,
-                        QTableWidgetItem(format_emission_rate(emis)))
-            else:
-                # 非热电厂：每个参数2列（实测 + 排放量）
-                for col_idx, code in enumerate(code_list):
-                    base_col = 1 + col_idx * 2
-                    val_key = f"val_{code}"
-                    val = row.get(val_key)
-                    self.history_table.setItem(row_idx, base_col, QTableWidgetItem(_fmt_val(val)))
-                    emis = None
-                    if is_concentration_param(code):
-                        # v5.50：服务端字段优先，取不到再计算
-                        emis = extract_emission_mass(row, code)
-                        if emis is None and val not in (None, '', '--'):
-                            emis = calc_emission_rate(val, _row_flow(row), code)
+                        row_idx, c,
+                        QTableWidgetItem(_fmt_val(row.get(f"cvt_{code}"))))
+                    c += 1
+                if with_emis:
+                    # 排放量：服务端字段优先，取不到再按 实测浓度×累计流量 计算。
+                    # v5.51：用实测值（网页端口径），不用折算值。
+                    emis = extract_emission_mass(row, code)
+                    if emis is None and val not in (None, '', '--'):
+                        emis = calc_emission_rate(val, _row_flow(row), code)
                     self.history_table.setItem(
-                        row_idx, base_col + 1,
-                        QTableWidgetItem(format_emission_rate(emis)))
+                        row_idx, c, QTableWidgetItem(format_emission_rate(emis)))
         self.history_table.setUpdatesEnabled(True)
         self.history_table.resizeRowsToContents()
 
@@ -4764,15 +4757,33 @@ class MainWindow(QMainWindow):
             codes_str = getattr(self, '_history_codes', '')
             code_list = [c.strip() for c in codes_str.split(',') if c.strip()]
             from data_processor import CODE_TO_NAME
+            from param_units import (
+                get_param_unit, calc_emission_mass, is_concentration_param,
+                pick_flow_code,
+            )
             code_to_display = {code: CODE_TO_NAME.get(code, code) for code in code_list}
+            # v5.65：导出与界面口径一致——浓度列标单位，并补充排放量(kg)列
+            flow_code = pick_flow_code(all_rows, code_list)
 
             # 构建数据记录
             records = []
             for row in all_rows:
                 record = {"时间": row.get('DateTime', '')}
                 for code in code_list:
+                    name = code_to_display.get(code, code)
+                    unit = get_param_unit(code)
                     val = row.get(f"val_{code}")
-                    record[code_to_display.get(code, code)] = val if val is not None else ""
+                    if val in (None, '', '--', '-9999', -9999):
+                        val = ""
+                    mkey = f"{name}实测({unit})" if unit else f"{name}实测"
+                    record[mkey] = val
+                    if is_concentration_param(code):
+                        mass = None
+                        if flow_code and val != "":
+                            mass = calc_emission_mass(
+                                val, row.get(f"val_{flow_code}"), code)
+                        record[f"{name}排放量(kg)"] = (
+                            round(mass, 4) if mass is not None else "")
                 records.append(record)
 
             df = pd.DataFrame(records)
@@ -4896,7 +4907,7 @@ class MainWindow(QMainWindow):
             ws1 = wb.active
             ws1.title = "预测汇总"
             sum_headers = ["企业", "排放口", "参数", "预测类型", "当前/基线预测值",
-                           "趋势", "趋势率(%)", "置信度", "预警等级",
+                           "数值单位", "趋势", "趋势率(%)", "置信度", "预警等级",
                            "数据来源", "基线方式", "自学习样本"]
             ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(sum_headers))
             t1 = ws1.cell(row=1, column=1)
@@ -4914,10 +4925,24 @@ class MainWindow(QMainWindow):
             r = 4
             for p in preds:
                 src = p.get('data_source', '')
+                # v5.65：明确数值单位——日排放量预测为 kg/天，小时/日均预测为浓度单位
+                if p.get('pred_type') == '日排放量预测':
+                    val_unit = 'kg/天'
+                else:
+                    val_unit = ''
+                    try:
+                        from data_processor import NAME_TO_CODE as _N2C
+                        from param_units import get_param_unit as _gpu
+                        _c = _N2C.get(p.get('param', ''))
+                        if _c:
+                            val_unit = _gpu(_c)
+                    except Exception:  # noqa
+                        val_unit = ''
                 row_vals = [
                     p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''),
                     p.get('pred_type', ''),
                     p.get('cur_pred') if p.get('cur_pred') is not None else p.get('predicted'),
+                    val_unit,
                     p.get('trend', ''), p.get('trend_rate', 0),
                     p.get('confidence', 0), p.get('warning_level', ''),
                     src, base_mode, calib.get('samples', 0),
@@ -4931,7 +4956,7 @@ class MainWindow(QMainWindow):
                 r += 1
             for ci in range(1, len(sum_headers) + 1):
                 ws1.column_dimensions[get_column_letter(ci)].width = 16
-            ws1.column_dimensions[get_column_letter(10)].width = 22
+            ws1.column_dimensions[get_column_letter(11)].width = 22
 
             # ── Sheet2 小时预测明细 ──
             hourly = [p for p in preds if p.get('pred_type') == '小时数据预测'
@@ -4944,8 +4969,9 @@ class MainWindow(QMainWindow):
                         lbl = s.get('label', f"+{s.get('hour_offset','?')}h")
                         if lbl not in step_labels:
                             step_labels.append(lbl)
-                h_headers = ["企业", "排放口", "参数"] + \
-                            [f"{l}预测值" for l in step_labels] + \
+                # v5.65：小时明细是**浓度**预测，表头明确标注并给出单位列
+                h_headers = ["企业", "排放口", "参数", "浓度单位"] + \
+                            [f"{l}预测浓度" for l in step_labels] + \
                             [f"{l}置信度" for l in step_labels] + \
                             ["趋势", "趋势率(%)", "预警等级"]
                 self._write_pred_sheet(ws2, h_headers, hourly, "小时预测明细",
@@ -5009,7 +5035,18 @@ class MainWindow(QMainWindow):
         r = 4
         for p in preds:
             if kind == 'hourly':
-                base = [p.get('ent_name', ''), p.get('subname', ''), p.get('param', '')]
+                # v5.65：增加「浓度单位」列，与"预测浓度"表头对应
+                _u = ''
+                try:
+                    from data_processor import NAME_TO_CODE as _N2C2
+                    from param_units import get_param_unit as _gpu2
+                    _c2 = _N2C2.get(p.get('param', ''))
+                    if _c2:
+                        _u = _gpu2(_c2)
+                except Exception:  # noqa
+                    _u = ''
+                base = [p.get('ent_name', ''), p.get('subname', ''),
+                        p.get('param', ''), _u]
                 step_vals = []
                 conf_vals = []
                 fmap = {s.get('label'): s for s in p.get('future_preds', [])}
@@ -6167,7 +6204,18 @@ class MainWindow(QMainWindow):
             self.pred_table.setItem(row_idx, 0, item0)
 
             # ── 列1：参数 ────────────────────────────────────────────────────
-            item1 = QTableWidgetItem(p.get('param', ''))
+            # v5.65：小时预测值为**浓度**，参数名后附单位，避免与排放量(kg)混淆
+            _pname = p.get('param', '')
+            _punit = ''
+            try:
+                from data_processor import NAME_TO_CODE as _N2C
+                from param_units import get_param_unit as _gpu
+                _pcode = _N2C.get(_pname)
+                if _pcode:
+                    _punit = _gpu(_pcode)
+            except Exception:  # noqa
+                _punit = ''
+            item1 = QTableWidgetItem(f"{_pname}({_punit})" if _punit else _pname)
             item1.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.pred_table.setItem(row_idx, 1, item1)
 
