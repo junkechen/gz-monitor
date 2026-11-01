@@ -553,6 +553,14 @@ class PredictionWorker(QThread):
                             # 根据最近数据趋势自动识别干预状态，而非仅看当前是否超标
                             cur_mean = sum(input_values) / len(input_values) if input_values else 0
                             threshold = self.thresholds.get(param_name, 0) if param_name in self.thresholds else 0
+                            # v5.62：阈值可能是 (下限, 上限) 元组，必须取上限后再比较，
+                            # 否则 tuple > int 抛 TypeError，整个排放口预测被跳过
+                            if isinstance(threshold, (tuple, list)):
+                                threshold = threshold[1] if len(threshold) > 1 else threshold[0]
+                            try:
+                                threshold = float(threshold)
+                            except (TypeError, ValueError):
+                                threshold = 0
 
                             # 更新干预状态机，获取干预参数
                             if cur_mean > 0 and threshold > 0:
@@ -5804,6 +5812,13 @@ class MainWindow(QMainWindow):
                     # 根据最近数据趋势自动识别干预状态，而非仅看当前是否超标
                     cur_mean = sum(input_values) / len(input_values) if input_values else 0
                     threshold = self.thresholds.get(param_name, 0) if param_name in self.thresholds else 0
+                    # v5.62：同 run() 内修复——元组阈值取上限，避免 TypeError
+                    if isinstance(threshold, (tuple, list)):
+                        threshold = threshold[1] if len(threshold) > 1 else threshold[0]
+                    try:
+                        threshold = float(threshold)
+                    except (TypeError, ValueError):
+                        threshold = 0
 
                     # 更新干预状态机，获取干预参数
                     if cur_mean > 0 and threshold > 0:

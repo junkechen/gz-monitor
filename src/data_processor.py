@@ -587,6 +587,25 @@ def predict_next_hour_value(minute_values: List[float]) -> dict:
     }
 
 
+def _norm_threshold(threshold):
+    """阈值归一化：兼容 (下限, 上限) 元组/列表，统一返回上限 float 或 None。
+
+    v5.62：self.thresholds 里部分参数存的是元组，直接参与 ``> 0`` 比较会抛
+    TypeError（tuple > int），导致整个排放口预测被跳过。
+    """
+    if threshold is None:
+        return None
+    if isinstance(threshold, (tuple, list)):
+        try:
+            return float(threshold[1]) if len(threshold) > 1 else float(threshold[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+    try:
+        return float(threshold)
+    except (TypeError, ValueError):
+        return None
+
+
 def predict_future_hours(minute_values: List[float], horizon: int = 3,
                           intervention_params: dict = None,
                           threshold: float = None,
@@ -643,6 +662,9 @@ def predict_future_hours(minute_values: List[float], horizon: int = 3,
     """
     if horizon < 1:
         horizon = 1
+
+    # v5.62：阈值可能是元组，统一取上限，避免后续比较抛 TypeError
+    threshold = _norm_threshold(threshold)
 
     results = []
 
@@ -978,6 +1000,8 @@ def predict_daily_emission(hour_values: List[float],
         dict（在原有字段基础上新增 'baseline_mode' 字段，描述所用基线方式）。
     """
     horizon_days = max(1, int(horizon_days or 1))
+    # v5.62：阈值兼容元组（取上限）
+    threshold = _norm_threshold(threshold)
 
     empty = {
         'predicted': None, 'future_daily': [], 'dates': [], 'confidences': [],
@@ -1359,10 +1383,13 @@ def check_threshold(value: float, param_name: str, thresholds: dict) -> bool:
     """检查是否超过预警阈值"""
     if param_name not in thresholds:
         return False
-    threshold = thresholds[param_name]
+    threshold = _norm_threshold(thresholds[param_name])
     if threshold is None:
         return False
-    return value > threshold
+    try:
+        return float(value) > threshold
+    except (TypeError, ValueError):
+        return False
 
 
 def get_warning_level(value: float, param_name: str, thresholds: dict) -> str:
