@@ -798,6 +798,10 @@ class PredictionWorker(QThread):
                             continue
 
                         future_daily = fc.get('future_daily', [])
+                        # v5.64：最近一天实测排放量（kg），用于表格对照，
+                        # 让用户一眼看出"预测值到底是不是同一口径"
+                        last_actual = daily_values[-1] if daily_values else None
+                        last_actual_date = str(daily_dates[-1])[:10] if daily_dates else ''
                         # v5.63：诊断日志——便于核对日预测的数值口径（排放量 kg/天）
                         logger.info(
                             f"[PRED_DAILY] {subname}/{param_name} 排放量(kg/天) "
@@ -807,7 +811,8 @@ class PredictionWorker(QThread):
                             f"D+1={future_daily[0] if future_daily else None} "
                             f"D+N={future_daily[-1] if future_daily else None} "
                             f"流量code={flow_code} 参考流量={flow_ref} "
-                            f"基线方式={fc.get('baseline_mode')} 来源={daily_source}")
+                            f"基线方式={fc.get('baseline_mode')} 来源={daily_source} "
+                            f"近5天={[round(v, 3) for v in daily_values[-5:]]}")
                         # 取预测期内的最高预警等级（排放量 ÷ 日流量 → 浓度口径）
                         wl = "正常"
                         level_order = {"正常": 0, "黄色预警": 1,
@@ -839,6 +844,9 @@ class PredictionWorker(QThread):
                             'is_emission': True,
                             'flow_ref': flow_ref,
                             'divisor': divisor,
+                            # v5.64：最近一天实测排放量(kg)，表格「最近实测」列对照
+                            'last_actual': last_actual,
+                            'last_actual_date': last_actual_date,
                             # v5.49：流量值用于排放量计算（小时预测口径仍用）
                             'flow_value': self._extract_flow_value(rows, code_list)[0],
                             'flow_code': self._extract_flow_value(rows, code_list)[1],
@@ -4957,7 +4965,8 @@ class MainWindow(QMainWindow):
                     for d in (p.get('future_dates') or []):
                         if d not in day_labels:
                             day_labels.append(d)
-                d_headers = ["企业", "排放口", "参数", "基线排放量(kg)", "趋势", "趋势率(%)",
+                d_headers = ["企业", "排放口", "参数", "基线排放量(kg)",
+                             "最近实测(kg)", "趋势", "趋势率(%)",
                              "基线置信度"] + \
                             [f"{d}排放量(kg)" for d in day_labels] + ["预警等级", "数据来源"]
                 self._write_pred_sheet(ws3, d_headers, daily, "日排放量预测明细",
@@ -5014,7 +5023,8 @@ class MainWindow(QMainWindow):
                 fd = p.get('future_daily', [])
                 fd_dates = p.get('future_dates', [])
                 base = [p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''),
-                        p.get('predicted'), p.get('trend', ''), p.get('trend_rate', 0),
+                        p.get('predicted'), p.get('last_actual'),
+                        p.get('trend', ''), p.get('trend_rate', 0),
                         p.get('confidence', 0)]
                 day_vals = []
                 for d in step_labels:
@@ -6314,7 +6324,7 @@ class MainWindow(QMainWindow):
 
         # ── 构建列头（仅当天数变化时重建列结构）─────────────────────────
         # v5.63：表头显式标注口径——基线/逐日预测均为排放量 kg/天
-        labels = ["企业/排放口", "参数", "历史基线(kg)", "日均排放量(kg)"] + \
+        labels = ["企业/排放口", "参数", "历史基线(kg)", "最近实测(kg)"] + \
                  [f"D+{i}(kg)" for i in range(1, max_days + 1)] + \
                  ["趋势", "置信度", "预警状态"]
         if max_days != getattr(self, '_last_daily_days', -1):
@@ -6370,16 +6380,15 @@ class MainWindow(QMainWindow):
             item_b.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row_idx, 2, item_b)
 
-            # ── 日均排放量列（v5.49 新增，v5.50 修正口径）──────────────
-            # 日均排放量(kg) = 日均浓度 × 当日累计流量 / 分母
-            # 注：接口 val_{flow} 返回的是**期间累计流量**（非瞬时 m³/h），
-            # 故无需再乘 24（v5.49 曾误乘 24，与网页端口径不符）。
-            # v5.60：预测结果本身已是排放量(kg/天)时，直接取历史基线值。
+            # ── 最近实测列（v5.64：替代原「日均排放量」重复列）──────────
+            # 日排放量预测的数值单位是 kg/天，此列显示最近一天的**实测**排放量，
+            # 方便直接对照"预测值是否与实测同一口径"。
             emis_text = "--"
             _flow = p.get('flow_value')
             if p.get('is_emission'):
-                if base_val is not None:
-                    emis_text = f"{base_val:.3f}"
+                _la = p.get('last_actual')
+                if _la is not None:
+                    emis_text = f"{_la:.3f}"
             elif base_val is not None and _flow:
                 from param_units import (
                     calc_emission_mass, is_concentration_param,
@@ -6392,6 +6401,9 @@ class MainWindow(QMainWindow):
                         emis_text = f"{_mass:.3f}"
             item_e = QTableWidgetItem(emis_text)
             item_e.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if p.get('is_emission') and p.get('last_actual_date'):
+                item_e.setToolTip(
+                    f"{p['last_actual_date']} 实测排放量（kg）")
             table.setItem(row_idx, col_emis, item_e)
 
             # ── 逐日预测值（超标单元格加深色底）────────────────────────
