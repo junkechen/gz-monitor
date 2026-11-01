@@ -864,6 +864,9 @@ class PredictionWorker(QThread):
                             'warning_level': wl,
                             'is_warning': wl != "正常",
                             'pred_type': '日排放量预测',
+                            # v5.67：实际使用的基线描述（含自定义时间周期），供表格/导出
+                            'baseline_label': fc.get('baseline_mode', ''),
+                            'baseline_mode_key': self._baseline_mode,
                             # v5.60：结果为排放量(kg/天)，供表格/导出区分口径
                             'is_emission': True,
                             'flow_ref': flow_ref,
@@ -4925,18 +4928,20 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return {"samples": 0, "groups": 0}
             calib = _calib_stats()
-            base_mode = getattr(self, '_baseline_mode', 'auto')
+            # v5.67：基线方式改为可读描述（含自定义时间周期），不再写 auto/custom
+            base_mode = self._baseline_mode_desc()
 
             # ── Sheet1 预测汇总 ──
             ws1 = wb.active
             ws1.title = "预测汇总"
             sum_headers = ["企业", "排放口", "参数", "预测类型", "当前/基线预测值",
                            "数值单位", "趋势", "趋势率(%)", "置信度", "预警等级",
-                           "数据来源", "基线方式", "自学习样本"]
+                           "数据来源", "基线方式/时间周期", "自学习样本"]
             ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(sum_headers))
             t1 = ws1.cell(row=1, column=1)
             t1.value = (f"GZ安环监测 — 预测结果汇总（导出时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）"
-                        f"  自学习累计样本：{calib.get('samples', 0)}")
+                        f"  自学习累计样本：{calib.get('samples', 0)}"
+                        f"  基准方式：{base_mode}")
             t1.font = title_font
             t1.fill = title_fill
             t1.alignment = center
@@ -4969,7 +4974,11 @@ class MainWindow(QMainWindow):
                     val_unit,
                     p.get('trend', ''), p.get('trend_rate', 0),
                     p.get('confidence', 0), p.get('warning_level', ''),
-                    src, base_mode, calib.get('samples', 0),
+                    src,
+                    # 日预测用该行实际所用的基线（含时间段），其他类型留空
+                    p.get('baseline_label') or (
+                        base_mode if p.get('pred_type') == '日排放量预测' else ''),
+                    calib.get('samples', 0),
                 ]
                 for ci, v in enumerate(row_vals, 1):
                     c = ws1.cell(row=r, column=ci, value=v)
@@ -5017,7 +5026,7 @@ class MainWindow(QMainWindow):
                             day_labels.append(d)
                 d_headers = ["企业", "排放口", "参数", "基线排放量(kg)",
                              "最近实测(kg)", "趋势", "趋势率(%)",
-                             "基线置信度"] + \
+                             "基线置信度", "基线方式/时间周期"] + \
                             [f"{d}排放量(kg)" for d in day_labels] + ["预警等级", "数据来源"]
                 self._write_pred_sheet(ws3, d_headers, daily, "日排放量预测明细",
                                        day_labels, kind='daily', title_font=title_font,
@@ -5086,7 +5095,9 @@ class MainWindow(QMainWindow):
                 base = [p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''),
                         p.get('predicted'), p.get('last_actual'),
                         p.get('trend', ''), p.get('trend_rate', 0),
-                        p.get('confidence', 0)]
+                        p.get('confidence', 0),
+                        # v5.67：该行实际基线方式（含自定义时间段）
+                        p.get('baseline_label', '')]
                 day_vals = []
                 for d in step_labels:
                     idx = fd_dates.index(d) if d in fd_dates else -1
@@ -5139,27 +5150,44 @@ class MainWindow(QMainWindow):
             f'已切换为预测未来 {days} 天的每日排放量，请点击"开始预测"更新结果')
         print(f"[INFO] 日排放量预测天数: {days}")
 
+    def _baseline_mode_desc(self) -> str:
+        """v5.67：把当前基线设置翻译成可读描述（含自定义时间周期）。
+
+        用于预测结果提示与导出（Excel），避免只显示 auto/custom 这类内部值。
+        """
+        mode = getattr(self, '_baseline_mode', 'auto')
+        if mode == 'prev_day':
+            return '仅上一天'
+        if mode == 'last_10_workdays':
+            return '仅前10个工作日'
+        if mode == 'all_history':
+            return '全部历史(加权)'
+        if mode == 'custom':
+            cfg = _get_bl_custom_cfg()
+            if cfg.get('range_enabled') and cfg.get('range_start'):
+                return (f"自定义时间段 {cfg.get('range_start', '')}"
+                        f" 至 {cfg.get('range_end', '')}")
+            parts = []
+            if cfg.get('use_prev_day'):
+                parts.append('上一天')
+            n = int(cfg.get('use_last_n_workdays') or 0)
+            if n > 0:
+                parts.append(f'前{n}个工作日')
+            if cfg.get('use_all_history'):
+                parts.append('全部历史(加权)')
+            return '自定义(' + ('+'.join(parts) if parts else '未选来源') + ')'
+        return '上一天+前10个工作日'
+
     def _on_baseline_mode_changed(self, index):
         """v5.58 基线方式改变，映射为内部模式并提示重算。"""
         # 与下拉框顺序保持一致；第4项（⚙ 自定义...）映射到 'custom'
         mode_map = ['auto', 'prev_day', 'last_10_workdays', 'all_history', 'custom']
         self._baseline_mode = mode_map[index] if 0 <= index < len(mode_map) else 'auto'
         self.pred_table.setRowCount(0)
-        label = self.baseline_mode_combo.currentText() if hasattr(self, 'baseline_mode_combo') else ''
-        if self._baseline_mode == 'custom':
-            cfg = _get_bl_custom_cfg()
-            parts = []
-            if cfg.get('use_prev_day'):
-                parts.append('上一天')
-            n = cfg.get('use_last_n_workdays', 0)
-            if n > 0:
-                parts.append(f'前{n}个工作日')
-            if cfg.get('use_all_history'):
-                parts.append('全部历史')
-            label = '自定义(' + ('+'.join(parts) if parts else '空') + ')'
+        label = self._baseline_mode_desc()
         self.pred_result_label.setText(
             f'已切换基线方式为「{label}」，请点击"开始预测"更新结果')
-        print(f"[INFO] 日排放量基线方式: {self._baseline_mode}")
+        print(f"[INFO] 日排放量基线方式: {self._baseline_mode} / {label}")
 
     def _open_baseline_custom_dialog(self):
         """v5.58 打开自定义基线设置对话框：用户自主设置基线取值。
@@ -6541,11 +6569,19 @@ class MainWindow(QMainWindow):
 
         warn_count = sum(1 for p in predictions if p.get('is_warning'))
         total = len(predictions)
+        # v5.67：底部提示带出实际基线方式（含自定义时间周期）
+        _bl_desc = ''
+        try:
+            _bl_desc = predictions[0].get('baseline_label', '') if predictions else ''
+        except Exception:  # noqa
+            _bl_desc = ''
         if warn_count:
             summary = (f"共 {total} 条日排放量预测，其中 {warn_count} 条存在超标风险 ⚠"
+                       f"  |  基准：{_bl_desc}"
                        f"  |  声音报警：{'已开启 🔔' if self.sound_alarm_enabled else '已关闭 🔕'}")
         else:
-            summary = f"共 {total} 条日排放量预测，未来 {max_days} 天全部正常 ✅"
+            summary = (f"共 {total} 条日排放量预测，未来 {max_days} 天全部正常 ✅"
+                       f"  |  基准：{_bl_desc}")
         self.pred_result_label.setText(summary)
         table.setUpdatesEnabled(True)
         # v5.48：企业/排口名换行后行高需自适应，否则折行文字仍会被裁剪
