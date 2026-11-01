@@ -237,6 +237,28 @@ class PredictionWorker(QThread):
                     except (ValueError, TypeError):
                         pass
                 agg[vk] = (sum(vals) / len(vals)) if vals else None
+            # v5.60：按日汇总排放量 emis_{code} = Σ(小时浓度×小时累计流量)/分母。
+            # 注意流量是期间累计量，日均值无物理意义；排放量必须逐小时累加。
+            from param_units import (
+                is_concentration_param, calc_emission_mass, FLOW_CODES,
+            )
+            _day_flow_code = None
+            for vk in sorted(val_keys):
+                if vk[4:] in FLOW_CODES:
+                    _day_flow_code = vk[4:]
+                    break
+            if _day_flow_code:
+                for vk in sorted(val_keys):
+                    _c = vk[4:]
+                    if _c == _day_flow_code or not is_concentration_param(_c):
+                        continue
+                    _total = 0.0
+                    for r in rows:
+                        _m = calc_emission_mass(
+                            r.get(vk), r.get(f'val_{_day_flow_code}'), _c)
+                        if _m is not None:
+                            _total += _m
+                    agg[f'emis_{_c}'] = _total if _total > 0 else None
             out.append(agg)
         return out
 
@@ -641,40 +663,89 @@ class PredictionWorker(QThread):
                         predict_daily_emission, forecast_daily_dates,
                         get_warning_level as _gwl4,
                     )
+                    from param_units import (
+                        is_concentration_param, find_flow_code,
+                        calc_emission_mass, extract_emission_mass,
+                        get_concentration_divisor,
+                    )
                     future_dates = forecast_daily_dates(horizon_days)
+                    # v5.60：排放量计算的流量参数（日累计 m³）
+                    flow_code = find_flow_code(code_list)
 
                     for code in code_list:
                         param_name = code_to_name.get(code, code)
                         if self.prediction_params and param_name not in self.prediction_params:
                             if port_has_match:
                                 continue
+                        # v5.60：日排放量预测只针对浓度类污染物（SO2/NOx/颗粒物/
+                        # VOCs/COD/氨氮等），排除含氧量/流量/流速/烟温/烟压/
+                        # 湿度/水温/pH 等过程参数——这些参数没有"排放量"概念。
+                        if not is_concentration_param(code):
+                            continue
+                        if not flow_code:
+                            self.daily_skip_reasons.append(
+                                f"{subname}/{param_name}：该排口无流量参数，无法计算排放量")
+                            continue
+
                         val_key = f"val_{code}"
-                        daily_values = []
+                        emis_key = f"emis_{code}"
+                        daily_values = []   # 每日排放量（kg）
                         daily_dates = []
+                        daily_flows = []    # 每日累计流量（用于预警反推浓度）
                         for r in rows:
-                            raw = r.get(val_key)
-                            if raw not in (None, '', '--', 0):
+                            # 排放量取值优先级：
+                            #   1) 小时聚合行已按日汇总的 emis_{code}（Σ小时排放）
+                            #   2) 服务端排放量字段（extract_emission_mass）
+                            #   3) 日浓度 × 日累计流量 换算
+                            mass = None
+                            if daily_source == '小时数据聚合':
+                                raw_m = r.get(emis_key)
+                                if raw_m not in (None, '', '--'):
+                                    try:
+                                        mass = float(raw_m)
+                                    except (ValueError, TypeError):
+                                        mass = None
+                            if mass is None:
+                                mass = extract_emission_mass(r, code)
+                            if mass is None:
+                                mass = calc_emission_mass(
+                                    r.get(val_key), r.get(f'val_{flow_code}'), code)
+                            if mass is not None and mass > 0:
+                                daily_values.append(float(mass))
+                                daily_dates.append(r.get('DateTime'))
                                 try:
-                                    daily_values.append(float(raw))
-                                    daily_dates.append(r.get('DateTime'))
+                                    daily_flows.append(
+                                        float(r.get(f'val_{flow_code}')))
                                 except (ValueError, TypeError):
-                                    pass
+                                    daily_flows.append(None)
                         # 至少需要 3 天历史才有外推意义
                         if len(daily_values) < 3:
-                            reason = (f"{subname}/{param_name}：历史数据仅 "
+                            reason = (f"{subname}/{param_name}：历史排放量仅 "
                                       f"{len(daily_values)} 天（{daily_source}），不足 3 天")
                             self.daily_skip_reasons.append(reason)
                             logger.debug(
                                 f"[PRED_WORKER] {subname}/{param_name}: "
-                                f"日数据仅 {len(daily_values)} 天，不足以预测")
+                                f"日排放量仅 {len(daily_values)} 天，不足以预测")
                             continue
 
-                        threshold = self.thresholds.get(param_name)
-                        if isinstance(threshold, tuple):
-                            threshold = threshold[1]      # 元组取上限
+                        # 预警仍按浓度口径：用最近有值的日流量把 kg 反推回 mg/m³
+                        divisor = get_concentration_divisor(code)
+                        flow_ref = None
+                        for f in reversed(daily_flows):
+                            if f:
+                                flow_ref = f
+                                break
+                        conc_threshold = self.thresholds.get(param_name)
+                        if isinstance(conc_threshold, tuple):
+                            conc_threshold = conc_threshold[1]   # 元组取上限
+                        # 排放量封顶（kg）= 浓度限值(mg/m³) × 参考日流量(m³) / 分母
+                        kg_threshold = None
+                        if conc_threshold and flow_ref and divisor:
+                            kg_threshold = conc_threshold * flow_ref / divisor
+
                         fc = predict_daily_emission(
                             daily_values, horizon_days=horizon_days,
-                            threshold=threshold,
+                            threshold=kg_threshold,
                             dates=daily_dates,
                             baseline_mode=self._baseline_mode,
                             accumulate_feedback=True,
@@ -684,12 +755,15 @@ class PredictionWorker(QThread):
                             continue
 
                         future_daily = fc.get('future_daily', [])
-                        # 取预测期内的最高预警等级
+                        # 取预测期内的最高预警等级（排放量 ÷ 日流量 → 浓度口径）
                         wl = "正常"
                         level_order = {"正常": 0, "黄色预警": 1,
                                        "橙色预警": 2, "红色预警": 3}
                         for dval in future_daily:
-                            lv = _gwl4(dval, param_name, self.thresholds)
+                            if dval is None or not flow_ref or not divisor:
+                                continue
+                            conc_equiv = dval * divisor / flow_ref
+                            lv = _gwl4(conc_equiv, param_name, self.thresholds)
                             if level_order.get(lv, 0) > level_order.get(wl, 0):
                                 wl = lv
 
@@ -708,7 +782,11 @@ class PredictionWorker(QThread):
                             'warning_level': wl,
                             'is_warning': wl != "正常",
                             'pred_type': '日排放量预测',
-                            # v5.49：流量值用于排放量计算
+                            # v5.60：结果为排放量(kg/天)，供表格/导出区分口径
+                            'is_emission': True,
+                            'flow_ref': flow_ref,
+                            'divisor': divisor,
+                            # v5.49：流量值用于排放量计算（小时预测口径仍用）
                             'flow_value': self._extract_flow_value(rows, code_list)[0],
                             'flow_code': self._extract_flow_value(rows, code_list)[1],
                             # v5.47：标注数据来源，便于用户判断可信度
@@ -4817,9 +4895,9 @@ class MainWindow(QMainWindow):
                     for d in (p.get('future_dates') or []):
                         if d not in day_labels:
                             day_labels.append(d)
-                d_headers = ["企业", "排放口", "参数", "基线值", "趋势", "趋势率(%)",
+                d_headers = ["企业", "排放口", "参数", "基线排放量(kg)", "趋势", "趋势率(%)",
                              "基线置信度"] + \
-                            [f"{d}预测" for d in day_labels] + ["预警等级", "数据来源"]
+                            [f"{d}排放量(kg)" for d in day_labels] + ["预警等级", "数据来源"]
                 self._write_pred_sheet(ws3, d_headers, daily, "日排放量预测明细",
                                        day_labels, kind='daily', title_font=title_font,
                                        title_fill=title_fill, header_fill=header_fill,
@@ -6166,9 +6244,13 @@ class MainWindow(QMainWindow):
             # 日均排放量(kg) = 日均浓度 × 当日累计流量 / 分母
             # 注：接口 val_{flow} 返回的是**期间累计流量**（非瞬时 m³/h），
             # 故无需再乘 24（v5.49 曾误乘 24，与网页端口径不符）。
+            # v5.60：预测结果本身已是排放量(kg/天)时，直接取历史基线值。
             emis_text = "--"
             _flow = p.get('flow_value')
-            if base_val is not None and _flow:
+            if p.get('is_emission'):
+                if base_val is not None:
+                    emis_text = f"{base_val:.3f}"
+            elif base_val is not None and _flow:
                 from param_units import (
                     calc_emission_mass, is_concentration_param,
                 )
@@ -6193,8 +6275,18 @@ class MainWindow(QMainWindow):
                     txt = self._fmt_pred_val(dval)
                     if dval is not None and dconf > 0:
                         txt += f"\n({dconf*100:.0f}%)"
-                    level = get_warning_level(dval, param_name,
-                                              self.thresholds) if dval is not None else "正常"
+                    # v5.60：排放量(kg)反推回浓度口径再做预警分级
+                    if dval is not None:
+                        if (p.get('is_emission') and p.get('flow_ref')
+                                and p.get('divisor')):
+                            level = get_warning_level(
+                                dval * p['divisor'] / p['flow_ref'],
+                                param_name, self.thresholds)
+                        else:
+                            level = get_warning_level(dval, param_name,
+                                                      self.thresholds)
+                    else:
+                        level = "正常"
                 else:
                     dval = None
                     txt = "—"
