@@ -137,7 +137,7 @@ class PredictionWorker(QThread):
                  get_subtype_code_fn, is_water_sub_fn,
                  code_to_name_map, intervention_sm=None,
                  get_sub_itemcodes_fn=None, daily_forecast_days=7,
-                 cache_lock=None):
+                 cache_lock=None, baseline_mode='auto'):
         super().__init__()
         self.grouped_data = grouped_data
         self.multi_client = multi_client
@@ -156,6 +156,8 @@ class PredictionWorker(QThread):
         self._cache_lock = cache_lock
         # v5.46：日排放量预测的未来天数
         self.daily_forecast_days = daily_forecast_days
+        # v5.58：日排放量预测的基线方式（auto/prev_day/last_10_workdays/all_history/custom）
+        self._baseline_mode = baseline_mode or 'auto'
         # v5.47：日排放量预测被跳过的原因（供 UI 提示，避免"无结果却不知为何"）
         self.daily_skip_reasons = []
 
@@ -5347,6 +5349,7 @@ class MainWindow(QMainWindow):
             get_sub_itemcodes_fn=self._get_sub_itemcodes,
             daily_forecast_days=getattr(self, 'daily_forecast_days', 7),
             cache_lock=self._cache_lock,
+            baseline_mode=getattr(self, '_baseline_mode', 'auto'),
         )
         self._pred_worker.prediction_done.connect(
             lambda preds: self._on_prediction_worker_done(preds, pred_type, silent)
@@ -6575,6 +6578,7 @@ class MainWindow(QMainWindow):
                 intervention_sm=getattr(self, '_intervention_sm', None),
                 get_sub_itemcodes_fn=self._get_sub_itemcodes,
                 cache_lock=self._cache_lock,
+                baseline_mode=getattr(self, '_baseline_mode', 'auto'),
             )
             # 用默认参数 pn=param_name 固化闭包，避免循环变量延迟绑定
             worker.prediction_done.connect(
