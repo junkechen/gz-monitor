@@ -279,8 +279,9 @@ class PredictionWorker(QThread):
         Returns:
             (flow_value, flow_code)：任一为空表示无法计算排放量
         """
-        from param_units import find_flow_code
-        flow_code = find_flow_code(code_list)
+        from param_units import find_flow_code, pick_flow_code
+        # v5.63：优先按数据可用性选流量 code（492/494/495 可能只有一个有值）
+        flow_code = pick_flow_code(rows, code_list) or find_flow_code(code_list)
         if not flow_code or not rows:
             return None, flow_code
         for r in reversed(list(rows)):
@@ -692,11 +693,12 @@ class PredictionWorker(QThread):
                     from param_units import (
                         is_concentration_param, find_flow_code,
                         calc_emission_mass, extract_emission_mass,
-                        get_concentration_divisor,
+                        get_concentration_divisor, pick_flow_code,
                     )
                     future_dates = forecast_daily_dates(horizon_days)
                     # v5.60：排放量计算的流量参数（日累计 m³）
-                    flow_code = find_flow_code(code_list)
+                    # v5.63：按数据可用性挑选，避免选中无值的 492 导致 0 天数据
+                    flow_code = pick_flow_code(rows, code_list) or find_flow_code(code_list)
 
                     for code in code_list:
                         param_name = code_to_name.get(code, code)
@@ -744,6 +746,21 @@ class PredictionWorker(QThread):
                                         float(r.get(f'val_{flow_code}')))
                                 except (ValueError, TypeError):
                                     daily_flows.append(None)
+                        # v5.63：剔除"今天"这个未过完的日期——其排放量只累计了
+                        # 几个小时，会把基线（上一天）严重拉低。保留前 2 天以上数据。
+                        try:
+                            _today = _dt.now().strftime('%Y-%m-%d')
+                            if (daily_dates and len(daily_values) >= 4
+                                    and str(daily_dates[-1])[:10] == _today):
+                                daily_values.pop()
+                                daily_dates.pop()
+                                daily_flows.pop()
+                                logger.debug(
+                                    f"[PRED_WORKER] {subname}/{param_name}: "
+                                    f"剔除未过完的当天数据，保留 {len(daily_values)} 天")
+                        except Exception:  # noqa
+                            pass
+
                         # 至少需要 3 天历史才有外推意义
                         if len(daily_values) < 3:
                             reason = (f"{subname}/{param_name}：历史排放量仅 "
@@ -781,6 +798,16 @@ class PredictionWorker(QThread):
                             continue
 
                         future_daily = fc.get('future_daily', [])
+                        # v5.63：诊断日志——便于核对日预测的数值口径（排放量 kg/天）
+                        logger.info(
+                            f"[PRED_DAILY] {subname}/{param_name} 排放量(kg/天) "
+                            f"天数={len(daily_values)} 基线={daily_values[-1]:.3f}"
+                            f"->预测基线={fc.get('predicted'):.3f} "
+                            f"趋势={fc.get('trend')}({fc.get('trend_rate')}%/天) "
+                            f"D+1={future_daily[0] if future_daily else None} "
+                            f"D+N={future_daily[-1] if future_daily else None} "
+                            f"流量code={flow_code} 参考流量={flow_ref} "
+                            f"基线方式={fc.get('baseline_mode')} 来源={daily_source}")
                         # 取预测期内的最高预警等级（排放量 ÷ 日流量 → 浓度口径）
                         wl = "正常"
                         level_order = {"正常": 0, "黄色预警": 1,
@@ -4521,7 +4548,7 @@ class MainWindow(QMainWindow):
         from param_units import (
             get_param_unit, calc_emission_rate, find_flow_code,
             format_emission_rate, is_concentration_param,
-            extract_emission_mass,
+            extract_emission_mass, pick_flow_code,
         )
         code_to_display = {code: CODE_TO_NAME.get(code, code) for code in code_list}
 
@@ -4530,6 +4557,7 @@ class MainWindow(QMainWindow):
 
         # 只显示有代码的参数（表头带单位：'二氧化硫(mg/m³)'）
         display_params_filtered = []
+        display_param_codes = []
         for code in code_list:
             if not code:
                 continue
@@ -4537,25 +4565,33 @@ class MainWindow(QMainWindow):
             unit = get_param_unit(code)
             display_params_filtered.append(
                 f"{pname}({unit})" if unit else pname)
+            display_param_codes.append(code)
 
         # v5.49：本排口流量参数 code（排放量 = 浓度 × 流量）
-        flow_code = find_flow_code(code_list)
+        # v5.63：改为按数据可用性挑选（492 无值时自动用 494/495），
+        # 否则总排口这类多流量参数排口排放量整列为 '--'
+        flow_code = pick_flow_code(rows, code_list) or find_flow_code(code_list)
 
         if is_thermal_power:
             # 热电厂废气：时间 + 每参数[实测, 折算, 排放量]
             total_cols = 1 + len(display_params_filtered) * 3
             headers = ["时间"]
-            for param in display_params_filtered:
+            for param, code in zip(display_params_filtered, display_param_codes):
                 headers.append(f"{param}(实测)")
                 headers.append(f"{param}(折算)")
-                headers.append(f"{param}(排放量)")
+                # v5.63：排放量单位是 kg，不再误标为浓度单位
+                headers.append(f"{param}(kg)(排放量)"
+                               if is_concentration_param(code)
+                               else f"{param}(排放量)")
         else:
             # 非热电厂：时间 + 每参数[实测, 排放量]
             total_cols = 1 + len(display_params_filtered) * 2
             headers = ["时间"]
-            for param in display_params_filtered:
+            for param, code in zip(display_params_filtered, display_param_codes):
                 headers.append(f"{param}(实测)")
-                headers.append(f"{param}(排放量)")
+                headers.append(f"{param}(kg)(排放量)"
+                               if is_concentration_param(code)
+                               else f"{param}(排放量)")
 
         self.history_table.setColumnCount(total_cols)
         self.history_table.setHorizontalHeaderLabels(headers)
@@ -6277,8 +6313,9 @@ class MainWindow(QMainWindow):
             max_days = max(max_days, len(p.get('future_daily', []) or []))
 
         # ── 构建列头（仅当天数变化时重建列结构）─────────────────────────
-        labels = ["企业/排放口", "参数", "历史基线", "日均排放量(kg)"] + \
-                 [f"D+{i}" for i in range(1, max_days + 1)] + \
+        # v5.63：表头显式标注口径——基线/逐日预测均为排放量 kg/天
+        labels = ["企业/排放口", "参数", "历史基线(kg)", "日均排放量(kg)"] + \
+                 [f"D+{i}(kg)" for i in range(1, max_days + 1)] + \
                  ["趋势", "置信度", "预警状态"]
         if max_days != getattr(self, '_last_daily_days', -1):
             table.setColumnCount(len(labels))

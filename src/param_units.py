@@ -222,6 +222,9 @@ def find_flow_code(code_list) -> Optional[str]:
 
     优先返回废气流量(210)，其次废水流量(492/494)。
     同一排口理论上只有一个流量参数。
+
+    注意：本函数只看参数列表、不看数据。若同一排口同时登记了 492/494/495
+    但只有其中一个有值，请改用 pick_flow_code(rows, code_list)。
     """
     for code in code_list or []:
         if normalize_code(code) == '210':
@@ -233,6 +236,64 @@ def find_flow_code(code_list) -> Optional[str]:
         if normalize_code(code) == '494':
             return '494'
     return None
+
+
+# 流量参数优先级：期间/瞬时流量优先，累计流量(495)仅在前两者无值时兜底
+_FLOW_PRIORITY = ('210', '492', '494', '495')
+
+
+def pick_flow_code(rows, code_list) -> Optional[str]:
+    """
+    按**数据可用性**挑选流量参数 code（v5.63）。
+
+    背景：部分排口同时登记了「废水流量(492)」「流量(494)」「累计流量(495)」，
+    但服务端只有其中之一有值。旧逻辑固定优先 492，导致 492 为空时排放量
+    整列显示 '--'（如总排口的 COD 排放量）。
+
+    规则：
+      1. 候选 = code_list 中属于流量类的 code；
+      2. 按 210 > 492 > 494 > 495 的优先级（同旧逻辑，仅跳过无值项），取"最近数据行有有效正值"的 code；
+      3. 都无有效值时回退静态规则（find_flow_code）。
+
+    Args:
+        rows:      数据行列表（升序，允许为空）
+        code_list: 排口参数 code 列表
+
+    Returns:
+        选中的流量 code；无流量参数时返回 None。
+    """
+    cands = []
+    for code in code_list or []:
+        c = normalize_code(code)
+        if c in _FLOW_PRIORITY and c not in cands:
+            cands.append(c)
+    if not cands:
+        return None
+
+    checked = 0
+    for r in reversed(list(rows or [])):
+        if not isinstance(r, dict):
+            continue
+        checked += 1
+        for pref in _FLOW_PRIORITY:
+            if pref not in cands:
+                continue
+            v = r.get(f'val_{pref}')
+            if v in (None, '', '--'):
+                continue
+            try:
+                if float(v) > 0:
+                    return pref
+            except (TypeError, ValueError):
+                continue
+        if checked >= 50:          # 只看最近 50 行，避免大表遍历开销
+            break
+
+    # 全无有效值：按静态优先级回退
+    for pref in _FLOW_PRIORITY:
+        if pref in cands:
+            return pref
+    return find_flow_code(code_list)
 
 
 def format_emission_rate(value) -> str:
@@ -261,5 +322,6 @@ __all__ = [
     'calc_emission_mass',
     'extract_emission_mass',
     'find_flow_code',
+    'pick_flow_code',
     'format_emission_rate',
 ]

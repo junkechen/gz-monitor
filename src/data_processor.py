@@ -1009,17 +1009,35 @@ def predict_daily_emission(hour_values: List[float],
         'data_points': 0, 'data_completeness': 0, 'method': 'none',
     }
 
-    vals = [v for v in (hour_values or []) if v is not None]
-    if not vals:
+    # v5.63：值与日期成对处理——过滤异常值/空值时同步丢弃对应日期，
+    # 否则 vals 与 dates 错位，导致「上一天 / 前N工作日 / 时间段」基线取错。
+    _raw = list(hour_values or [])
+    _dts = list(dates) if dates is not None else []
+    _paired = (len(_dts) == len(_raw))
+    pairs = []
+    for i, v in enumerate(_raw):
+        if v is None:
+            continue
+        pairs.append((v, _dts[i] if _paired else None))
+    if not pairs:
         return empty
 
+    vals = [p[0] for p in pairs]
     n = len(vals)
 
     # ── 1. 异常值过滤（与小时预测一致，仅在数据量足够时启用）───────────────
     if n >= 7:
-        filtered = _filter_outliers(vals, method='iqr', threshold=1.5)
-        if len(filtered) >= n * 0.6:
-            vals = filtered
+        sv = sorted(vals)
+        q1 = sv[len(sv) // 4]
+        q3 = sv[3 * len(sv) // 4]
+        iqr = q3 - q1
+        lo = q1 - 3.0 * iqr
+        hi = q3 + 3.0 * iqr
+        kept = [p for p in pairs if lo <= p[0] <= hi]
+        if len(kept) >= n * 0.6:
+            pairs = kept
+    vals = [p[0] for p in pairs]
+    dates = [p[1] for p in pairs]
     n = len(vals)
     if n == 0:
         return empty
