@@ -253,6 +253,20 @@ class PredictionWorker(QThread):
                     _day_flow_code = vk[4:]
                     break
             if _day_flow_code:
+                # v5.66：当日总流量 = Σ 逐时流量（m³）。
+                # 小时数据里 val_flow 是"该小时通过量"，日均值没有物理意义；
+                # 计算限值封顶/预警反推必须用**当日累计流量**，否则会低估 24 倍，
+                # 导致预测被错误封顶、浓度反推虚高误报红色预警。
+                _flow_total = 0.0
+                for r in rows:
+                    try:
+                        _fv = float(r.get(f'val_{_day_flow_code}'))
+                    except (ValueError, TypeError):
+                        continue
+                    if _fv > 0:
+                        _flow_total += _fv
+                if _flow_total > 0:
+                    agg[f'flowsum_{_day_flow_code}'] = _flow_total
                 for vk in sorted(val_keys):
                     _c = vk[4:]
                     if _c == _day_flow_code or not is_concentration_param(_c):
@@ -741,11 +755,21 @@ class PredictionWorker(QThread):
                             if mass is not None and mass > 0:
                                 daily_values.append(float(mass))
                                 daily_dates.append(r.get('DateTime'))
+                                # v5.66：当日累计流量（m³）——小时聚合行用逐时累加，
+                                # 日数据行本身即当期累计量
+                                _flow_day = None
                                 try:
-                                    daily_flows.append(
-                                        float(r.get(f'val_{flow_code}')))
+                                    if daily_source == '小时数据聚合':
+                                        _flow_day = float(
+                                            r.get(f'flowsum_{flow_code}'))
+                                    else:
+                                        _flow_day = float(
+                                            r.get(f'val_{flow_code}'))
                                 except (ValueError, TypeError):
-                                    daily_flows.append(None)
+                                    _flow_day = None
+                                if _flow_day is not None and _flow_day <= 0:
+                                    _flow_day = None
+                                daily_flows.append(_flow_day)
                         # v5.63：剔除"今天"这个未过完的日期——其排放量只累计了
                         # 几个小时，会把基线（上一天）严重拉低。保留前 2 天以上数据。
                         try:
