@@ -8,6 +8,7 @@ import sys
 import os
 import time
 import gc
+import json
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -31,6 +32,49 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+# ── v5.58 自定义基线配置持久化（用户自主设置，独立于预测算法）─────────────
+def _baseline_custom_path() -> str:
+    """返回自定义基线配置文件路径（data/baseline_custom.json）。"""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "data", "baseline_custom.json")
+
+
+def _get_bl_custom_cfg() -> dict:
+    """读取自定义基线配置，损坏/缺失时返回默认（上一天+前10个工作日）。"""
+    default = {'use_prev_day': True, 'use_last_n_workdays': 10,
+               'use_all_history': False}
+    try:
+        p = _baseline_custom_path()
+        if not os.path.exists(p):
+            return dict(default)
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return dict(default)
+        return {
+            'use_prev_day': bool(data.get('use_prev_day', default['use_prev_day'])),
+            'use_last_n_workdays': max(0, min(60, int(data.get(
+                'use_last_n_workdays', default['use_last_n_workdays'])))),
+            'use_all_history': bool(data.get('use_all_history', default['use_all_history'])),
+        }
+    except Exception:  # noqa - 配置错误回退默认
+        return dict(default)
+
+
+def _save_bl_custom_cfg(cfg: dict) -> None:
+    """保存自定义基线配置到磁盘。"""
+    try:
+        p = _baseline_custom_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    except Exception:  # noqa - 保存失败静默
+        pass
 
 
 def log_performance(func):
@@ -496,7 +540,10 @@ class PredictionWorker(QThread):
 
                             from data_processor import predict_future_hours as _pfh
                             future_seq = _pfh(input_values, horizon=horizon,
-                                            intervention_params=intervention_params)
+                                            intervention_params=intervention_params,
+                                            accumulate_feedback=True,
+                                            apply_correction=True,
+                                            horizon_type='小时')
 
                         level_order = {"正常": 0, "黄色预警": 1, "橙色预警": 2, "红色预警": 3}
                         max_level = "正常"
@@ -601,11 +648,13 @@ class PredictionWorker(QThread):
                                 continue
                         val_key = f"val_{code}"
                         daily_values = []
+                        daily_dates = []
                         for r in rows:
                             raw = r.get(val_key)
                             if raw not in (None, '', '--', 0):
                                 try:
                                     daily_values.append(float(raw))
+                                    daily_dates.append(r.get('DateTime'))
                                 except (ValueError, TypeError):
                                     pass
                         # 至少需要 3 天历史才有外推意义
@@ -623,7 +672,12 @@ class PredictionWorker(QThread):
                             threshold = threshold[1]      # 元组取上限
                         fc = predict_daily_emission(
                             daily_values, horizon_days=horizon_days,
-                            threshold=threshold)
+                            threshold=threshold,
+                            dates=daily_dates,
+                            baseline_mode=self._baseline_mode,
+                            accumulate_feedback=True,
+                            apply_correction=True,
+                            horizon_type='日排放量')
                         if fc.get('predicted') is None:
                             continue
 
@@ -1383,6 +1437,22 @@ class MainWindow(QMainWindow):
         # 需要预测的参数列表（空列表 = 预测全部参数）
         self.prediction_params = []  # 空列表表示不过滤，预测所有参数
 
+        # v5.58：自定义基线配置（用户自主设置）。启动时从磁盘加载并下发到
+        # data_processor，保证『⚙ 自定义基线』跨重启保持。
+        try:
+            from data_processor import set_custom_baseline
+            set_custom_baseline(_get_bl_custom_cfg())
+        except Exception:  # noqa - 不阻塞主界面启动
+            pass
+
+        # v5.58：程序退出时强制落盘校准样本（自学习结果不丢失）
+        try:
+            import atexit
+            from prediction_calibrator import flush_now
+            atexit.register(flush_now)
+        except Exception:  # noqa
+            pass
+
         # ── 缓存与内存管理 ────────────────────────────────────────────────────
         # 预测结果缓存：用于增量更新对比，key=(ent_name, subname, param)，有上限
         self._pred_result_cache: dict = {}
@@ -1432,6 +1502,8 @@ class MainWindow(QMainWindow):
         self._pred_chart_visible = False          # 预测图所在 tab 是否可见
         self._prediction_dirty = False            # 预测触发脏标记（T04 消费）
         self._last_pred_horizon = -1              # 上次预测 horizon（用于预测表列重建判断）
+        self._baseline_mode = 'auto'              # v5.58 日排放量基线模式
+        self._last_predictions = []               # v5.58 最近一次预测结果（导出用）
         self._refresh_last_flush = 0.0            # 上次真正刷新时间（节流用，T04）
         self._refresh_timer_coalesce = None       # 节流合并定时器（T04）
         self._hist_worker = None                  # 后台历史取数 worker
@@ -2256,6 +2328,24 @@ class MainWindow(QMainWindow):
 
         pred_layout.addSpacing(10)
 
+        # v5.58 新增：导出预测结果
+        self.export_pred_btn = QPushButton("📥 导出预测")
+        self.export_pred_btn.setMinimumWidth(110)
+        self.export_pred_btn.setToolTip("将当前预测结果导出为 Excel（含未来逐日/逐时预测）")
+        self.export_pred_btn.clicked.connect(self._export_prediction)
+        pred_layout.addWidget(self.export_pred_btn)
+
+        pred_layout.addSpacing(10)
+
+        # v5.58 新增：自学习校准状态指示
+        self.pred_calib_label = QLabel("🧠 自学习: 0样本")
+        self.pred_calib_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px; padding: 4px 6px;")
+        self.pred_calib_label.setToolTip("预测算法根据实际数据自动校准：样本越多，预测越准")
+        pred_layout.addWidget(self.pred_calib_label)
+
+        pred_layout.addSpacing(10)
+
         # 自动更新开关
         chk_style = f"""
             QCheckBox {{
@@ -2325,6 +2415,33 @@ class MainWindow(QMainWindow):
         # v5.46：默认隐藏，仅在选中「日排放量预测」时显示
         self.daily_horizon_label.setVisible(False)
         self.daily_horizon_combo.setVisible(False)
+
+        # v5.58 新增：基线方式选择（仅「日排放量预测」模式有效）
+        self.baseline_mode_label = QLabel("基线方式:")
+        pred_layout.addWidget(self.baseline_mode_label)
+        self.baseline_mode_combo = QComboBox()
+        # 顺序即映射；默认第0项 = 上一天 + 前10个工作日
+        self.baseline_mode_combo.addItems([
+            "上一天+前10个工作日", "仅上一天", "仅前10个工作日",
+            "全部历史", "⚙ 自定义..."])
+        self.baseline_mode_combo.setCurrentIndex(0)
+        self.baseline_mode_combo.setFixedWidth(160)
+        self.baseline_mode_combo.setToolTip("日排放量预测的基线取值方式（默认采用上一天与前10个工作日数据）")
+        self.baseline_mode_combo.currentIndexChanged.connect(
+            self._on_baseline_mode_changed)
+        pred_layout.addWidget(self.baseline_mode_combo)
+
+        # v5.58 新增：自定义基线配置按钮（点开后设置上一天/前N工作日/全部历史）
+        self.baseline_custom_btn = QPushButton("⚙ 基准设置")
+        self.baseline_custom_btn.setFixedWidth(90)
+        self.baseline_custom_btn.setToolTip("自主设置基线取值（上一天 / 前N个工作日 / 全部历史 任意组合）")
+        self.baseline_custom_btn.clicked.connect(self._open_baseline_custom_dialog)
+        pred_layout.addWidget(self.baseline_custom_btn)
+
+        # 默认隐藏，仅在选中「日排放量预测」时显示
+        self.baseline_mode_label.setVisible(False)
+        self.baseline_mode_combo.setVisible(False)
+        self.baseline_custom_btn.setVisible(False)
 
         pred_layout.addStretch()
         pred_group.setLayout(pred_layout)
@@ -4578,6 +4695,201 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.warning(self, "导出失败", f"导出时发生错误:\n{str(e)}")
 
+    def _export_prediction(self):
+        """v5.58 导出最近一次预测结果到 Excel（含自学习/基线信息）。
+
+        生成 3 个 sheet：
+          - 预测汇总：每个（企业/排放口/参数）一行（当前/基线值、趋势、置信度、预警、数据来源）
+          - 小时预测明细：逐小时展开（+0h/+1h/...+Nh 预测值与置信度）
+          - 日排放量明细：逐日展开（未来每天日期与预测值）
+        """
+        preds = getattr(self, '_last_predictions', None)
+        if not preds:
+            QMessageBox.warning(self, "提示",
+                                "暂无预测结果可导出，请先点击「🚀 开始预测」")
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"预测结果_{ts}.xlsx"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出预测结果", default_name, "Excel Files (*.xlsx)")
+        if not file_path:
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+
+            wb = openpyxl.Workbook()
+
+            header_fill = PatternFill("solid", fgColor="3498DB")
+            header_font = Font(bold=True, color="FFFFFF", size=11)
+            title_font = Font(bold=True, size=13, color="FFFFFF")
+            title_fill = PatternFill("solid", fgColor="2C3E50")
+            center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            thin = Side(style='thin')
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            fill_even = PatternFill("solid", fgColor="EAF4FB")
+
+            # —— 自学习统计 ——
+            def _calib_stats():
+                try:
+                    from prediction_calibrator import get_stats
+                    return get_stats()
+                except Exception:
+                    return {"samples": 0, "groups": 0}
+            calib = _calib_stats()
+            base_mode = getattr(self, '_baseline_mode', 'auto')
+
+            # ── Sheet1 预测汇总 ──
+            ws1 = wb.active
+            ws1.title = "预测汇总"
+            sum_headers = ["企业", "排放口", "参数", "预测类型", "当前/基线预测值",
+                           "趋势", "趋势率(%)", "置信度", "预警等级",
+                           "数据来源", "基线方式", "自学习样本"]
+            ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(sum_headers))
+            t1 = ws1.cell(row=1, column=1)
+            t1.value = (f"GZ安环监测 — 预测结果汇总（导出时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）"
+                        f"  自学习累计样本：{calib.get('samples', 0)}")
+            t1.font = title_font
+            t1.fill = title_fill
+            t1.alignment = center
+            for ci, h in enumerate(sum_headers, 1):
+                c = ws1.cell(row=3, column=ci, value=h)
+                c.font = header_font
+                c.fill = header_fill
+                c.alignment = center
+                c.border = border
+            r = 4
+            for p in preds:
+                src = p.get('data_source', '')
+                row_vals = [
+                    p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''),
+                    p.get('pred_type', ''),
+                    p.get('cur_pred') if p.get('cur_pred') is not None else p.get('predicted'),
+                    p.get('trend', ''), p.get('trend_rate', 0),
+                    p.get('confidence', 0), p.get('warning_level', ''),
+                    src, base_mode, calib.get('samples', 0),
+                ]
+                for ci, v in enumerate(row_vals, 1):
+                    c = ws1.cell(row=r, column=ci, value=v)
+                    c.alignment = center
+                    c.border = border
+                    if r % 2 == 0:
+                        c.fill = fill_even
+                r += 1
+            for ci in range(1, len(sum_headers) + 1):
+                ws1.column_dimensions[get_column_letter(ci)].width = 16
+            ws1.column_dimensions[get_column_letter(10)].width = 22
+
+            # ── Sheet2 小时预测明细 ──
+            hourly = [p for p in preds if p.get('pred_type') == '小时数据预测'
+                      and p.get('future_preds')]
+            if hourly:
+                ws2 = wb.create_sheet("小时预测明细")
+                step_labels = []
+                for p in hourly:
+                    for s in p.get('future_preds', []):
+                        lbl = s.get('label', f"+{s.get('hour_offset','?')}h")
+                        if lbl not in step_labels:
+                            step_labels.append(lbl)
+                h_headers = ["企业", "排放口", "参数"] + \
+                            [f"{l}预测值" for l in step_labels] + \
+                            [f"{l}置信度" for l in step_labels] + \
+                            ["趋势", "趋势率(%)", "预警等级"]
+                self._write_pred_sheet(ws2, h_headers, hourly, "小时预测明细",
+                                       step_labels, kind='hourly', title_font=title_font,
+                                       title_fill=title_fill, header_fill=header_fill,
+                                       header_font=header_font, center=center,
+                                       border=border, fill_even=fill_even,
+                                       get_column_letter=get_column_letter)
+
+            # ── Sheet3 日排放量明细 ──
+            daily = [p for p in preds if p.get('pred_type') == '日排放量预测'
+                     and p.get('future_daily')]
+            if daily:
+                ws3 = wb.create_sheet("日排放量明细")
+                day_labels = []
+                for p in daily:
+                    for d in (p.get('future_dates') or []):
+                        if d not in day_labels:
+                            day_labels.append(d)
+                d_headers = ["企业", "排放口", "参数", "基线值", "趋势", "趋势率(%)",
+                             "基线置信度"] + \
+                            [f"{d}预测" for d in day_labels] + ["预警等级", "数据来源"]
+                self._write_pred_sheet(ws3, d_headers, daily, "日排放量预测明细",
+                                       day_labels, kind='daily', title_font=title_font,
+                                       title_fill=title_fill, header_fill=header_fill,
+                                       header_font=header_font, center=center,
+                                       border=border, fill_even=fill_even,
+                                       get_column_letter=get_column_letter)
+
+            wb.save(file_path)
+            QMessageBox.information(
+                self, "导出成功",
+                f"已导出 {len(preds)} 条预测结果到:\n{file_path}\n"
+                f"（含小时/日预测明细与自学习统计）")
+        except ImportError as e:
+            QMessageBox.critical(self, "导出失败", f"缺少依赖模块: {str(e)}\n请联系管理员")
+        except PermissionError:
+            QMessageBox.warning(self, "导出失败", f"文件被占用，请关闭后重试:\n{file_path}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "导出失败", f"导出时发生错误:\n{str(e)}")
+
+    def _write_pred_sheet(self, ws, headers, preds, sheet_title, step_labels, kind,
+                          title_font, title_fill, header_fill, header_font,
+                          center, border, fill_even, get_column_letter):
+        """辅助：把小时/日预测明细写入指定 sheet（统一表头/样式）。"""
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        t = ws.cell(row=1, column=1)
+        t.value = f"GZ安环监测 — {sheet_title}（导出时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）"
+        t.font = title_font
+        t.fill = title_fill
+        t.alignment = center
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row=3, column=ci, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = border
+        r = 4
+        for p in preds:
+            if kind == 'hourly':
+                base = [p.get('ent_name', ''), p.get('subname', ''), p.get('param', '')]
+                step_vals = []
+                conf_vals = []
+                fmap = {s.get('label'): s for s in p.get('future_preds', [])}
+                for lbl in step_labels:
+                    s = fmap.get(lbl, {})
+                    step_vals.append(s.get('predicted'))
+                    conf_vals.append(s.get('confidence'))
+                tail = [p.get('trend', ''), p.get('trend_rate', 0), p.get('warning_level', '')]
+                row_vals = base + step_vals + conf_vals + tail
+            else:  # daily
+                fd = p.get('future_daily', [])
+                fd_dates = p.get('future_dates', [])
+                base = [p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''),
+                        p.get('predicted'), p.get('trend', ''), p.get('trend_rate', 0),
+                        p.get('confidence', 0)]
+                day_vals = []
+                for d in step_labels:
+                    idx = fd_dates.index(d) if d in fd_dates else -1
+                    day_vals.append(fd[idx] if 0 <= idx < len(fd) else None)
+                tail = [p.get('warning_level', ''), p.get('data_source', '')]
+                row_vals = base + day_vals + tail
+            for ci, v in enumerate(row_vals, 1):
+                c = ws.cell(row=r, column=ci, value=v)
+                c.alignment = center
+                c.border = border
+                if r % 2 == 0:
+                    c.fill = fill_even
+            r += 1
+        for ci in range(1, len(headers) + 1):
+            ws.column_dimensions[get_column_letter(ci)].width = 14
+
     def _on_pred_type_changed(self, index):
         """预测类型改变 —— 清空旧结果"""
         self.pred_table.setRowCount(0)
@@ -4597,6 +4909,12 @@ class MainWindow(QMainWindow):
             self._pred_horizon_label.setVisible(is_hourly)
         if getattr(self, 'pred_horizon_combo', None) is not None:
             self.pred_horizon_combo.setVisible(is_hourly)
+        # v5.58：基线方式选择仅在「日排放量预测」时可见
+        for w in (getattr(self, 'baseline_mode_label', None),
+                  getattr(self, 'baseline_mode_combo', None),
+                  getattr(self, 'baseline_custom_btn', None)):
+            if w is not None:
+                w.setVisible(is_daily)
 
     def _on_daily_horizon_changed(self, index):
         """预测天数改变（3/7/15/30 天）"""
@@ -4607,6 +4925,103 @@ class MainWindow(QMainWindow):
         self.pred_result_label.setText(
             f'已切换为预测未来 {days} 天的每日排放量，请点击"开始预测"更新结果')
         print(f"[INFO] 日排放量预测天数: {days}")
+
+    def _on_baseline_mode_changed(self, index):
+        """v5.58 基线方式改变，映射为内部模式并提示重算。"""
+        # 与下拉框顺序保持一致；第4项（⚙ 自定义...）映射到 'custom'
+        mode_map = ['auto', 'prev_day', 'last_10_workdays', 'all_history', 'custom']
+        self._baseline_mode = mode_map[index] if 0 <= index < len(mode_map) else 'auto'
+        self.pred_table.setRowCount(0)
+        label = self.baseline_mode_combo.currentText() if hasattr(self, 'baseline_mode_combo') else ''
+        if self._baseline_mode == 'custom':
+            cfg = _get_bl_custom_cfg()
+            parts = []
+            if cfg.get('use_prev_day'):
+                parts.append('上一天')
+            n = cfg.get('use_last_n_workdays', 0)
+            if n > 0:
+                parts.append(f'前{n}个工作日')
+            if cfg.get('use_all_history'):
+                parts.append('全部历史')
+            label = '自定义(' + ('+'.join(parts) if parts else '空') + ')'
+        self.pred_result_label.setText(
+            f'已切换基线方式为「{label}」，请点击"开始预测"更新结果')
+        print(f"[INFO] 日排放量基线方式: {self._baseline_mode}")
+
+    def _open_baseline_custom_dialog(self):
+        """v5.58 打开自定义基线设置对话框：用户自主设置基线取值。
+
+        可选：上一天实测值 / 前N个工作日均值 / 全部历史加权，任意组合；
+        N 由用户自由设定（1~60）。配置持久化到 data/baseline_custom.json。
+        """
+        try:
+            from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                         QCheckBox, QSpinBox, QLabel, QPushButton)
+        except Exception:
+            return
+        cfg = _get_bl_custom_cfg()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("⚙ 自定义基线设置")
+        dlg.setMinimumWidth(360)
+        vbox = QVBoxLayout(dlg)
+
+        tip = QLabel("基线 = 预测未来每日排放量的起始参照值。\n"
+                     "可自由勾选以下来源并设定权重组合：")
+        tip.setWordWrap(True)
+        vbox.addWidget(tip)
+
+        cb_prev = QCheckBox("取【上一天】实测值")
+        cb_prev.setChecked(bool(cfg.get('use_prev_day')))
+        vbox.addWidget(cb_prev)
+
+        hbox_wd = QHBoxLayout()
+        cb_wd = QCheckBox("取前")
+        cb_wd.setChecked(cfg.get('use_last_n_workdays', 0) > 0)
+        spin_wd = QSpinBox()
+        spin_wd.setRange(1, 60)
+        spin_wd.setValue(cfg.get('use_last_n_workdays', 10) or 10)
+        spin_wd.setEnabled(cb_wd.isChecked())
+        cb_wd.toggled.connect(spin_wd.setEnabled)
+        label_wd = QLabel("个工作日均值")
+        hbox_wd.addWidget(cb_wd)
+        hbox_wd.addWidget(spin_wd)
+        hbox_wd.addWidget(label_wd)
+        hbox_wd.addStretch()
+        vbox.addLayout(hbox_wd)
+
+        cb_all = QCheckBox("取【全部历史】加权基线（早期数据权重更低）")
+        cb_all.setChecked(bool(cfg.get('use_all_history')))
+        vbox.addWidget(cb_all)
+
+        vbox.addSpacing(12)
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("确定")
+        btn_cancel = QPushButton("取消")
+        btn_box.addStretch()
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        vbox.addLayout(btn_box)
+
+        def _on_ok():
+            new_cfg = {
+                'use_prev_day': cb_prev.isChecked(),
+                'use_last_n_workdays': spin_wd.value() if cb_wd.isChecked() else 0,
+                'use_all_history': cb_all.isChecked(),
+            }
+            _save_bl_custom_cfg(new_cfg)
+            try:
+                from data_processor import set_custom_baseline
+                set_custom_baseline(new_cfg)
+            except Exception:  # noqa
+                pass
+            # 若当前已选自定义基线，立即刷新提示文字
+            if getattr(self, '_baseline_mode', 'auto') == 'custom':
+                self._on_baseline_mode_changed(self.baseline_mode_combo.currentIndex())
+            dlg.accept()
+
+        btn_ok.clicked.connect(_on_ok)
+        btn_cancel.clicked.connect(dlg.reject)
+        dlg.exec_()
 
     def _on_sound_alarm_changed(self, state):
         """声音报警开关状态改变"""
@@ -4987,6 +5402,22 @@ class MainWindow(QMainWindow):
             print(f"[PRED] 第一条预测: {all_predictions[0]}")
         else:
             print("[PRED] 警告: 预测结果为空！")
+
+        # v5.58：保存最近一次预测结果，供「📥 导出预测」使用
+        try:
+            self._last_predictions = list(all_predictions) if all_predictions else []
+        except Exception:  # noqa
+            self._last_predictions = []
+        # v5.58：刷新自学习样本计数标签
+        try:
+            from prediction_calibrator import get_stats
+            _st = get_stats()
+            lbl = getattr(self, 'pred_calib_label', None)
+            if lbl is not None:
+                lbl.setText(f"🧠 自学习: {_st.get('samples', 0)}样本 / "
+                            f"{_st.get('groups', 0)}组已校准")
+        except Exception:  # noqa
+            pass
 
         # ── 预测增量检查：对比指纹，有变化才重建UI ─────────────────────────
         def _pred_fingerprint(preds):

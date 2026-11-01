@@ -5,7 +5,7 @@ GZ安环监测系统 - 数据处理与预测模块
 
 import statistics
 import math
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Dict, Optional
 
 
@@ -589,7 +589,23 @@ def predict_next_hour_value(minute_values: List[float]) -> dict:
 
 def predict_future_hours(minute_values: List[float], horizon: int = 3,
                           intervention_params: dict = None,
-                          threshold: float = None) -> List[dict]:
+                          threshold: float = None,
+                          accumulate_feedback: bool = False,
+                          apply_correction: bool = True,
+                          horizon_type: str = '小时') -> List[dict]:
+    """
+    根据当前小时内分钟数据，预测当前小时及未来 horizon 个小时的均值序列。
+
+    v5.58 新增参数
+    --------------
+    accumulate_feedback : 是否用当前历史序列做留一法回溯，采集「预测 vs 实际」
+                          误差样本供自学习校准器使用。回溯调用本身会传 False，
+                          不会形成反馈环。
+    apply_correction    : 是否对输出预测值/置信度施加自学习校准修正。
+    horizon_type        : 校准分组键（默认 '小时'，与 calibrate 模块保持一致）。
+
+    其余参数含义见下文返回值说明。
+    """
     """
     根据当前小时内分钟数据，预测当前小时及未来 horizon 个小时的均值序列。
 
@@ -629,6 +645,13 @@ def predict_future_hours(minute_values: List[float], horizon: int = 3,
         horizon = 1
 
     results = []
+
+    # ── v5.58：自学习回溯采集 ────────────────────────────────────────────
+    # 用当前历史序列做留一法检验：用前段预测后 horizon 个点，与序列里真实
+    # 值对比，记录误差样本供校准器自我优化。递归调用关闭采集与修正，避免反馈环。
+    if accumulate_feedback and minute_values:
+        _calib_backtest_hourly(minute_values, horizon, threshold,
+                               intervention_params, horizon_type)
 
     # ── 第0条：当前小时预测 ───────────────────────────────────────────────
     cur = predict_hour_value(minute_values, method='trend', with_trend=True)
@@ -778,6 +801,19 @@ def predict_future_hours(minute_values: List[float], horizon: int = 3,
                 'data_completeness': cur.get('data_completeness', 0),
             })
 
+    # ── v5.58：施加自学习校准修正（偏差 + 置信度）────────────────────────
+    if apply_correction:
+        for i in range(1, horizon + 1):
+            if i >= len(results):
+                break
+            bias, conf_scale = _calib_correction(horizon_type, i)
+            r = results[i]
+            if r.get('predicted') is not None:
+                r['predicted'] = round(max(0.0, r['predicted'] * bias), 4)
+            if r.get('confidence') is not None:
+                r['confidence'] = round(max(0.0, min(1.0, r['confidence'] * conf_scale)), 2)
+            r['corrected'] = (bias != 1.0 or conf_scale != 1.0)
+
     return results
 
 
@@ -900,7 +936,12 @@ def predict_day_average(hour_values: List[float], current_hour: int = None, with
 
 def predict_daily_emission(hour_values: List[float],
                            horizon_days: int = 7,
-                           threshold: float = None) -> dict:
+                           threshold: float = None,
+                           dates: list = None,
+                           baseline_mode: str = 'auto',
+                           accumulate_feedback: bool = False,
+                           apply_correction: bool = True,
+                           horizon_type: str = '日排放量') -> dict:
     """
     基于历史每日排放量预测未来每日排放量。
 
@@ -908,32 +949,33 @@ def predict_daily_emission(hour_values: List[float],
       - ``predict_day_average`` 预测的是**当日**均值（当日内推）
       - 本函数预测的是**未来若干天**的每日排放量（跨日外推）
 
-    算法（加权趋势 + 日前周期性 + 置信度衰减）：
+    算法（基线 + 趋势外推 + 置信度衰减）：
       1. IQR 异常值过滤，去掉停机/异常尖峰干扰
-      2. 加权移动平均求基线（近期权重更高，指数衰减）
+      2. 基线计算（v5.58 可选，默认 = 上一天 + 前10个工作日 组合）：
+         - 'auto'（默认）：上一天值 与 前10个工作日均值 的组合平均
+         - 'prev_day'：仅取上一天（最新一天）实测值
+         - 'last_10_workdays'：仅取前10个工作日均值
+         - 'all_history'：旧逻辑，全部历史加权移动平均
+         - 'custom'：用户自主设置（上一天 / 前N个工作日 / 全部历史 任意组合）
       3. 线性回归求日环比趋势率（仅在 R² 达标时采信）
       4. 逐日外推：predicted(d) = baseline × (1 + trend_rate)^d
       5. 置信度随外推天数指数衰减，并按数据完整度/稳定性折减
+
+    v5.58 新增（自学习）：accumulate_feedback 开启留一法回溯采集；
+    apply_correction 开启偏差/置信度校准修正；horizon_type 为校准分组键。
 
     Args:
         hour_values:    历史每日排放量序列（按时间升序，允许含 None）
         horizon_days:   预测未来天数（默认 7 天）
         threshold:      排放限值。用于给预测值封顶（超标后不应无限增长），
                         上限取 threshold×1.5；None 表示不封顶。
+        dates:          与 hour_values 对齐的日期列表（'YYYY-MM-DD' 或 datetime）。
+                        用于识别工作日与"上一天"，缺失时 auto 回退 all_history。
+        baseline_mode:  基线模式（见上文）。
+        accumulate_feedback / apply_correction / horizon_type: 自学习相关。
 
     Returns:
-        dict: {
-            'predicted':      当日基线预测值（等价于 +0 天），
-            'future_daily':   [未来第1天, …, 第N天] 的预测值列表，
-            'dates':          与 future_daily 对应的日期字符串列表,
-            'confidences':    与 future_daily 对应的置信度列表,
-            'confidence':     当日基线置信度 (0-1),
-            'trend':          趋势 ('up'/'down'/'stable'),
-            'trend_rate':     日环比变化率 (%),
-            'data_points':    有效数据点数,
-            'data_completeness': 数据完整度 (0-1),
-            'method':         使用的预测方法
-        }
+        dict（在原有字段基础上新增 'baseline_mode' 字段，描述所用基线方式）。
     """
     horizon_days = max(1, int(horizon_days or 1))
 
@@ -958,11 +1000,16 @@ def predict_daily_emission(hour_values: List[float],
     if n == 0:
         return empty
 
-    # ── 2. 加权基线（近期权重更高）────────────────────────────────────────
-    # 半衰期 5 天：5 天前的数据权重减半，兼顾稳定性与时效性
-    half_life = 5.0
-    weights = [0.5 ** ((n - 1 - i) / half_life) for i in range(n)]
-    baseline = sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+    # ── v5.58：自学习回溯采集（留一法）────────────────────────────────────
+    # 用历史序列前段预测后 horizon_days 天，与真实值对比记录误差样本。
+    # 递归调用关闭采集与修正，避免反馈环。
+    if accumulate_feedback and dates is not None and n >= horizon_days + 10:
+        _calib_backtest_daily(vals, dates, horizon_days, threshold, baseline_mode,
+                              horizon_type)
+
+    # ── 2. 基线（v5.58 可选：默认 上一天 + 前10个工作日）──────────────────
+    baseline, baseline_label = _compute_daily_baseline(
+        vals, dates, baseline_mode)
 
     # ── 3. 日环比趋势率（线性回归，仅 R²≥0.25 时采信）──────────────────────
     trend_rate = 0.0
@@ -996,6 +1043,7 @@ def predict_daily_emission(hour_values: List[float],
     if n < 3:
         base_conf *= 0.5          # 数据极少时大幅折减，避免虚假高精度
 
+    raw_daily = []
     for d in range(1, horizon_days + 1):
         val = baseline * ((1.0 + daily_rate) ** d)
         # 物理量不能为负
@@ -1004,21 +1052,246 @@ def predict_daily_emission(hour_values: List[float],
         if threshold is not None and threshold > 0:
             cap = threshold * 1.5
             val = min(val, cap)
-        future_daily.append(round(val, 4))
+        raw_daily.append(val)
         # 置信度按 0.85^d 衰减（与小时预测的 0.7/小时 口径一致量级）
         confidences.append(round(max(0.0, base_conf * (0.85 ** d)), 2))
 
+    # ── v5.58：施加自学习校准修正（偏差 + 置信度）────────────────────────
+    base_bias, base_conf_scale = _calib_correction(horizon_type, 0)
+    future_daily = []
+    if apply_correction:
+        for d in range(1, horizon_days + 1):
+            bias_d, conf_scale_d = _calib_correction(horizon_type, d)
+            v = max(0.0, raw_daily[d - 1] * bias_d)
+            future_daily.append(round(v, 4))
+            if d - 1 < len(confidences):
+                confidences[d - 1] = round(
+                    max(0.0, min(1.0, confidences[d - 1] * conf_scale_d)), 2)
+        predicted_base = round(max(0.0, baseline * base_bias), 4)
+        base_conf_final = round(max(0.0, min(1.0, base_conf * base_conf_scale)), 2)
+    else:
+        future_daily = [round(v, 4) for v in raw_daily]
+        predicted_base = round(baseline, 4)
+        base_conf_final = round(max(0.0, min(1.0, base_conf)), 2)
+
     return {
-        'predicted': round(baseline, 4),
+        'predicted': predicted_base,
         'future_daily': future_daily,
         'confidences': confidences,
-        'confidence': round(max(0.0, min(1.0, base_conf)), 2),
+        'confidence': base_conf_final,
         'trend': trend,
         'trend_rate': round(trend_rate, 2),
         'data_points': n,
         'data_completeness': round(data_completeness, 2),
         'method': 'weighted_trend_daily',
+        'baseline_mode': baseline_label,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v5.58 预测自学习辅助函数（校准器桥接 + 可选基线）
+# ─────────────────────────────────────────────────────────────────────────────
+def _calib_correction(horizon_type, horizon_offset):
+    """读取校准修正 (bias, conf_scale)，异常时返回 (1.0, 1.0)。"""
+    try:
+        from prediction_calibrator import get_correction
+        return get_correction(horizon_type, horizon_offset)
+    except Exception:
+        return 1.0, 1.0
+
+
+def _calib_backtest_hourly(values, horizon, threshold, intervention_params, horizon_type):
+    """小时预测留一法回溯：用前段预测后 horizon 个点，记录实际误差样本。"""
+    try:
+        from prediction_calibrator import record_sample
+        vals = [v for v in values if v is not None]
+        need = horizon + 12
+        if len(vals) < need:
+            return
+        prefix = vals[:-horizon]
+        actual_hold = vals[-horizon:]
+        bt = predict_future_hours(prefix, horizon=horizon,
+                                  intervention_params=intervention_params,
+                                  threshold=threshold,
+                                  accumulate_feedback=False,
+                                  apply_correction=False,
+                                  horizon_type=horizon_type)
+        for i in range(1, horizon + 1):
+            if i >= len(bt):
+                break
+            pred_i = bt[i].get('predicted')
+            act_i = actual_hold[i - 1]
+            conf_i = bt[i].get('confidence', 0)
+            if pred_i is not None and act_i is not None:
+                record_sample(horizon_type, i, float(pred_i), float(act_i), float(conf_i))
+    except Exception:
+        pass
+
+
+def _parse_date(d):
+    """解析多种日期格式为 datetime.date；失败返回 None。"""
+    if d is None:
+        return None
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    s = str(d).strip()
+    if not s:
+        return None
+    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%dT%H:%M:%S'):
+        try:
+            return datetime.strptime(s[:19], fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+# ── v5.58 自定义基线（用户自主设置，持久化到 data/baseline_custom.json）──────
+# 由 main_window 通过 set_custom_baseline 写入；_compute_daily_baseline 在
+# mode=='custom' 时读取此配置。默认值与『auto』一致（上一天 + 前10个工作日）。
+_CUSTOM_BASELINE = {
+    'use_prev_day': True,        # 是否纳入上一天实测值
+    'use_last_n_workdays': 10,   # 取前 N 个工作日求均值（0 表示不取）
+    'use_all_history': False,    # 是否纳入全部历史加权基线
+}
+
+
+def set_custom_baseline(cfg: dict) -> None:
+    """写入用户自定义基线配置（仅接受已知字段，异常忽略）。"""
+    global _CUSTOM_BASELINE
+    try:
+        if not isinstance(cfg, dict):
+            return
+        merged = dict(_CUSTOM_BASELINE)
+        if 'use_prev_day' in cfg:
+            merged['use_prev_day'] = bool(cfg['use_prev_day'])
+        if 'use_all_history' in cfg:
+            merged['use_all_history'] = bool(cfg['use_all_history'])
+        n = int(cfg.get('use_last_n_workdays', merged['use_last_n_workdays']))
+        merged['use_last_n_workdays'] = max(0, min(60, n))
+        _CUSTOM_BASELINE = merged
+    except Exception:  # noqa - 自定义配置错误不应影响预测
+        pass
+
+
+def get_custom_baseline() -> dict:
+    """返回当前自定义基线配置副本。"""
+    try:
+        return dict(_CUSTOM_BASELINE)
+    except Exception:  # noqa
+        return {'use_prev_day': True, 'use_last_n_workdays': 10, 'use_all_history': False}
+
+
+def _compute_daily_baseline(vals, dates, mode):
+    """根据基线模式计算基线值与描述标签。
+
+    mode:
+      'auto'（默认）      = 上一天 + 前10个工作日 组合平均
+      'prev_day'          = 仅上一天（最新一天实测）
+      'last_10_workdays'  = 仅前10个工作日均值
+      'all_history'       = 全部历史加权移动平均（旧逻辑，半衰期5天）
+      'custom'            = 用户自主设置（见 _CUSTOM_BASELINE / set_custom_baseline）
+    若未提供 dates 或所需数据不足，auto/custom 回退 all_history 并标注。
+    """
+    n = len(vals)
+    half_life = 5.0
+    weights = [0.5 ** ((n - 1 - i) / half_life) for i in range(n)]
+    weighted_base = sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+
+    # 解析工作日（周一~周五）
+    workday_vals = []
+    if dates:
+        for v, d in zip(vals, dates):
+            dt = _parse_date(d)
+            if dt is not None and dt.weekday() < 5:
+                workday_vals.append(v)
+
+    if mode in (None, '', 'all_history'):
+        return weighted_base, '全部历史(加权)'
+
+    if mode == 'custom':
+        cfg = _CUSTOM_BASELINE
+        n_wd = max(0, int(cfg.get('use_last_n_workdays', 10)))
+        lastn_workdays = workday_vals[-n_wd:] if (n_wd > 0 and workday_vals) else []
+        mean_wd = (sum(lastn_workdays) / len(lastn_workdays)) if lastn_workdays else None
+        prev_day_val = vals[-1] if n >= 1 else None
+
+        candidates = []
+        labels = []
+        if cfg.get('use_prev_day') and prev_day_val is not None:
+            candidates.append(prev_day_val)
+            labels.append('上一天')
+        if mean_wd is not None:
+            candidates.append(mean_wd)
+            labels.append(f'前{n_wd}个工作日')
+        if cfg.get('use_all_history'):
+            candidates.append(weighted_base)
+            labels.append('全部历史(加权)')
+        if candidates:
+            base = sum(candidates) / len(candidates)
+            return base, '+'.join(labels) if labels else '自定义(空)'
+        return weighted_base, '自定义(不足,回退加权)'
+
+    if mode == 'prev_day':
+        prev_day_val = vals[-1] if n >= 1 else None
+        if prev_day_val is not None:
+            return prev_day_val, '上一天'
+        return weighted_base, '上一天(不足,回退加权)'
+
+    if mode == 'last_10_workdays':
+        last10wd = workday_vals[-10:] if workday_vals else []
+        mean_10wd = (sum(last10wd) / len(last10wd)) if last10wd else None
+        if mean_10wd is not None:
+            return mean_10wd, '前10个工作日'
+        return weighted_base, '前10个工作日(不足,回退加权)'
+
+    # auto 默认：上一天 + 前10个工作日 组合
+    last10wd = workday_vals[-10:] if workday_vals else []
+    mean_10wd = (sum(last10wd) / len(last10wd)) if last10wd else None
+    prev_day_val = vals[-1] if n >= 1 else None
+    candidates = []
+    labels = []
+    if prev_day_val is not None:
+        candidates.append(prev_day_val)
+        labels.append('上一天')
+    if mean_10wd is not None:
+        candidates.append(mean_10wd)
+        labels.append('前10个工作日')
+    if candidates:
+        base = sum(candidates) / len(candidates)
+        return base, '+'.join(labels)
+    return weighted_base, '全部历史(加权)'
+
+
+def _calib_backtest_daily(vals, dates, horizon_days, threshold, baseline_mode, horizon_type):
+    """日排放量留一法回溯：用前段预测后 horizon_days 天，记录实际误差样本。"""
+    try:
+        from prediction_calibrator import record_sample
+        if len(vals) < horizon_days + 10 or not dates:
+            return
+        prefix_vals = vals[:-horizon_days]
+        prefix_dates = dates[:-horizon_days]
+        actual_hold = vals[-horizon_days:]
+        bt = predict_daily_emission(prefix_vals, horizon_days=horizon_days,
+                                    threshold=threshold, dates=prefix_dates,
+                                    baseline_mode=baseline_mode,
+                                    accumulate_feedback=False,
+                                    apply_correction=False,
+                                    horizon_type=horizon_type)
+        fd = bt.get('future_daily', [])
+        fc = bt.get('confidences', [])
+        for d in range(1, horizon_days + 1):
+            if d - 1 >= len(fd):
+                break
+            pred_d = fd[d - 1]
+            act_d = actual_hold[d - 1]
+            conf_d = fc[d - 1] if d - 1 < len(fc) else 0
+            if pred_d is not None and act_d is not None:
+                record_sample(horizon_type, d, float(pred_d), float(act_d), float(conf_d))
+    except Exception:
+        pass
 
 
 def forecast_daily_dates(horizon_days: int = 7, base_date: datetime = None):
