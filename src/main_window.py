@@ -47,7 +47,8 @@ def _baseline_custom_path() -> str:
 def _get_bl_custom_cfg() -> dict:
     """读取自定义基线配置，损坏/缺失时返回默认（上一天+前10个工作日）。"""
     default = {'use_prev_day': True, 'use_last_n_workdays': 10,
-               'use_all_history': False}
+               'use_all_history': False, 'range_enabled': False,
+               'range_start': '', 'range_end': ''}
     try:
         p = _baseline_custom_path()
         if not os.path.exists(p):
@@ -61,6 +62,10 @@ def _get_bl_custom_cfg() -> dict:
             'use_last_n_workdays': max(0, min(60, int(data.get(
                 'use_last_n_workdays', default['use_last_n_workdays'])))),
             'use_all_history': bool(data.get('use_all_history', default['use_all_history'])),
+            # v5.61：自由时间段基线
+            'range_enabled': bool(data.get('range_enabled', False)),
+            'range_start': str(data.get('range_start', '') or '')[:19],
+            'range_end': str(data.get('range_end', '') or '')[:19],
         }
     except Exception:  # noqa - 配置错误回退默认
         return dict(default)
@@ -615,8 +620,21 @@ class PredictionWorker(QThread):
                     # 数据源：拉取最近 N 天的「日数据」(index=2)，逐参数做加权趋势外推。
                     # 与「当日均值预测」的区别：后者基于当天小时数据内推当日均值，
                     # 前者基于历史每日排放量外推未来若干天的每日排放量。
-                    days_back = max(30, self.daily_forecast_days * 2)
                     from datetime import datetime as _dt, timedelta as _td
+                    days_back = max(30, self.daily_forecast_days * 2)
+                    # v5.61：自定义基准若指定了历史时段，查询窗口需覆盖起始日
+                    if self._baseline_mode == 'custom':
+                        try:
+                            _bl = _get_bl_custom_cfg()
+                            if _bl.get('range_enabled') and _bl.get('range_start'):
+                                _rs = _dt.strptime(_bl['range_start'][:16],
+                                                   '%Y-%m-%d %H:%M')
+                                _need = (_dt.now() - _rs).days + 3
+                                days_back = max(days_back, min(366, _need))
+                                logger.debug(
+                                    f"[PRED_WORKER] 自定义时段基线，历史窗口扩至 {days_back} 天")
+                        except Exception:  # noqa - 配置异常用默认窗口
+                            pass
                     _end = _dt.now()
                     _start = _end - _td(days=days_back)
                     _start_str = _start.strftime('%Y-%m-%d 00:00')
@@ -2514,7 +2532,7 @@ class MainWindow(QMainWindow):
         # v5.58 新增：自定义基线配置按钮（点开后设置上一天/前N工作日/全部历史）
         self.baseline_custom_btn = QPushButton("⚙ 基准设置")
         self.baseline_custom_btn.setFixedWidth(90)
-        self.baseline_custom_btn.setToolTip("自主设置基线取值（上一天 / 前N个工作日 / 全部历史 任意组合）")
+        self.baseline_custom_btn.setToolTip("自主设置基线取值（上一天 / 前N个工作日 / 全部历史 / 自由时间段 任意设置）")
         self.baseline_custom_btn.clicked.connect(self._open_baseline_custom_dialog)
         pred_layout.addWidget(self.baseline_custom_btn)
 
@@ -5032,21 +5050,26 @@ class MainWindow(QMainWindow):
         """v5.58 打开自定义基线设置对话框：用户自主设置基线取值。
 
         可选：上一天实测值 / 前N个工作日均值 / 全部历史加权，任意组合；
-        N 由用户自由设定（1~60）。配置持久化到 data/baseline_custom.json。
+        N 由用户自由设定（1~60）。
+        v5.61：新增「自由时间段」——可精确选择 年月日时 至 年月日时，
+        该区间内（按日）的日均排放量直接作为基线，优先于以上组合。
+        配置持久化到 data/baseline_custom.json。
         """
         try:
             from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                         QCheckBox, QSpinBox, QLabel, QPushButton)
+                                         QCheckBox, QSpinBox, QLabel,
+                                         QPushButton, QDateTimeEdit)
+            from PyQt5.QtCore import QDateTime
         except Exception:
             return
         cfg = _get_bl_custom_cfg()
         dlg = QDialog(self)
         dlg.setWindowTitle("⚙ 自定义基线设置")
-        dlg.setMinimumWidth(360)
+        dlg.setMinimumWidth(470)
         vbox = QVBoxLayout(dlg)
 
         tip = QLabel("基线 = 预测未来每日排放量的起始参照值。\n"
-                     "可自由勾选以下来源并设定权重组合：")
+                     "可勾选以下来源组合；勾选「自由时间段」时以其为准：")
         tip.setWordWrap(True)
         vbox.addWidget(tip)
 
@@ -5073,6 +5096,51 @@ class MainWindow(QMainWindow):
         cb_all.setChecked(bool(cfg.get('use_all_history')))
         vbox.addWidget(cb_all)
 
+        # ── v5.61：自由时间段（精确到分钟）──────────────────────────────
+        vbox.addSpacing(8)
+        cb_range = QCheckBox("自由时间段（该区间内日均排放量作为基线）")
+        cb_range.setChecked(bool(cfg.get('range_enabled')))
+        vbox.addWidget(cb_range)
+
+        dt_fmt = "yyyy-MM-dd HH:mm"
+        now_dt = QDateTime.currentDateTime()
+        start_dt = now_dt.addDays(-10)
+        if cfg.get('range_start'):
+            _p = QDateTime.fromString(cfg['range_start'], dt_fmt)
+            if _p.isValid():
+                start_dt = _p
+        end_dt = now_dt
+        if cfg.get('range_end'):
+            _p = QDateTime.fromString(cfg['range_end'], dt_fmt)
+            if _p.isValid():
+                end_dt = _p
+
+        ed_start = QDateTimeEdit(start_dt)
+        ed_start.setDisplayFormat(dt_fmt)
+        ed_start.setCalendarPopup(True)
+        ed_end = QDateTimeEdit(end_dt)
+        ed_end.setDisplayFormat(dt_fmt)
+        ed_end.setCalendarPopup(True)
+        for w in (ed_start, ed_end):
+            w.setEnabled(cb_range.isChecked())
+        cb_range.toggled.connect(ed_start.setEnabled)
+        cb_range.toggled.connect(ed_end.setEnabled)
+
+        hbox_r1 = QHBoxLayout()
+        hbox_r1.addWidget(QLabel("起始："))
+        hbox_r1.addWidget(ed_start)
+        vbox.addLayout(hbox_r1)
+        hbox_r2 = QHBoxLayout()
+        hbox_r2.addWidget(QLabel("截止："))
+        hbox_r2.addWidget(ed_end)
+        vbox.addLayout(hbox_r2)
+
+        hint = QLabel("提示：历史排放量按日统计，时分仅用于确定起止日；"
+                      "查询窗口会自动扩展到起始日。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888;")
+        vbox.addWidget(hint)
+
         vbox.addSpacing(12)
         btn_box = QHBoxLayout()
         btn_ok = QPushButton("确定")
@@ -5087,7 +5155,17 @@ class MainWindow(QMainWindow):
                 'use_prev_day': cb_prev.isChecked(),
                 'use_last_n_workdays': spin_wd.value() if cb_wd.isChecked() else 0,
                 'use_all_history': cb_all.isChecked(),
+                'range_enabled': cb_range.isChecked(),
+                'range_start': ed_start.dateTime().toString(dt_fmt),
+                'range_end': ed_end.dateTime().toString(dt_fmt),
             }
+            # 时间段启用时校验起止顺序
+            if cb_range.isChecked():
+                from PyQt5.QtWidgets import QMessageBox
+                if ed_start.dateTime() > ed_end.dateTime():
+                    QMessageBox.warning(dlg, "时间范围有误",
+                                        "起始时间不能晚于截止时间，请调整后重试。")
+                    return
             _save_bl_custom_cfg(new_cfg)
             try:
                 from data_processor import set_custom_baseline

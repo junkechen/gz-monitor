@@ -1148,6 +1148,26 @@ def _parse_date(d):
     return None
 
 
+def _parse_dt(s):
+    """解析日期时间（含时分）为 datetime；失败返回 None。"""
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s
+    if isinstance(s, date):
+        return datetime(s.year, s.month, s.day)
+    txt = str(s).strip()
+    if not txt:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M',
+                '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(txt[:19], fmt)
+        except Exception:
+            continue
+    return None
+
+
 # ── v5.58 自定义基线（用户自主设置，持久化到 data/baseline_custom.json）──────
 # 由 main_window 通过 set_custom_baseline 写入；_compute_daily_baseline 在
 # mode=='custom' 时读取此配置。默认值与『auto』一致（上一天 + 前10个工作日）。
@@ -1155,6 +1175,10 @@ _CUSTOM_BASELINE = {
     'use_prev_day': True,        # 是否纳入上一天实测值
     'use_last_n_workdays': 10,   # 取前 N 个工作日求均值（0 表示不取）
     'use_all_history': False,    # 是否纳入全部历史加权基线
+    # v5.61：自由时间段基线（'YYYY-MM-DD HH:MM'；启用后优先于以上选项）
+    'range_enabled': False,
+    'range_start': '',
+    'range_end': '',
 }
 
 
@@ -1171,6 +1195,11 @@ def set_custom_baseline(cfg: dict) -> None:
             merged['use_all_history'] = bool(cfg['use_all_history'])
         n = int(cfg.get('use_last_n_workdays', merged['use_last_n_workdays']))
         merged['use_last_n_workdays'] = max(0, min(60, n))
+        if 'range_enabled' in cfg:
+            merged['range_enabled'] = bool(cfg['range_enabled'])
+        for key in ('range_start', 'range_end'):
+            if key in cfg:
+                merged[key] = str(cfg[key] or '')[:19]
         _CUSTOM_BASELINE = merged
     except Exception:  # noqa - 自定义配置错误不应影响预测
         pass
@@ -1213,6 +1242,30 @@ def _compute_daily_baseline(vals, dates, mode):
 
     if mode == 'custom':
         cfg = _CUSTOM_BASELINE
+
+        # v5.61：自由时间段基线——启用后该时段内的日均排放量即为基线，
+        # 优先于「上一天/前N工作日/全部历史」。时段为日粒度（历史为逐日值）。
+        if cfg.get('range_enabled') and dates:
+            _s = _parse_dt(cfg.get('range_start'))
+            _e = _parse_dt(cfg.get('range_end'))
+            if _s is not None and _e is not None:
+                if _s > _e:
+                    _s, _e = _e, _s
+                in_range = []
+                for v, d in zip(vals, dates):
+                    dt = _parse_dt(d)
+                    if dt is None:
+                        continue
+                    if _s.date() <= dt.date() <= _e.date():
+                        in_range.append(v)
+                if in_range:
+                    base = sum(in_range) / len(in_range)
+                    label = (f'时段{_s.strftime("%Y-%m-%d %H:%M")}'
+                             f'~{_e.strftime("%Y-%m-%d %H:%M")}'
+                             f'({len(in_range)}天)')
+                    return base, label
+                return weighted_base, '时段(该区间无数据,回退加权)'
+
         n_wd = max(0, int(cfg.get('use_last_n_workdays', 10)))
         lastn_workdays = workday_vals[-n_wd:] if (n_wd > 0 and workday_vals) else []
         mean_wd = (sum(lastn_workdays) / len(lastn_workdays)) if lastn_workdays else None
