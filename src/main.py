@@ -829,6 +829,19 @@ def main():
                 if _has_locked:
                     _result_msg = _result_msg + "冠洲、鼎鑫等账号因服务端锁定未登录，将在稍后自动重试"
 
+                # v5.68: 汇总「密码错误需核实」的账号，单独提示用户去修改，
+                # 避免散落在进度里被忽略（这些账号本次已跳过登录，不再反复尝试）。
+                _bad_pwd_names = [
+                    _bpu for _bpu, _bres in result.get('details', {}).items()
+                    if _bres.get('need_password_check')
+                ]
+                if _bad_pwd_names:
+                    _result_msg = (
+                        _result_msg
+                        + " 以下账号密码错误，请核实后在登录界面前双击「密码」列修改后重试："
+                        + "、".join(_bad_pwd_names)
+                    )
+
                 if result.get('success'):
                     _login_dialog.set_login_result(True, _result_msg)
                     print(">>> 登录成功，准备显示主窗口...")

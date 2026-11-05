@@ -9,6 +9,7 @@ import requests
 import time
 import json
 import random
+import hashlib
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
@@ -52,6 +53,83 @@ def _save_session_cache(cache: dict):
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# ── v5.68: 密码错误黑名单（按「账号 + 密码哈希」持久化）─────────────────────
+# 密码错误 / 用户不存在属于**确定性不可恢复失败**：反复重试只会浪费滑块请求、
+# 触发服务端风控，并反复骚扰用户。因此首次确认密码错误后，把「账号名 + 当前密码
+# 哈希」记下来；之后整次运行（以及下次启动、点击重新登录）都**跳过该账号的完整
+# 登录流程**（含会话恢复与滑块校验），只提示用户去核实密码。
+# 当用户在登录界面前把密码改对后，传入密码哈希与记录不符 → 黑名单自动失效并放行；
+# 登录成功也会清除黑名单，保证状态自洽。只存密码哈希，不存明文。
+
+def _bad_pwd_path() -> str:
+    import os as _os
+    return _os.path.join(_get_log_dir(), 'gz_bad_pwd.json')
+
+
+def _load_bad_pwd() -> dict:
+    try:
+        with open(_bad_pwd_path(), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_bad_pwd(cache: dict):
+    try:
+        with open(_bad_pwd_path(), 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _pwd_hash(password: str) -> str:
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+
+def mark_bad_password(username: str, password: str):
+    """记录某账号的密码错误（按账号 + 密码哈希）。"""
+    try:
+        cache = _load_bad_pwd()
+        cache[username] = {'pwd_hash': _pwd_hash(password), 'saved_at': time.time()}
+        _save_bad_pwd(cache)
+    except Exception:
+        pass
+
+
+def clear_bad_password(username: str):
+    """登录成功或密码已变更时，清除该账号的密码错误记录。"""
+    try:
+        cache = _load_bad_pwd()
+        if username in cache:
+            del cache[username]
+            _save_bad_pwd(cache)
+    except Exception:
+        pass
+
+
+def is_bad_password(username: str, password: str) -> bool:
+    """
+    判断该账号是否已知密码错误且当前传入密码与记录时一致。
+
+    - 记录不存在 → False（正常尝试）
+    - 记录存在但当前密码哈希不同（用户已改密码）→ 自动清除并放行（False）
+    - 记录存在且密码一致 → True（跳过登录，提示核实密码）
+    """
+    try:
+        cache = _load_bad_pwd()
+        info = cache.get(username)
+        if not isinstance(info, dict) or not info.get('pwd_hash'):
+            return False
+        if _pwd_hash(password) != info.get('pwd_hash'):
+            # 密码已变更，黑名单失效，放行重试
+            clear_bad_password(username)
+            return False
+        return True
+    except Exception:
+        return False
 
 
 
@@ -103,6 +181,24 @@ class GZMultiAccountClient:
 
             # 创建单独的客户端
             client = GZApiClient()
+
+            # v5.68: 已知密码错误且密码未变更 → 直接跳过（不尝试会话恢复、
+            # 不发任何滑块/登录请求），只保留实例并提示用户核实密码。
+            # 这样软件重启或点击「重新登录」时，不会反复尝试该账号。
+            if is_bad_password(username, password):
+                result = {
+                    "success": False,
+                    "message": "密码错误，请核实后在登录界面前双击「密码」列修改后重试",
+                    "need_password_check": True,
+                    "skipped": True,
+                }
+                self.clients[username] = client
+                details[username] = result
+                fail_count += 1
+                if progress_callback:
+                    progress_callback(f"⚠ {username} 密码错误，已跳过登录，请核实密码")
+                time.sleep(0.3)
+                continue
 
             # v5.41: 先尝试用本地持久化会话恢复登录（0 次滑块请求），
             # 失效才走完整 4 步登录——减少登录次数，降低风控锁定概率
@@ -467,6 +563,7 @@ class GZApiClient:
         if trail_provider is not None:
             self._trail_provider = trail_provider
 
+        # 登录调试日志（提前定义，供后续各处使用）
         MAX_LOGIN_RETRY = 3
         import os as _os
         _log_dir = _get_log_dir()
@@ -479,6 +576,18 @@ class GZApiClient:
                     f.write(f"[{_tm.strftime('%H:%M:%S')}] [{username}] {msg}\n")
             except Exception:
                 pass
+
+        # v5.68: 已知密码错误且密码未变更 → 跳过整套登录流程（含滑块校验），
+        # 避免每次启动/重新登录都反复尝试并骚扰用户；只提示去核实密码。
+        if is_bad_password(username, password):
+            _log("已知密码错误（密码未变更），跳过登录流程，提示核实密码")
+            return {
+                "success": False,
+                "message": "密码错误，请核实后在登录界面前双击「密码」列修改后重试",
+                "need_password_check": True,
+                "skipped": True,
+            }
+
         _log(f"开始登录 (最多{MAX_LOGIN_RETRY}次重试)")
         
         for _retry in range(MAX_LOGIN_RETRY):
@@ -573,6 +682,7 @@ class GZApiClient:
                     self.enterprise_name = username
                     self._session_id = self.session.cookies.get('ASP.NET_SessionId', '')
                     self._save_session(username)  # v5.41: 持久化会话供下次复用
+                    clear_bad_password(username)  # v5.68: 登录成功 → 清除密码错误记录
                     _log("登录成功")
                     return {"success": True, "message": "登录成功"}
                 elif result_text == 'errorvalid':
@@ -580,10 +690,12 @@ class GZApiClient:
                     return {"success": False, "message": "验证码错误，请重试"}
                 elif result_text == 'errorpassword':
                     _log("密码错误")
-                    return {"success": False, "message": "密码错误"}
+                    mark_bad_password(username, password)  # v5.68: 记录密码错误，避免反复重试
+                    return {"success": False, "message": "密码错误", "need_password_check": True}
                 elif result_text == 'usernotexist':
                     _log("用户不存在")
-                    return {"success": False, "message": "用户不存在"}
+                    mark_bad_password(username, password)  # v5.68: 同样视为账号问题，跳过重试
+                    return {"success": False, "message": "用户不存在", "need_password_check": True}
                 elif result_text.startswith('haslock'):
                     # 服务端返回 haslock|N 表示账号被锁定/限流（终端失败，不立即重试）
                     _log(f"账号被锁定: {result_text}")
