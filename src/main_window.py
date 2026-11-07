@@ -3467,10 +3467,12 @@ class MainWindow(QMainWindow):
             # 的「筛选结果 N 条」覆盖掉「✅ 扫描完成」
             self._refresh_abnormal_table()
             if hasattr(self, 'abnormal_status_label'):
+                unhandled = self.abnormal_store.unhandled_count()
                 if counts:
                     summary = '  '.join(f"{k}:{v}" for k, v in sorted(counts.items()))
                     self.abnormal_status_label.setText(
-                        f"✅ 扫描完成（近24小时）：{summary}｜新增 {added} 条")
+                        f"✅ 扫描完成（近24小时）：{summary}｜新增 {added} 条"
+                        f"｜未处理 {unhandled} 条")
                 else:
                     self.abnormal_status_label.setText("✅ 扫描完成：近24小时无异常数据")
 
@@ -3488,10 +3490,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self, "异常数据提示",
                     f"近24小时扫描共发现 {len(records)} 条异常记录，"
-                    f"其中新增 {added} 条：\n"
+                    f"其中新增 {added} 条"
+                    f"（未处理 {self.abnormal_store.unhandled_count()} 条）：\n"
                     + "\n".join(lines)
                     + "\n\n（明细为本次扫描命中的全部记录，含此前已记录项）"
-                      "\n详情与导出请查看「⚠️ 异常记录」页签。")
+                      "\n请在「⚠️ 异常记录」页签处理并标记，支持导出。")
         except BaseException as e:
             logger.error(f"异常扫描结果处理失败: {e}", exc_info=True)
 
@@ -3559,6 +3562,48 @@ class MainWindow(QMainWindow):
         toolbar.addStretch()
         layout.addWidget(toolbar_widget)
 
+        # ── 第二行：处理状态筛选 + 标记（v5.73）────────────────────────────
+        handle_widget = QWidget()
+        handle_bar = QHBoxLayout(handle_widget)
+        handle_bar.setContentsMargins(0, 0, 0, 0)
+        handle_bar.setSpacing(8)
+
+        handle_bar.addWidget(QLabel("处理状态:"))
+        self.abnormal_handled_combo = QComboBox()
+        self.abnormal_handled_combo.addItem("全部", "")
+        self.abnormal_handled_combo.addItem("⏳ 未处理", "unhandled")
+        self.abnormal_handled_combo.addItem("✅ 已处理", "handled")
+        self.abnormal_handled_combo.currentIndexChanged.connect(
+            self._refresh_abnormal_table)
+        handle_bar.addWidget(self.abnormal_handled_combo)
+
+        mark_btn = QPushButton("✅ 标记已处理")
+        mark_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mark_btn.setToolTip("对表格中选中的记录标记为已处理（可按住 Ctrl/Shift 多选）")
+        mark_btn.clicked.connect(lambda: self._mark_abnormal_handled(True))
+        mark_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #2e7d32; color: white; border: none;
+                border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: #388e3c; }}
+        """)
+        handle_bar.addWidget(mark_btn)
+
+        unmark_btn = QPushButton("↩ 标记未处理")
+        unmark_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        unmark_btn.setToolTip("把选中记录恢复为未处理")
+        unmark_btn.clicked.connect(lambda: self._mark_abnormal_handled(False))
+        handle_bar.addWidget(unmark_btn)
+
+        self.abnormal_unhandled_label = QLabel("")
+        self.abnormal_unhandled_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        handle_bar.addWidget(self.abnormal_unhandled_label)
+
+        handle_bar.addStretch()
+        layout.addWidget(handle_widget)
+
         # ── 状态标签 ────────────────────────────────────────────────────────
         self.abnormal_status_label = QLabel("点击「立即扫描」或等待自动扫描（登录后3秒 + 每30分钟）")
         self.abnormal_status_label.setStyleSheet(
@@ -3567,7 +3612,7 @@ class MainWindow(QMainWindow):
 
         # ── 记录表 ──────────────────────────────────────────────────────────
         self.abnormal_table = QTableWidget()
-        headers = ["时间", "企业", "排放口", "参数", "类型", "数值",
+        headers = ["时间", "企业", "排放口", "参数", "类型", "处理状态", "数值",
                    "单位", "标准值", "原始标记", "说明", "记录时间"]
         self.abnormal_table.setColumnCount(len(headers))
         self.abnormal_table.setHorizontalHeaderLabels(headers)
@@ -3577,6 +3622,14 @@ class MainWindow(QMainWindow):
         self.abnormal_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.abnormal_table.setAlternatingRowColors(True)
         self.abnormal_table.verticalHeader().setVisible(False)
+        # v5.73：支持多选后批量标记处理状态
+        self.abnormal_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.abnormal_table.setSelectionMode(
+            QTableWidget.SelectionMode.ExtendedSelection)
+        self.abnormal_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.abnormal_table.customContextMenuRequested.connect(
+            self._show_abnormal_context_menu)
         self.abnormal_table.setStyleSheet(f"""
             QTableWidget {{
                 background: {COLORS['bg_card']};
@@ -3602,6 +3655,18 @@ class MainWindow(QMainWindow):
         '预警': '#f1c40f',
     }
 
+    def _abnormal_handled_filter(self):
+        """当前「处理状态」筛选值：None=全部 / False=未处理 / True=已处理"""
+        combo = getattr(self, 'abnormal_handled_combo', None)
+        if combo is None:
+            return None
+        data = combo.currentData()
+        if data == 'handled':
+            return True
+        if data == 'unhandled':
+            return False
+        return None
+
     def _refresh_abnormal_table(self):
         """按当前筛选条件刷新异常记录表"""
         if not hasattr(self, 'abnormal_table'):
@@ -3611,8 +3676,9 @@ class MainWindow(QMainWindow):
             rtype = self.abnormal_type_combo.currentData() or ''
             start = self.abnormal_start_dt.dateTime().toString("yyyy-MM-dd HH:mm")
             end = self.abnormal_end_dt.dateTime().toString("yyyy-MM-dd HH:mm")
-            records = self.abnormal_store.query(ent=ent, rtype=rtype,
-                                                start=start, end=end)
+            records = self.abnormal_store.query(
+                ent=ent, rtype=rtype, start=start, end=end,
+                handled=self._abnormal_handled_filter())
             self._abnormal_current = records
 
             # 同步企业下拉选项（首次或企业变化时）
@@ -3636,12 +3702,14 @@ class MainWindow(QMainWindow):
             self.abnormal_table.setUpdatesEnabled(False)
             self.abnormal_table.setRowCount(len(records))
             for row_idx, r in enumerate(records):
+                handled = bool(r.get('handled'))
                 vals = [
                     r.get('time', ''),
                     r.get('ent', ''),
                     r.get('subname', ''),
                     r.get('param', ''),
                     r.get('type', ''),
+                    '✅ 已处理' if handled else '⏳ 未处理',   # 处理状态
                     str(r.get('value', '')) if r.get('value', '') != '' else '--',
                     r.get('unit', ''),
                     str(r.get('std', '')) if r.get('std', '') != '' else '--',
@@ -3654,8 +3722,18 @@ class MainWindow(QMainWindow):
                     r.get('type', ''), COLORS['text_primary']))
                 for col, text in enumerate(vals):
                     item = QTableWidgetItem(text)
-                    if col == 4:       # 类型列着色
+                    if col == 5:       # 处理状态列
+                        item.setForeground(QColor('#2ecc71' if handled else '#e67e22'))
+                        item.setToolTip(
+                            f"已处理：{r.get('handled_at', '') or '--'}"
+                            f"\n处理人：{r.get('handled_by', '') or '--'}"
+                            f"\n备注：{r.get('handle_note', '') or '--'}"
+                            if handled else "未处理（选中行后点「✅ 标记已处理」）")
+                    elif col == 4:     # 类型列着色
                         item.setForeground(type_color)
+                    elif handled:
+                        # 已处理的整行淡化，便于一眼区分是否处理过
+                        item.setForeground(QColor('#7f8c8d'))
                     elif r.get('type') == '超标':
                         item.setForeground(QColor(self._ABNORMAL_TYPE_COLORS['超标']))
                     self.abnormal_table.setItem(row_idx, col, item)
@@ -3664,11 +3742,73 @@ class MainWindow(QMainWindow):
 
             if hasattr(self, 'abnormal_status_label') and records is not None:
                 total_all = len(self.abnormal_store.records)
+                unhandled = self.abnormal_store.unhandled_count()
                 self.abnormal_status_label.setText(
                     f"筛选结果 {len(records)} 条 / 记录总数 {total_all} 条"
-                    f"（时间范围 {start} ~ {end}）")
+                    f"（未处理 {unhandled} 条，时间范围 {start} ~ {end}）")
+            if hasattr(self, 'abnormal_unhandled_label'):
+                unhandled = self.abnormal_store.unhandled_count()
+                self.abnormal_unhandled_label.setText(
+                    f"未处理 {unhandled} 条" if unhandled else "全部已处理")
+                self.abnormal_unhandled_label.setStyleSheet(
+                    "color: #e67e22; font-size: 12px; font-weight: bold;"
+                    if unhandled else "color: #2ecc71; font-size: 12px;")
         except BaseException as e:
             logger.error(f"刷新异常记录表异常: {e}", exc_info=True)
+
+    def _selected_abnormal_records(self) -> list:
+        """取表格中选中行对应的记录"""
+        if not hasattr(self, 'abnormal_table'):
+            return []
+        rows = sorted({idx.row() for idx in self.abnormal_table.selectedIndexes()})
+        current = getattr(self, '_abnormal_current', None) or []
+        return [current[i] for i in rows if 0 <= i < len(current)]
+
+    def _mark_abnormal_handled(self, handled: bool = True):
+        """把选中记录标记为已处理/未处理（v5.73）"""
+        recs = self._selected_abnormal_records()
+        if not recs:
+            QMessageBox.information(
+                self, "提示",
+                "请先在表格中选中要标记的记录（可按住 Ctrl 或 Shift 多选）")
+            return
+        n = self.abnormal_store.mark_handled(recs, handled)
+        self._refresh_abnormal_table()
+        unhandled = self.abnormal_store.unhandled_count()
+        if hasattr(self, 'abnormal_status_label'):
+            self.abnormal_status_label.setText(
+                f"{'✅ 已标记为已处理' if handled else '↩ 已标记为未处理'} {n} 条"
+                f"｜当前未处理 {unhandled} 条")
+
+    def _show_abnormal_context_menu(self, pos):
+        """右键菜单：标记处理状态（v5.73）"""
+        if not hasattr(self, 'abnormal_table'):
+            return
+        if not self._selected_abnormal_records():
+            idx = self.abnormal_table.indexAt(pos)
+            if idx.isValid():
+                self.abnormal_table.selectRow(idx.row())
+        menu = QMenu(self)
+        act_done = menu.addAction("✅ 标记为已处理")
+        act_undo = menu.addAction("↩ 标记为未处理")
+        menu.addSeparator()
+        act_copy = menu.addAction("📋 复制选中行")
+        chosen = menu.exec_(self.abnormal_table.viewport().mapToGlobal(pos))
+        if chosen == act_done:
+            self._mark_abnormal_handled(True)
+        elif chosen == act_undo:
+            self._mark_abnormal_handled(False)
+        elif chosen == act_copy:
+            recs = self._selected_abnormal_records()
+            lines = ['\t'.join([r.get('time', ''), r.get('ent', ''),
+                                r.get('subname', ''), r.get('param', ''),
+                                r.get('type', ''),
+                                '已处理' if r.get('handled') else '未处理',
+                                r.get('desc', '')]) for r in recs]
+            try:
+                QApplication.clipboard().setText('\n'.join(lines))
+            except Exception:
+                pass
 
     def _export_abnormal(self, fmt: str = 'excel'):
         """导出当前筛选的异常记录为 Excel / CSV"""
@@ -3680,8 +3820,9 @@ class MainWindow(QMainWindow):
                 rtype = self.abnormal_type_combo.currentData() or ''
                 start = self.abnormal_start_dt.dateTime().toString("yyyy-MM-dd HH:mm")
                 end = self.abnormal_end_dt.dateTime().toString("yyyy-MM-dd HH:mm")
-                records = self.abnormal_store.query(ent=ent, rtype=rtype,
-                                                    start=start, end=end)
+                records = self.abnormal_store.query(
+                    ent=ent, rtype=rtype, start=start, end=end,
+                    handled=self._abnormal_handled_filter())
             except Exception:
                 records = []
         if not records:
@@ -3701,6 +3842,10 @@ class MainWindow(QMainWindow):
                 '排放口': r.get('subname', ''),
                 '参数': r.get('param', ''),
                 '类型': r.get('type', ''),
+                '处理状态': '已处理' if r.get('handled') else '未处理',  # v5.73
+                '处理时间': r.get('handled_at', ''),
+                '处理人': r.get('handled_by', ''),
+                '处理备注': r.get('handle_note', ''),
                 '数值': r.get('value', ''),
                 '单位': r.get('unit', ''),
                 '标准值': r.get('std', ''),
@@ -3715,8 +3860,11 @@ class MainWindow(QMainWindow):
                 df.to_csv(file_path, index=False, encoding='utf-8-sig')
             else:
                 df.to_excel(file_path, index=False, engine='openpyxl')
-            QMessageBox.information(self, "导出成功",
-                                    f"已导出 {len(records)} 条异常记录到：\n{file_path}")
+            _unhandled = sum(1 for r in records if not r.get('handled'))
+            QMessageBox.information(
+                self, "导出成功",
+                f"已导出 {len(records)} 条异常记录（未处理 {_unhandled} 条、"
+                f"已处理 {len(records) - _unhandled} 条）到：\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出异常记录失败: {e}")
 

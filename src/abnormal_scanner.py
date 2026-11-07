@@ -127,7 +127,10 @@ class AbnormalStore:
             pass
 
     def add_records(self, records: List[dict]) -> int:
-        """批量写入（去重），返回新增条数"""
+        """批量写入（去重），返回新增条数
+
+        已存在的同 key 记录不会被覆盖——其处理状态（handled 等字段）得以保留。
+        """
         added = 0
         with self._lock:
             for rec in records or []:
@@ -136,6 +139,10 @@ class AbnormalStore:
                 key = self.dedupe_key(rec)
                 if key in self._index:
                     continue
+                rec.setdefault('handled', False)      # v5.73: 处理状态
+                rec.setdefault('handled_at', '')
+                rec.setdefault('handled_by', '')
+                rec.setdefault('handle_note', '')
                 self._index[key] = rec
                 self.records.append(rec)
                 added += 1
@@ -143,6 +150,29 @@ class AbnormalStore:
                 self._prune_locked()
                 self._save()
         return added
+
+    def mark_handled(self, records: List[dict], handled: bool = True,
+                     operator: str = '', note: str = '') -> int:
+        """批量标记处理状态（records 为 store.records 中的记录引用）"""
+        n = 0
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with self._lock:
+            for rec in records or []:
+                if not isinstance(rec, dict):
+                    continue
+                rec['handled'] = bool(handled)
+                rec['handled_at'] = now_s if handled else ''
+                rec['handled_by'] = (operator or '') if handled else ''
+                rec['handle_note'] = (note or '') if handled else ''
+                n += 1
+            if n:
+                self._save()
+        return n
+
+    def unhandled_count(self) -> int:
+        """未处理记录数（旧记录无 handled 字段视为未处理）"""
+        with self._lock:
+            return sum(1 for r in self.records if not r.get('handled'))
 
     def _prune_locked(self, max_records: int = 10000, keep_days: int = 180):
         """限制总量与保留时长，防止无限膨胀"""
@@ -159,8 +189,9 @@ class AbnormalStore:
 
     def query(self, ent: Optional[str] = None, rtype: Optional[str] = None,
               start: Optional[str] = None, end: Optional[str] = None,
+              handled: Optional[bool] = None,
               limit: int = 5000) -> List[dict]:
-        """条件查询：企业/类型/时间范围（按记录 time 字段过滤），最新在前"""
+        """条件查询：企业/类型/时间范围/处理状态（按记录 time 过滤），最新在前"""
         dt_start = _parse_dt(start)
         dt_end = _parse_dt(end)
         with self._lock:
@@ -169,6 +200,8 @@ class AbnormalStore:
                 if ent and r.get('ent', '') != ent:
                     continue
                 if rtype and r.get('type', '') != rtype:
+                    continue
+                if handled is not None and bool(r.get('handled')) != bool(handled):
                     continue
                 if dt_start or dt_end:
                     dt = _parse_dt(r.get('time'))
