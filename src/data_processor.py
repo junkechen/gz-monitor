@@ -29,9 +29,9 @@ NAME_TO_CODE = {v: k for k, v in CODE_TO_NAME.items()}
 # 废水排放口显示参数
 WATER_PARAMS_DISPLAY = ["化学需氧量", "pH值", "流量", "废水流量", "氨氮"]
 # VOCs 排口专用显示参数（含非甲烷总烃）
-VOCS_PARAMS_DISPLAY = ["非甲烷总烃", "烟气温度", "烟气流量", "烟气含氧量", "流速"]
+VOCS_PARAMS_DISPLAY = ["非甲烷总烃", "烟气温度", "烟气流量", "烟气含氧量", "烟气压力", "流速"]
 # 普通废气排放口（锅炉/燃烧类）显示参数（不含非甲烷总烃）
-GAS_PARAMS_DISPLAY = ["二氧化硫", "氮氧化物", "颗粒物", "烟气温度", "烟气流量", "烟气含氧量", "流速"]
+GAS_PARAMS_DISPLAY = ["二氧化硫", "氮氧化物", "颗粒物", "烟气温度", "烟气流量", "烟气含氧量", "烟气压力", "流速"]
 
 # 废水排放口subtype
 WATER_SUBTYPE = "51"
@@ -171,8 +171,9 @@ def convert_history_to_realtime_format(history_raw: dict, subid: str, ent_name: 
                 if sv is not None and sv != '' and str(sv) != '-9999':
                     std_val = str(sv)
 
-            # 取超标状态
+            # 取超标/故障状态（v5.69：保留故障/停产分类）
             state_val = latest.get(f'state_{code}', '0')
+            status_val = latest.get(f'status_{code}', '')
             is_exceed = state_val != '0'
 
             result['params'].append({
@@ -182,6 +183,7 @@ def convert_history_to_realtime_format(history_raw: dict, subid: str, ent_name: 
                 'corrected_value': cvt_val,  # 明确标记为折算值，供预警系统使用
                 'std': std_val,
                 'is_exceed': is_exceed,
+                'data_state': classify_data_state(state_val, status_val),
                 'datetime': latest.get('DateTime', ''),
             })
 
@@ -291,6 +293,45 @@ def merge_corrected_data_into_grouped(grouped_data: dict, multi_client,
     return result
 
 
+# ── v5.69：数据状态分类（超标/故障/停产）────────────────────────────────
+# 服务端 historydata 接口每个参数带 state_{code}/status_{code} 标记，
+# 官网手机端图例：超标=红色，故障=紫色，停产=灰色。
+# 实测编码存在 数字型(0正常/1超标/2故障/3停产)、字母型(N正常/F故障/S停产)、
+# 中文描述 三种形态，分类器全部兼容；无法识别的非零标记返回 None（视为异常）。
+_FAULT_TOKENS = ('2', 'F', 'f')
+_STOP_TOKENS = ('3', 'S', 's')
+_NORMAL_TOKENS = ('0', '', 'N', 'n')
+
+
+def classify_data_state(state, status=''):
+    """
+    根据 state_{code}/status_{code} 原始标记分类数据状态。
+
+    Returns:
+        '超标' | '故障' | '停产' | '正常' | None（未知标记，视为异常）
+    """
+    s = str(state if state is not None else '').strip()
+    t = str(status if status is not None else '').strip()
+
+    if '故障' in s or '故障' in t:
+        return '故障'
+    if '停产' in s or '停产' in t:
+        return '停产'
+    if s in _FAULT_TOKENS or t in _FAULT_TOKENS:
+        return '故障'
+    if s in _STOP_TOKENS and t in ('', '0', 'N', 'n', '正常'):
+        return '停产'
+    if s in _NORMAL_TOKENS and t in _NORMAL_TOKENS + ('正常',):
+        return '正常'
+    if s:
+        if s.isdecimal():
+            # 数字型非零标记按超标处理（1/4-9 等）
+            return '超标'
+        # 无法识别的字母标记 → None（由扫描器按"异常"记录）
+        return None
+    return None
+
+
 def parse_history_data(raw: dict, codes_list: List[str]) -> List[dict]:
     """
     解析历史数据
@@ -311,6 +352,11 @@ def parse_history_data(raw: dict, codes_list: List[str]) -> List[dict]:
                 'is_exceed': row.get(state_key, '0') != '0',
                 'status': row.get(status_key, ''),
                 'ex': row.get(f'ex_{code}'),
+                # v5.69: 保留原始标记并给出状态分类（超标/故障/停产/正常）
+                'state_raw': row.get(state_key, ''),
+                'status_raw': row.get(status_key, ''),
+                'data_state': classify_data_state(
+                    row.get(state_key, ''), row.get(status_key, '')),
             }
         parsed.append(entry)
     return parsed

@@ -97,7 +97,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QLineEdit, QPushButton, QComboBox, QTableWidget,
     QTableWidgetItem, QListWidget, QListWidgetItem, QHeaderView, QGroupBox, QFormLayout, QMessageBox,
-    QDateEdit, QTimeEdit, QFileDialog, QSplitter, QFrame, QScrollArea,
+    QDateEdit, QTimeEdit, QDateTimeEdit, QFileDialog, QSplitter, QFrame, QScrollArea,
     QDialog, QDialogButtonBox, QSpinBox, QCheckBox, QProgressBar,
     QMenuBar, QMenu, QSizePolicy
 )
@@ -111,10 +111,12 @@ from data_processor import (
     predict_next_hour_value, predict_day_average, predict_future_hours,
     get_display_params_for_sub, filter_params_for_display,
     is_water_sub, is_gas_sub, get_subtype_code, CODE_TO_NAME,
-    get_intervention_state_machine, merge_corrected_data_into_grouped
+    get_intervention_state_machine, merge_corrected_data_into_grouped,
+    classify_data_state
 )
 from warning_system import WarningSystem, PredictionWarning
 from chart_widget import ChartWidget
+from abnormal_scanner import AbnormalStore, scan_all, ALL_TYPES
 from config import (COLORS, WATER_DISPLAY_PARAMS, GAS_DISPLAY_PARAMS, RIGHT_AXIS_PARAMS,
                     HISTORY_TTL, HISTORY_INDEX, SERIES_CAP, FIG_DPI, THROTTLE_MS, EMPTY_PLACEHOLDER,
                     APP_RELEASE_VERSION)
@@ -980,6 +982,30 @@ class RefreshDataWorker(QThread):
             self.fetch_failed.emit(f"刷新数据异常: {e}")
 
 
+class AbnormalScanWorker(QThread):
+    """v5.69：后台扫描近24小时超标/故障/异常/预警数据。
+
+    逐企业逐排口查询小时历史数据（index=1），按 state_/status_ 标记分类，
+    并合并预警系统历史；结果写入 AbnormalStore（去重），通过信号回主线程提示。
+    """
+    scan_finished = pyqtSignal(list, int, str)  # (本次记录列表, 新增条数, 错误信息)
+
+    def __init__(self, multi_client, warning_history, store, hours=24, parent=None):
+        super().__init__(parent)
+        self._multi_client = multi_client
+        self._warning_history = warning_history or []
+        self._store = store
+        self._hours = hours
+
+    def run(self):
+        try:
+            records = scan_all(self._multi_client, self._warning_history, self._hours)
+            added = self._store.add_records(records)
+            self.scan_finished.emit(records, added, '')
+        except Exception as e:
+            self.scan_finished.emit([], 0, str(e))
+
+
 # ==================== 版本检测 ====================
 def get_app_version():
     """根据程序名判断版本"""
@@ -1712,6 +1738,15 @@ class MainWindow(QMainWindow):
         # 实时表差量渲染器（必须在 _init_ui 之后，依赖 _init_ui 中创建的 realtime_table）
         self._rt_diff = TableDiff(self.realtime_table)
 
+        # v5.69：异常记录存储 + 登录后自动扫描近24小时异常数据（超标/故障/异常/预警）
+        self.abnormal_store = AbnormalStore()
+        self._abnormal_scan_running = False
+        self._abnormal_scanned_once = False
+        QTimer.singleShot(3000, self._start_abnormal_scan)   # 登录进主窗口后自动扫描
+        self.abnormal_scan_timer = QTimer()
+        self.abnormal_scan_timer.timeout.connect(self._start_abnormal_scan)
+        self.abnormal_scan_timer.start(30 * 60 * 1000)       # 每30分钟自动复扫
+
     def _init_ui(self):
         self.setWindowTitle(f"GZ安环监测系统 - {self.username}")
         self.setMinimumSize(1920, 1080)  # 优化窗口大小,确保显示完整
@@ -1932,7 +1967,11 @@ class MainWindow(QMainWindow):
         self.prediction_tab = self._create_prediction_tab()
         self.right_panel.addTab(self.prediction_tab, "🔮 数据预测")
 
-        # Tab 4: 预警设置
+        # Tab 4: 异常记录（v5.69：超标/故障/异常/预警 记录、查询与导出）
+        self.abnormal_tab = self._create_abnormal_tab()
+        self.right_panel.addTab(self.abnormal_tab, "⚠️ 异常记录")
+
+        # Tab 5: 预警设置
         self.settings_tab = self._create_settings_tab()
         self.right_panel.addTab(self.settings_tab, "⚙️ 系统设置")
 
@@ -3349,6 +3388,309 @@ class MainWindow(QMainWindow):
                 # 触发图表重绘
                 self.pred_chart.update()
 
+        # 切换到异常记录tab时刷新表格（数据可能已被后台扫描更新）
+        elif index == 3:  # 异常记录tab
+            try:
+                self._refresh_abnormal_table()
+            except Exception as e:
+                logger.warning(f"刷新异常记录表失败: {e}")
+
+    # ── v5.69：异常记录（近24小时 超标/故障/异常/预警）────────────────────────
+    def _start_abnormal_scan(self):
+        """启动后台异常扫描（登录后自动 + 定时 + 手动按钮共用）"""
+        try:
+            if self._abnormal_scan_running:
+                return
+            clients = getattr(self.multi_client, 'clients', None) or {}
+            if not clients:
+                return   # 未登录任何企业，静默跳过
+            self._abnormal_scan_running = True
+            if hasattr(self, 'abnormal_status_label'):
+                self.abnormal_status_label.setText("⏳ 正在扫描近24小时异常数据...")
+            warning_history = getattr(self.warning_system, 'warning_history', [])
+            self._abnormal_worker = AbnormalScanWorker(
+                self.multi_client, warning_history, self.abnormal_store, hours=24)
+            self._abnormal_worker.scan_finished.connect(self._on_abnormal_scan_finished)
+            self._abnormal_worker.finished.connect(self._on_abnormal_scan_worker_finished)
+            self._abnormal_worker.start()
+        except Exception as e:
+            self._abnormal_scan_running = False
+            logger.error(f"启动异常扫描失败: {e}", exc_info=True)
+
+    def _on_abnormal_scan_worker_finished(self):
+        """扫描线程结束清理引用"""
+        self._abnormal_scan_running = False
+        w = getattr(self, '_abnormal_worker', None)
+        self._abnormal_worker = None
+        if w is not None:
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
+
+    def _on_abnormal_scan_finished(self, records, added, error):
+        """扫描完成：更新状态、刷新表格、有新增异常时主动弹窗提示"""
+        try:
+            self._abnormal_scanned_once = True
+            counts = {}
+            for r in records or []:
+                counts[r.get('type', '')] = counts.get(r.get('type', ''), 0) + 1
+            if hasattr(self, 'abnormal_status_label'):
+                if error:
+                    self.abnormal_status_label.setText(f"❌ 扫描失败: {error}")
+                elif counts:
+                    summary = '  '.join(f"{k}:{v}" for k, v in sorted(counts.items()))
+                    self.abnormal_status_label.setText(
+                        f"✅ 扫描完成（近24小时）：{summary}")
+                else:
+                    self.abnormal_status_label.setText("✅ 扫描完成：近24小时无异常数据")
+            if error:
+                logger.warning(f"异常扫描失败: {error}")
+                return
+
+            self._refresh_abnormal_table()
+            # 主动提示：有新增异常才弹窗，避免打扰
+            if added > 0:
+                ent_counts = {}
+                for r in records or []:
+                    ent = r.get('ent', '')
+                    ent_counts[ent] = ent_counts.get(ent, 0) + 1
+                lines = ['  '.join(f"{k} {v}条" for k, v in sorted(counts.items()))]
+                for ent, cnt in ent_counts.items():
+                    lines.append(f"  • {ent}：{cnt}条")
+                QMessageBox.information(
+                    self, "异常数据提示",
+                    f"近24小时扫描发现新增异常 {added} 条：\n"
+                    + "\n".join(lines)
+                    + "\n\n详情与导出请查看「⚠️ 异常记录」页签。")
+        except BaseException as e:
+            logger.error(f"异常扫描结果处理失败: {e}", exc_info=True)
+
+    def _create_abnormal_tab(self):
+        """创建异常记录标签页（v5.69）"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # ── 工具栏：扫描按钮 + 条件筛选 ─────────────────────────────────────
+        toolbar_widget = QWidget()
+        toolbar = QHBoxLayout(toolbar_widget)
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(8)
+
+        scan_btn = QPushButton("🔄 立即扫描")
+        scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        scan_btn.clicked.connect(self._start_abnormal_scan)
+        scan_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['primary']}; color: white; border: none;
+                border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {COLORS['secondary']}; }}
+        """)
+        toolbar.addWidget(scan_btn)
+
+        toolbar.addWidget(QLabel("企业:"))
+        self.abnormal_ent_combo = QComboBox()
+        self.abnormal_ent_combo.setMinimumWidth(200)
+        self.abnormal_ent_combo.addItem("全部企业", "")
+        toolbar.addWidget(self.abnormal_ent_combo)
+
+        toolbar.addWidget(QLabel("类型:"))
+        self.abnormal_type_combo = QComboBox()
+        self.abnormal_type_combo.addItem("全部类型", "")
+        for t in ALL_TYPES:
+            self.abnormal_type_combo.addItem(t, t)
+        toolbar.addWidget(self.abnormal_type_combo)
+
+        toolbar.addWidget(QLabel("时间:"))
+        self.abnormal_start_dt = QDateTimeEdit(QDateTime.currentDateTime().addDays(-1))
+        self.abnormal_end_dt = QDateTimeEdit(QDateTime.currentDateTime())
+        for dt_edit in (self.abnormal_start_dt, self.abnormal_end_dt):
+            dt_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+            dt_edit.setCalendarPopup(True)
+            toolbar.addWidget(dt_edit)
+
+        query_btn = QPushButton("🔍 查询")
+        query_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        query_btn.clicked.connect(self._refresh_abnormal_table)
+        toolbar.addWidget(query_btn)
+
+        export_xlsx_btn = QPushButton("📥 导出Excel")
+        export_xlsx_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        export_xlsx_btn.clicked.connect(lambda: self._export_abnormal('excel'))
+        toolbar.addWidget(export_xlsx_btn)
+
+        export_csv_btn = QPushButton("📄 导出CSV")
+        export_csv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        export_csv_btn.clicked.connect(lambda: self._export_abnormal('csv'))
+        toolbar.addWidget(export_csv_btn)
+
+        toolbar.addStretch()
+        layout.addWidget(toolbar_widget)
+
+        # ── 状态标签 ────────────────────────────────────────────────────────
+        self.abnormal_status_label = QLabel("点击「立即扫描」或等待自动扫描（登录后3秒 + 每30分钟）")
+        self.abnormal_status_label.setStyleSheet(
+            f"color: {COLORS['accent']}; font-size: 13px; font-weight: bold;")
+        layout.addWidget(self.abnormal_status_label)
+
+        # ── 记录表 ──────────────────────────────────────────────────────────
+        self.abnormal_table = QTableWidget()
+        headers = ["时间", "企业", "排放口", "参数", "类型", "数值",
+                   "单位", "标准值", "原始标记", "说明", "记录时间"]
+        self.abnormal_table.setColumnCount(len(headers))
+        self.abnormal_table.setHorizontalHeaderLabels(headers)
+        self.abnormal_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self.abnormal_table.horizontalHeader().setStretchLastSection(True)
+        self.abnormal_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.abnormal_table.setAlternatingRowColors(True)
+        self.abnormal_table.verticalHeader().setVisible(False)
+        self.abnormal_table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {COLORS['bg_card']};
+                alternate-background-color: {COLORS['bg_dark']};
+                gridline-color: {COLORS['border']};
+                color: {COLORS['text_primary']};
+            }}
+            QHeaderView::section {{
+                background: {COLORS['primary']}; color: white;
+                padding: 6px; border: none; font-weight: bold;
+            }}
+        """)
+        layout.addWidget(self.abnormal_table, 1)
+        widget.setLayout(layout)
+        return widget
+
+    # 各类型在表格中的颜色（与官网口径一致：超标红/故障紫/停产灰）
+    _ABNORMAL_TYPE_COLORS = {
+        '超标': '#e74c3c',
+        '故障': '#c678dd',
+        '停产': '#888888',
+        '异常': '#e67e22',
+        '预警': '#f1c40f',
+    }
+
+    def _refresh_abnormal_table(self):
+        """按当前筛选条件刷新异常记录表"""
+        if not hasattr(self, 'abnormal_table'):
+            return
+        try:
+            ent = self.abnormal_ent_combo.currentData() or ''
+            rtype = self.abnormal_type_combo.currentData() or ''
+            start = self.abnormal_start_dt.dateTime().toString("yyyy-MM-dd HH:mm")
+            end = self.abnormal_end_dt.dateTime().toString("yyyy-MM-dd HH:mm")
+            records = self.abnormal_store.query(ent=ent, rtype=rtype,
+                                                start=start, end=end)
+            self._abnormal_current = records
+
+            # 同步企业下拉选项（首次或企业变化时）
+            ents = []
+            for r in self.abnormal_store.records:
+                e = r.get('ent', '')
+                if e and e not in ents:
+                    ents.append(e)
+            current_ent = self.abnormal_ent_combo.currentData() or ''
+            if ents != [self.abnormal_ent_combo.itemText(i)
+                        for i in range(1, self.abnormal_ent_combo.count())]:
+                self.abnormal_ent_combo.blockSignals(True)
+                while self.abnormal_ent_combo.count() > 1:
+                    self.abnormal_ent_combo.removeItem(1)
+                for e in ents:
+                    self.abnormal_ent_combo.addItem(e, e)
+                idx = self.abnormal_ent_combo.findData(current_ent)
+                self.abnormal_ent_combo.setCurrentIndex(idx if idx >= 0 else 0)
+                self.abnormal_ent_combo.blockSignals(False)
+
+            self.abnormal_table.setUpdatesEnabled(False)
+            self.abnormal_table.setRowCount(len(records))
+            for row_idx, r in enumerate(records):
+                vals = [
+                    r.get('time', ''),
+                    r.get('ent', ''),
+                    r.get('subname', ''),
+                    r.get('param', ''),
+                    r.get('type', ''),
+                    str(r.get('value', '')) if r.get('value', '') != '' else '--',
+                    r.get('unit', ''),
+                    str(r.get('std', '')) if r.get('std', '') != '' else '--',
+                    (r.get('state_raw', '') + ('/' + r.get('status_raw', '')
+                     if r.get('status_raw', '') else '')),
+                    r.get('desc', ''),
+                    r.get('detected_at', ''),
+                ]
+                type_color = QColor(self._ABNORMAL_TYPE_COLORS.get(
+                    r.get('type', ''), COLORS['text_primary']))
+                for col, text in enumerate(vals):
+                    item = QTableWidgetItem(text)
+                    if col == 4:       # 类型列着色
+                        item.setForeground(type_color)
+                    elif r.get('type') == '超标':
+                        item.setForeground(QColor(self._ABNORMAL_TYPE_COLORS['超标']))
+                    self.abnormal_table.setItem(row_idx, col, item)
+            self.abnormal_table.setUpdatesEnabled(True)
+            self.abnormal_table.resizeRowsToContents()
+
+            if hasattr(self, 'abnormal_status_label') and records is not None:
+                total_all = len(self.abnormal_store.records)
+                self.abnormal_status_label.setText(
+                    f"筛选结果 {len(records)} 条 / 记录总数 {total_all} 条"
+                    f"（时间范围 {start} ~ {end}）")
+        except BaseException as e:
+            logger.error(f"刷新异常记录表异常: {e}", exc_info=True)
+
+    def _export_abnormal(self, fmt: str = 'excel'):
+        """导出当前筛选的异常记录为 Excel / CSV"""
+        records = getattr(self, '_abnormal_current', None)
+        if records is None:
+            # 未点过查询时按当前条件现查一次
+            try:
+                ent = self.abnormal_ent_combo.currentData() or ''
+                rtype = self.abnormal_type_combo.currentData() or ''
+                start = self.abnormal_start_dt.dateTime().toString("yyyy-MM-dd HH:mm")
+                end = self.abnormal_end_dt.dateTime().toString("yyyy-MM-dd HH:mm")
+                records = self.abnormal_store.query(ent=ent, rtype=rtype,
+                                                    start=start, end=end)
+            except Exception:
+                records = []
+        if not records:
+            QMessageBox.warning(self, "提示", "当前筛选条件下暂无异常记录，请先查询或扫描")
+            return
+
+        default_name = f"异常记录_{datetime.now().strftime('%Y%m%d_%H%M')}.{fmt if fmt == 'csv' else 'xlsx'}"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出异常记录", default_name,
+            "Excel Files (*.xlsx)" if fmt == 'excel' else "CSV Files (*.csv)")
+        if not file_path:
+            return
+        try:
+            rows = [{
+                '时间': r.get('time', ''),
+                '企业': r.get('ent', ''),
+                '排放口': r.get('subname', ''),
+                '参数': r.get('param', ''),
+                '类型': r.get('type', ''),
+                '数值': r.get('value', ''),
+                '单位': r.get('unit', ''),
+                '标准值': r.get('std', ''),
+                '原始标记': (r.get('state_raw', '') + ('/' + r.get('status_raw', '')
+                            if r.get('status_raw', '') else '')),
+                '说明': r.get('desc', ''),
+                '记录时间': r.get('detected_at', ''),
+            } for r in records]
+            import pandas as pd
+            df = pd.DataFrame(rows)
+            if fmt == 'csv':
+                df.to_csv(file_path, index=False, encoding='utf-8-sig')
+            else:
+                df.to_excel(file_path, index=False, engine='openpyxl')
+            QMessageBox.information(self, "导出成功",
+                                    f"已导出 {len(records)} 条异常记录到：\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出异常记录失败: {e}")
+
     def _refresh_data(self):
         """刷新实时数据（全局异常保护，防止未捕获异常导致QTimer停止或程序崩溃）"""
         try:
@@ -3938,8 +4280,14 @@ class MainWindow(QMainWindow):
                 self.realtime_table.setItem(row, 6, QTableWidgetItem("--"))
 
             # ── 监测状态列 ─────────────────────────────────────────────
-            # 热电厂废气：使用折算值判断是否超标；其他：使用实测值判断
-            if is_补充 and value is None:
+            # v5.69：官网返回的故障/停产标记优先展示（历史补充参数带 data_state）
+            if param.get('data_state') == '故障':
+                status_text = "故障"
+                status_color = QColor("#c678dd")
+            elif param.get('data_state') == '停产':
+                status_text = "停产"
+                status_color = QColor("#888888")
+            elif is_补充 and value is None:
                 status_text = "暂无数据"
                 status_color = QColor("#888888")
             elif is_hist:
@@ -4684,8 +5032,21 @@ class MainWindow(QMainWindow):
             # v5.65：按 col_plan 动态填列（浓度类才有 折算/排放量 列）
             for code, base_col, with_cvt, with_emis in col_plan:
                 val = row.get(f"val_{code}")
-                self.history_table.setItem(
-                    row_idx, base_col, QTableWidgetItem(_fmt_val(val)))
+                # v5.69：按官网口径对实测值着色——超标红/故障紫/停产灰
+                val_item = QTableWidgetItem(_fmt_val(val))
+                try:
+                    _cls = classify_data_state(
+                        row.get(f"state_{code}", ''),
+                        row.get(f"status_{code}", ''))
+                    if _cls == '故障':
+                        val_item.setForeground(QColor("#c678dd"))
+                    elif _cls == '停产':
+                        val_item.setForeground(QColor("#888888"))
+                    elif _cls == '超标':
+                        val_item.setForeground(QColor(COLORS['warning']))
+                except Exception:
+                    pass
+                self.history_table.setItem(row_idx, base_col, val_item)
                 c = base_col + 1
                 if with_cvt:
                     self.history_table.setItem(
