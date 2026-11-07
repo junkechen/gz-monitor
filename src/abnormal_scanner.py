@@ -67,6 +67,30 @@ def _is_invalid_val(v) -> bool:
         return True
 
 
+# 官网数据标记里代表"无标记"的取值
+_NORMAL_MARKS = ('', '0', 'N', 'n', '正常')
+
+
+def _is_marked(state, status) -> bool:
+    """v5.75：是否已被官网"日常工作-数据标记"标记
+
+    官网 history 接口的 state_{code}/status_{code} 就是数据标记的结果
+    （如 state=2 + status="非甲烷总烃故障"）。空/0/N/正常 视为未标记。
+    软件不再提供本地标记，此状态只读展示，避免与环保平台标记不一致。
+    """
+    return _mark_text(state, status) != ''
+
+
+def _mark_text(state, status) -> str:
+    """官网标记原文（state/status 中非空、非 0/N 的部分拼接）"""
+    parts = []
+    for v in (state, status):
+        s = str(v if v is not None else '').strip()
+        if s not in _NORMAL_MARKS:
+            parts.append(s)
+    return ' / '.join(parts)
+
+
 class AbnormalStore:
     """异常记录持久化存储（线程安全，data/abnormal_records.json）"""
 
@@ -115,6 +139,9 @@ class AbnormalStore:
             recs = [r for r in recs if not self._is_missing_record(r)]
             self._purged = True
         for r in recs:
+            # v5.75：兼容 v5.73 旧记录，按官网标记字段补算只读标记状态
+            r.setdefault('marked', _is_marked(r.get('state_raw'), r.get('status_raw')))
+            r.setdefault('mark_text', _mark_text(r.get('state_raw'), r.get('status_raw')))
             self.records.append(r)
             self._index[self.dedupe_key(r)] = r
 
@@ -129,7 +156,7 @@ class AbnormalStore:
     def add_records(self, records: List[dict]) -> int:
         """批量写入（去重），返回新增条数
 
-        已存在的同 key 记录不会被覆盖——其处理状态（handled 等字段）得以保留。
+        已存在的同 key 记录不会被覆盖——其官网标记状态得以保留。
         """
         added = 0
         with self._lock:
@@ -139,10 +166,14 @@ class AbnormalStore:
                 key = self.dedupe_key(rec)
                 if key in self._index:
                     continue
-                rec.setdefault('handled', False)      # v5.73: 处理状态
-                rec.setdefault('handled_at', '')
-                rec.setdefault('handled_by', '')
-                rec.setdefault('handle_note', '')
+                # v5.75：标记状态来自官网数据标记，只读
+                rec.setdefault('marked', _is_marked(
+                    rec.get('state_raw'), rec.get('status_raw')))
+                rec.setdefault('mark_text', _mark_text(
+                    rec.get('state_raw'), rec.get('status_raw')))
+                # 清掉 v5.73 的本地处理字段，避免误导
+                for k in ('handled', 'handled_at', 'handled_by', 'handle_note'):
+                    rec.pop(k, None)
                 self._index[key] = rec
                 self.records.append(rec)
                 added += 1
@@ -151,28 +182,10 @@ class AbnormalStore:
                 self._save()
         return added
 
-    def mark_handled(self, records: List[dict], handled: bool = True,
-                     operator: str = '', note: str = '') -> int:
-        """批量标记处理状态（records 为 store.records 中的记录引用）"""
-        n = 0
-        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    def unmarked_count(self) -> int:
+        """官网尚未标记的记录数（只读，用于角标/提示）"""
         with self._lock:
-            for rec in records or []:
-                if not isinstance(rec, dict):
-                    continue
-                rec['handled'] = bool(handled)
-                rec['handled_at'] = now_s if handled else ''
-                rec['handled_by'] = (operator or '') if handled else ''
-                rec['handle_note'] = (note or '') if handled else ''
-                n += 1
-            if n:
-                self._save()
-        return n
-
-    def unhandled_count(self) -> int:
-        """未处理记录数（旧记录无 handled 字段视为未处理）"""
-        with self._lock:
-            return sum(1 for r in self.records if not r.get('handled'))
+            return sum(1 for r in self.records if not r.get('marked'))
 
     def _prune_locked(self, max_records: int = 10000, keep_days: int = 180):
         """限制总量与保留时长，防止无限膨胀"""
@@ -189,9 +202,9 @@ class AbnormalStore:
 
     def query(self, ent: Optional[str] = None, rtype: Optional[str] = None,
               start: Optional[str] = None, end: Optional[str] = None,
-              handled: Optional[bool] = None,
+              marked: Optional[bool] = None,
               limit: int = 5000) -> List[dict]:
-        """条件查询：企业/类型/时间范围/处理状态（按记录 time 过滤），最新在前"""
+        """条件查询：企业/类型/时间范围/官网标记状态（按记录 time 过滤），最新在前"""
         dt_start = _parse_dt(start)
         dt_end = _parse_dt(end)
         with self._lock:
@@ -201,7 +214,7 @@ class AbnormalStore:
                     continue
                 if rtype and r.get('type', '') != rtype:
                     continue
-                if handled is not None and bool(r.get('handled')) != bool(handled):
+                if marked is not None and bool(r.get('marked')) != bool(marked):
                     continue
                 if dt_start or dt_end:
                     dt = _parse_dt(r.get('time'))
@@ -339,6 +352,9 @@ def _classify_rows(rows: List[dict], code_list: List[str], ent: str,
                 'desc': desc,
                 'state_raw': str(state),
                 'status_raw': str(status),
+                # v5.75：官网"日常工作-数据标记"的标记状态（只读）
+                'marked': _is_marked(state, status),
+                'mark_text': _mark_text(state, status),
                 'detected_at': detected_at,
                 'source': '24h扫描',
             })
@@ -368,6 +384,8 @@ def _warning_records(warning_history: List[dict], hours: int = 24) -> List[dict]
             'desc': f"{w.get('level', '')} {w.get('type', '')}".strip(),
             'state_raw': '',
             'status_raw': '',
+            'marked': False,        # 预警由本软件算出，官网未必有数据标记
+            'mark_text': '',
             'detected_at': now_s,
             'source': '预警系统',
         })
