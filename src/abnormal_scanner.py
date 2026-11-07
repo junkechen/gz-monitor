@@ -32,6 +32,9 @@ ALL_TYPES = (TYPE_EXCEED, TYPE_FAULT, TYPE_STOP, TYPE_ABNORMAL, TYPE_WARNING)
 _FAULT_TOKENS = ('2', 'F', 'f')
 _STOP_TOKENS = ('3', 'S', 's')
 
+# v5.72：一次性清除旧逻辑产生的"数据缺失"误报记录后，在存储文件里写下此标记
+_PURGE_FLAG = 'purge_missing_false_positives_v572_done'
+
 
 def _records_path() -> str:
     return os.path.join(
@@ -72,8 +75,15 @@ class AbnormalStore:
         self._lock = threading.Lock()
         self.records: List[dict] = []   # 按时间倒序（最新在前）
         self._index: Dict[str, dict] = {}  # dedupe key -> record
+        self._purged = False            # v5.72: 误报清理标记
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._load()
+
+    @staticmethod
+    def _is_missing_record(rec) -> bool:
+        """v5.72 前旧逻辑会把未报送参数记成'数据缺失'，一次性清除"""
+        return (isinstance(rec, dict) and rec.get('type') == TYPE_ABNORMAL
+                and str(rec.get('desc', '')).startswith('数据缺失'))
 
     @staticmethod
     def dedupe_key(rec: dict) -> str:
@@ -84,21 +94,35 @@ class AbnormalStore:
         ])
 
     def _load(self):
+        data = None
         try:
             with open(self.path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            recs = data if isinstance(data, list) else data.get('records', [])
-            for r in recs:
-                if isinstance(r, dict):
-                    self.records.append(r)
-                    self._index[self.dedupe_key(r)] = r
         except Exception:
-            pass
+            data = None
+        recs: List[dict] = []
+        if isinstance(data, list):
+            recs = [r for r in data if isinstance(r, dict)]
+        elif isinstance(data, dict):
+            recs = [r for r in (data.get('records') or [])
+                    if isinstance(r, dict)]
+            self._purged = bool(data.get(_PURGE_FLAG))
+        if data is None:
+            # 首次运行（无历史文件），无需清理
+            self._purged = True
+        if not self._purged:
+            # v5.72 一次性清除"数据缺失"误报（真实缺数会在下次扫描重新生成）
+            recs = [r for r in recs if not self._is_missing_record(r)]
+            self._purged = True
+        for r in recs:
+            self.records.append(r)
+            self._index[self.dedupe_key(r)] = r
 
     def _save(self):
         try:
             with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump(self.records, f, ensure_ascii=False, indent=1)
+                json.dump({'records': self.records, _PURGE_FLAG: self._purged},
+                          f, ensure_ascii=False, indent=1)
         except Exception:
             pass
 
@@ -232,6 +256,13 @@ def _scan_enterprise(client, username: str, hours: int = 24) -> List[dict]:
 def _classify_rows(rows: List[dict], code_list: List[str], ent: str,
                    subid: str, subname: str, detected_at: str) -> List[dict]:
     """逐行逐参数分类：超标/故障/停产/异常（数据缺失或未知标记）"""
+    # v5.72：整个扫描窗口内从未报送过值的 code，视为该排口未启用此参数，
+    # 不参与"数据缺失"判定。否则像总排口同时配置 废水流量/累计流量/流量
+    # 多个 code、实际只报送其中一部分时，未报送的 code 会被每小时误报缺失。
+    codes_with_data = {
+        c for c in code_list
+        if any(not _is_invalid_val(row.get(f'val_{c}')) for row in rows)
+    }
     records = []
     for row in rows:
         dt = str(row.get('DateTime', ''))
@@ -251,8 +282,9 @@ def _classify_rows(rows: List[dict], code_list: List[str], ent: str,
                 rtype = TYPE_FAULT
             elif cls == TYPE_STOP:
                 rtype = TYPE_STOP
-            elif invalid and row_has_valid:
-                # 数值缺失/无效，但同周期其他参数有值 → 数据缺失异常
+            elif invalid and row_has_valid and code in codes_with_data:
+                # 数值缺失/无效，但同周期其他参数有值，且该参数本窗口报送过
+                # → 真实缺数异常
                 rtype, desc = TYPE_ABNORMAL, '数据缺失（同周期其他参数有值）'
             elif cls is None and not invalid:
                 # 服务端返回了无法识别的标记 → 异常
