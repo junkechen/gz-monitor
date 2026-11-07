@@ -1756,6 +1756,8 @@ class MainWindow(QMainWindow):
         self.abnormal_store = AbnormalStore()
         self._abnormal_scan_running = False
         self._abnormal_scanned_once = False
+        # v5.74：进主窗口即刷新页签角标，日常在其他页签也能看到未处理数量
+        self._update_abnormal_tab_badge()
         QTimer.singleShot(3000, self._start_abnormal_scan)   # 登录进主窗口后自动扫描
         self.abnormal_scan_timer = QTimer()
         self.abnormal_scan_timer.timeout.connect(self._start_abnormal_scan)
@@ -3655,6 +3657,24 @@ class MainWindow(QMainWindow):
         '预警': '#f1c40f',
     }
 
+    def _update_abnormal_tab_badge(self):
+        """v5.74：异常记录页签标题带未处理数量，日常在其他页签也能一眼看到"""
+        try:
+            if not hasattr(self, 'abnormal_tab') or not hasattr(self, 'abnormal_store'):
+                return
+            idx = self.right_panel.indexOf(self.abnormal_tab)
+            if idx < 0:
+                return
+            n = self.abnormal_store.unhandled_count()
+            title = f"⚠️ 异常记录 ({n})" if n > 0 else "⚠️ 异常记录"
+            if self.right_panel.tabText(idx) != title:
+                self.right_panel.setTabText(idx, title)
+            self.right_panel.setTabToolTip(
+                idx, f"未处理异常 {n} 条，点击查看并标记处理"
+                if n > 0 else "暂无未处理异常")
+        except Exception as e:
+            logger.debug(f"更新异常页签角标失败: {e}")
+
     def _abnormal_handled_filter(self):
         """当前「处理状态」筛选值：None=全部 / False=未处理 / True=已处理"""
         combo = getattr(self, 'abnormal_handled_combo', None)
@@ -3753,6 +3773,8 @@ class MainWindow(QMainWindow):
                 self.abnormal_unhandled_label.setStyleSheet(
                     "color: #e67e22; font-size: 12px; font-weight: bold;"
                     if unhandled else "color: #2ecc71; font-size: 12px;")
+            # v5.74：同步页签角标（扫描完成/标记/查询后都会走到这里）
+            self._update_abnormal_tab_badge()
         except BaseException as e:
             logger.error(f"刷新异常记录表异常: {e}", exc_info=True)
 
