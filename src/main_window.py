@@ -1213,12 +1213,15 @@ class LoginDialog(QDialog):
         # v5.54：企业名称与密码可直接在登录前编辑，避免输错密码被服务端锁定
         account_list_widget.setColumnCount(3)
         account_list_widget.setHorizontalHeaderLabels(["企业名称", "密码", "登录状态"])
+        # v5.71：名称列独占剩余宽度，密码/状态列按内容自适应，
+        # 避免三列 Stretch 平分把长企业名挤成省略号（如"山东冠洲鼎鑫板材科技有限公司"）
         account_list_widget.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch)
         account_list_widget.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
+            1, QHeaderView.ResizeMode.ResizeToContents)
         account_list_widget.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents)
+        account_list_widget.setColumnWidth(0, 300)
         account_list_widget.setRowCount(len(self.accounts))
         # v5.56：账户行被挤压不可见——给表格最小高度、固定行高并启用换行
         account_list_widget.setMinimumHeight(210)
@@ -1245,7 +1248,8 @@ class LoginDialog(QDialog):
         for idx, account in enumerate(self.accounts):
             name_item = QTableWidgetItem(account.get('name', ''))
             name_item.setFont(QFont("Microsoft YaHei", 10))
-            name_item.setToolTip("双击可修改企业账号名称")
+            name_item.setToolTip(
+                f"企业全称：{account.get('name', '')}\n双击可修改企业账号名称")
             pwd_item = QTableWidgetItem(account.get('password', ''))
             pwd_item.setFont(QFont("Microsoft YaHei", 10))
             pwd_item.setToolTip("双击可修改密码（明文保存在本地配置）")
@@ -1541,7 +1545,7 @@ class AccountManageDialog(QDialog):
         super().__init__(parent)
         self.accounts = accounts
         self.setWindowTitle("账户管理")
-        self.setFixedSize(600, 450)
+        self.setFixedSize(680, 450)
         self._init_ui()
 
     def _init_ui(self):
@@ -1549,8 +1553,15 @@ class AccountManageDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["企业名称", "密码", "操作"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # v5.71：名称列占大头、其余按内容自适应，长企业名不再被省略号截断
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setWordWrap(True)
+        self.table.verticalHeader().setDefaultSectionSize(40)
         self._load_table()
         layout.addWidget(self.table)
 
@@ -1564,12 +1575,15 @@ class AccountManageDialog(QDialog):
     def _load_table(self):
         self.table.setRowCount(len(self.accounts))
         for row, acc in enumerate(self.accounts):
-            self.table.setItem(row, 0, QTableWidgetItem(acc['name']))
+            name_item = QTableWidgetItem(acc['name'])
+            name_item.setToolTip(f"企业全称：{acc['name']}")
+            self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, QTableWidgetItem(acc['password']))
 
             del_btn = QPushButton("删除")
             del_btn.clicked.connect(lambda _, r=row: self._delete_account(r))
             self.table.setCellWidget(row, 2, del_btn)
+        self.table.resizeRowsToContents()
 
     def _add_account(self):
         dialog = QDialog(self)
@@ -3403,7 +3417,14 @@ class MainWindow(QMainWindow):
                 return
             clients = getattr(self.multi_client, 'clients', None) or {}
             if not clients:
-                return   # 未登录任何企业，静默跳过
+                # v5.71：登录尚未就绪时短间隔重试（最多 6 次 / 30 秒内），
+                # 避免 3 秒那次静默跳过后要干等 30 分钟的定时复扫
+                retries = getattr(self, '_abnormal_scan_pending_retries', 0)
+                if retries < 6:
+                    self._abnormal_scan_pending_retries = retries + 1
+                    QTimer.singleShot(5000, self._start_abnormal_scan)
+                return   # 未登录任何企业，暂不扫描
+            self._abnormal_scan_pending_retries = 0
             self._abnormal_scan_running = True
             if hasattr(self, 'abnormal_status_label'):
                 self.abnormal_status_label.setText("⏳ 正在扫描近24小时异常数据...")
@@ -3432,27 +3453,33 @@ class MainWindow(QMainWindow):
         """扫描完成：更新状态、刷新表格、有新增异常时主动弹窗提示"""
         try:
             self._abnormal_scanned_once = True
+            records = records or []
             counts = {}
-            for r in records or []:
+            for r in records:
                 counts[r.get('type', '')] = counts.get(r.get('type', ''), 0) + 1
-            if hasattr(self, 'abnormal_status_label'):
-                if error:
-                    self.abnormal_status_label.setText(f"❌ 扫描失败: {error}")
-                elif counts:
-                    summary = '  '.join(f"{k}:{v}" for k, v in sorted(counts.items()))
-                    self.abnormal_status_label.setText(
-                        f"✅ 扫描完成（近24小时）：{summary}")
-                else:
-                    self.abnormal_status_label.setText("✅ 扫描完成：近24小时无异常数据")
             if error:
                 logger.warning(f"异常扫描失败: {error}")
+                if hasattr(self, 'abnormal_status_label'):
+                    self.abnormal_status_label.setText(f"❌ 扫描失败: {error}")
                 return
 
+            # v5.71：先刷新表格、再写扫描状态，避免被 _refresh_abnormal_table
+            # 的「筛选结果 N 条」覆盖掉「✅ 扫描完成」
             self._refresh_abnormal_table()
-            # 主动提示：有新增异常才弹窗，避免打扰
+            if hasattr(self, 'abnormal_status_label'):
+                if counts:
+                    summary = '  '.join(f"{k}:{v}" for k, v in sorted(counts.items()))
+                    self.abnormal_status_label.setText(
+                        f"✅ 扫描完成（近24小时）：{summary}｜新增 {added} 条")
+                else:
+                    self.abnormal_status_label.setText("✅ 扫描完成：近24小时无异常数据")
+
+            # 主动提示：有新增异常才弹窗，避免打扰。
+            # v5.71：明细统计的是「本次扫描命中的全部记录」，标题相应区分
+            # 「共发现 / 其中新增」，不再与 added 口径混淆。
             if added > 0:
                 ent_counts = {}
-                for r in records or []:
+                for r in records:
                     ent = r.get('ent', '')
                     ent_counts[ent] = ent_counts.get(ent, 0) + 1
                 lines = ['  '.join(f"{k} {v}条" for k, v in sorted(counts.items()))]
@@ -3460,9 +3487,11 @@ class MainWindow(QMainWindow):
                     lines.append(f"  • {ent}：{cnt}条")
                 QMessageBox.information(
                     self, "异常数据提示",
-                    f"近24小时扫描发现新增异常 {added} 条：\n"
+                    f"近24小时扫描共发现 {len(records)} 条异常记录，"
+                    f"其中新增 {added} 条：\n"
                     + "\n".join(lines)
-                    + "\n\n详情与导出请查看「⚠️ 异常记录」页签。")
+                    + "\n\n（明细为本次扫描命中的全部记录，含此前已记录项）"
+                      "\n详情与导出请查看「⚠️ 异常记录」页签。")
         except BaseException as e:
             logger.error(f"异常扫描结果处理失败: {e}", exc_info=True)
 
