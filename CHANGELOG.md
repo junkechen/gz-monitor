@@ -1,6 +1,14 @@
 # GZ 安环监测系统 — 版本更新日志
 
-## v5.69（2026-11-07）✅ 当前版本
+## v5.70（2026-11-07）✅ 当前版本
+
+### 🐛 紧急修复：启动报「创建窗口失败: name 'QDateTime' is not defined」
+
+- v5.69 异常记录页新增的时间范围控件 `QDateTimeEdit(QDateTime.currentDateTime()...)` 在主窗口初始化阶段引用了 `QDateTime`，但模块顶部 `PyQt5.QtCore` 导入行遗漏了它，导致 **软件启动即报"创建窗口失败"完全无法使用**。
+- 修复：`src/main_window.py` 顶部导入补上 `QDateTime`。
+- 回归验证：offscreen 实例化 `MainWindow` 冒烟测试通过。
+
+## v5.69（2026-11-07）
 
 ### 🩺 烟气压力 + 故障信息 + 近24小时异常自动扫描与记录
 

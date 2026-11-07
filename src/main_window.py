@@ -101,7 +101,7 @@ from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QSpinBox, QCheckBox, QProgressBar,
     QMenuBar, QMenu, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, QDate, QTime, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, QTimer, QDate, QTime, QDateTime, pyqtSignal, QThread
 from PyQt5.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QImage
 
 from multi_account_api import GZMultiAccountClient, GZApiClient
