@@ -29,6 +29,8 @@ class _FakeClient:
         self.daily_values_per_code = daily_values_per_code or {
             '201': [100.0 + i * 2 for i in range(14)],
             '203': [50.0 + (i % 3) for i in range(14)],
+            # v5.60+：日排放量预测必须有流量参数才能换算 kg，补 210（流量 m³）
+            '210': [10000.0 + i * 100 for i in range(14)],
         }
         self.calls = []
 
@@ -40,19 +42,20 @@ class _FakeClient:
             'start': start, 'end': end, 'index': index,
             'page': page, 'rows': rows, 'use_corrected': use_corrected,
         })
-        # 故意返回乱序，验证 worker 会排序
+        # v5.76：服务端每行含该时刻所有参数（此前按 code 拆行，
+        # 与 worker「按行取 val_{code} + 流量」的结构不符，测试长期失效）
         code_list = [c.strip() for c in codes.split(',') if c.strip()]
+        n_days = max((len(self.daily_values_per_code.get(c) or [])
+                      for c in code_list), default=0)
+        base = datetime(2026, 1, 1)
         out = []
-        for code in code_list:
-            vals = self.daily_values_per_code.get(code)
-            if not vals:
-                continue
-            base = datetime(2026, 1, 1)
-            for i, v in enumerate(vals):
-                out.append({
-                    'DateTime': (base + timedelta(days=i)).strftime('%Y-%m-%d'),
-                    f'val_{code}': str(v),
-                })
+        for i in range(n_days):
+            row = {'DateTime': (base + timedelta(days=i)).strftime('%Y-%m-%d')}
+            for code in code_list:
+                vals = self.daily_values_per_code.get(code) or []
+                if i < len(vals):
+                    row[f'val_{code}'] = str(vals[i])
+            out.append(row)
         # 倒序返回，模拟服务端不稳定排序
         out.reverse()
         return {'total': len(out), 'rows': out}
@@ -79,7 +82,7 @@ def _make_worker(pred_type, daily_forecast_days=7, client=None):
         prediction_params=[],
         pred_type=pred_type,
         thresholds={'二氧化硫': 120.0},
-        sub_itemcodes_cache={'K1_01': '201,203'},
+        sub_itemcodes_cache={'K1_01': '201,203,210'},
         api_data_cache={},
         thresholds_cache={},
         get_subtype_code_fn=lambda t: '01',
@@ -189,7 +192,8 @@ class TestDailyEmissionWorker(unittest.TestCase):
 
     def test_i_insufficient_history_skipped(self):
         """日数据不足 3 天时应跳过，不产出结果"""
-        client = _FakeClient({'201': [100.0, 101.0]})   # 仅 2 天
+        client = _FakeClient({'201': [100.0, 101.0],
+                              '210': [10000.0, 10100.0]})   # 仅 2 天
         worker, _ = _make_worker("日排放量预测", daily_forecast_days=7,
                                  client=client)
         captured = []
@@ -199,7 +203,8 @@ class TestDailyEmissionWorker(unittest.TestCase):
 
     def test_j_unsorted_server_response(self):
         """服务端乱序返回时，worker 应自行排序后计算"""
-        client = _FakeClient({'201': [float(i) for i in range(1, 15)]})
+        client = _FakeClient({'201': [float(i) for i in range(1, 15)],
+                              '210': [10000.0 + i * 100 for i in range(14)]})
         worker, _ = _make_worker("日排放量预测", daily_forecast_days=7,
                                  client=client)
         captured = []
@@ -275,6 +280,8 @@ class TestQueryHistoryArgSafety(unittest.TestCase):
                         out.append({
                             'DateTime': f'2026-01-{d:02d} {h:02d}:00',
                             'val_201': str(100.0 + d),
+                            # v5.76：排放量需逐时流量才能累加，补 210
+                            'val_210': '500.0',
                         })
                 return {'rows': out, 'total': len(out)}
 
@@ -290,7 +297,8 @@ class TestQueryHistoryArgSafety(unittest.TestCase):
 
     def test_e_skip_reasons_recorded(self):
         """数据不足时应记录原因，供 UI 提示"""
-        client = _FakeClient({'201': [100.0, 101.0]})   # 仅 2 天
+        client = _FakeClient({'201': [100.0, 101.0],
+                              '210': [10000.0, 10100.0]})   # 仅 2 天
         worker, _ = _make_worker("日排放量预测", daily_forecast_days=7,
                                  client=client)
         worker.run()

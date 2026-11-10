@@ -1096,8 +1096,9 @@ def predict_daily_emission(hour_values: List[float],
                               horizon_type)
 
     # ── 2. 基线（v5.58 可选：默认 上一天 + 前10个工作日）──────────────────
+    _baseline_detail = {}
     baseline, baseline_label = _compute_daily_baseline(
-        vals, dates, baseline_mode)
+        vals, dates, baseline_mode, _baseline_detail)
 
     # ── 3. 日环比趋势率（线性回归，仅 R²≥0.25 时采信）──────────────────────
     trend_rate = 0.0
@@ -1164,6 +1165,11 @@ def predict_daily_emission(hour_values: List[float],
 
     return {
         'predicted': predicted_base,
+        # v5.76：纯基线值（未叠加自学习偏差），即"参与时段的日排放平均值"，
+        # 供界面/导出与网页查询核对；预测值仍是 predicted（含校准）。
+        'baseline': round(baseline, 4),
+        'baseline_days': _baseline_detail.get('days'),
+        'baseline_total': round(_baseline_detail.get('total') or 0.0, 4),
         'future_daily': future_daily,
         'confidences': confidences,
         'confidence': base_conf_final,
@@ -1301,7 +1307,7 @@ def get_custom_baseline() -> dict:
         return {'use_prev_day': True, 'use_last_n_workdays': 10, 'use_all_history': False}
 
 
-def _compute_daily_baseline(vals, dates, mode):
+def _compute_daily_baseline(vals, dates, mode, detail=None):
     """根据基线模式计算基线值与描述标签。
 
     mode:
@@ -1311,7 +1317,18 @@ def _compute_daily_baseline(vals, dates, mode):
       'all_history'       = 全部历史加权移动平均（旧逻辑，半衰期5天）
       'custom'            = 用户自主设置（见 _CUSTOM_BASELINE / set_custom_baseline）
     若未提供 dates 或所需数据不足，auto/custom 回退 all_history 并标注。
+
+    v5.76：可选 detail 回填 {value, label, days, total}，供界面/导出核对
+    「基线 = 参与时段的日排放平均值」这一口径。
     """
+    def _ret(v, label, days=None, total=None):
+        if detail is not None:
+            detail['value'] = v
+            detail['label'] = label
+            detail['days'] = len(vals) if days is None else days
+            detail['total'] = sum(vals) if total is None else total
+        return v, label
+
     n = len(vals)
     half_life = 5.0
     weights = [0.5 ** ((n - 1 - i) / half_life) for i in range(n)]
@@ -1326,7 +1343,7 @@ def _compute_daily_baseline(vals, dates, mode):
                 workday_vals.append(v)
 
     if mode in (None, '', 'all_history'):
-        return weighted_base, '全部历史(加权)'
+        return _ret(weighted_base, '全部历史(加权)')
 
     if mode == 'custom':
         cfg = _CUSTOM_BASELINE
@@ -1351,8 +1368,9 @@ def _compute_daily_baseline(vals, dates, mode):
                     label = (f'时段{_s.strftime("%Y-%m-%d %H:%M")}'
                              f'~{_e.strftime("%Y-%m-%d %H:%M")}'
                              f'({len(in_range)}天)')
-                    return base, label
-                return weighted_base, '时段(该区间无数据,回退加权)'
+                    return _ret(base, label, days=len(in_range),
+                                total=sum(in_range))
+                return _ret(weighted_base, '时段(该区间无数据,回退加权)')
 
         n_wd = max(0, int(cfg.get('use_last_n_workdays', 10)))
         lastn_workdays = workday_vals[-n_wd:] if (n_wd > 0 and workday_vals) else []
@@ -1372,21 +1390,21 @@ def _compute_daily_baseline(vals, dates, mode):
             labels.append('全部历史(加权)')
         if candidates:
             base = sum(candidates) / len(candidates)
-            return base, '+'.join(labels) if labels else '自定义(空)'
-        return weighted_base, '自定义(不足,回退加权)'
+            return _ret(base, '+'.join(labels) if labels else '自定义(空)')
+        return _ret(weighted_base, '自定义(不足,回退加权)')
 
     if mode == 'prev_day':
         prev_day_val = vals[-1] if n >= 1 else None
         if prev_day_val is not None:
-            return prev_day_val, '上一天'
-        return weighted_base, '上一天(不足,回退加权)'
+            return _ret(prev_day_val, '上一天')
+        return _ret(weighted_base, '上一天(不足,回退加权)')
 
     if mode == 'last_10_workdays':
         last10wd = workday_vals[-10:] if workday_vals else []
         mean_10wd = (sum(last10wd) / len(last10wd)) if last10wd else None
         if mean_10wd is not None:
-            return mean_10wd, '前10个工作日'
-        return weighted_base, '前10个工作日(不足,回退加权)'
+            return _ret(mean_10wd, '前10个工作日')
+        return _ret(weighted_base, '前10个工作日(不足,回退加权)')
 
     # auto 默认：上一天 + 前10个工作日 组合
     last10wd = workday_vals[-10:] if workday_vals else []
@@ -1402,8 +1420,8 @@ def _compute_daily_baseline(vals, dates, mode):
         labels.append('前10个工作日')
     if candidates:
         base = sum(candidates) / len(candidates)
-        return base, '+'.join(labels)
-    return weighted_base, '全部历史(加权)'
+        return _ret(base, '+'.join(labels))
+    return _ret(weighted_base, '全部历史(加权)')
 
 
 def _calib_backtest_daily(vals, dates, horizon_days, threshold, baseline_mode, horizon_type):

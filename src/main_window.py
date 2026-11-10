@@ -754,7 +754,9 @@ class PredictionWorker(QThread):
                             if mass is None:
                                 mass = calc_emission_mass(
                                     r.get(val_key), r.get(f'val_{flow_code}'), code)
-                            if mass is not None and mass > 0:
+                            # v5.76：0 排放是有效的真实值（停产/达标零排放），
+                            # 应计入日均；只排除无数据（None）
+                            if mass is not None and mass >= 0:
                                 daily_values.append(float(mass))
                                 daily_dates.append(r.get('DateTime'))
                                 # v5.66：当日累计流量（m³）——小时聚合行用逐时累加，
@@ -831,8 +833,11 @@ class PredictionWorker(QThread):
                         # v5.63：诊断日志——便于核对日预测的数值口径（排放量 kg/天）
                         logger.info(
                             f"[PRED_DAILY] {subname}/{param_name} 排放量(kg/天) "
-                            f"天数={len(daily_values)} 基线={daily_values[-1]:.3f}"
-                            f"->预测基线={fc.get('predicted'):.3f} "
+                            f"天数={len(daily_values)} 最近一天={daily_values[-1]:.3f} "
+                            f"日均基线={fc.get('baseline')} "
+                            f"参与天数={fc.get('baseline_days')} "
+                            f"合计={fc.get('baseline_total')} "
+                            f"校准后={fc.get('predicted')} "
                             f"趋势={fc.get('trend')}({fc.get('trend_rate')}%/天) "
                             f"D+1={future_daily[0] if future_daily else None} "
                             f"D+N={future_daily[-1] if future_daily else None} "
@@ -868,6 +873,11 @@ class PredictionWorker(QThread):
                             'pred_type': '日排放量预测',
                             # v5.67：实际使用的基线描述（含自定义时间周期），供表格/导出
                             'baseline_label': fc.get('baseline_mode', ''),
+                            # v5.76：纯基线（= 参与时段的日排放平均值，未叠加自学习偏差），
+                            # 供与网页查询核对；预测值仍用 predicted
+                            'baseline_value': fc.get('baseline'),
+                            'baseline_days': fc.get('baseline_days'),
+                            'baseline_total': fc.get('baseline_total'),
                             'baseline_mode_key': self._baseline_mode,
                             # v5.60：结果为排放量(kg/天)，供表格/导出区分口径
                             'is_emission': True,
@@ -5514,7 +5524,8 @@ class MainWindow(QMainWindow):
                     for d in (p.get('future_dates') or []):
                         if d not in day_labels:
                             day_labels.append(d)
-                d_headers = ["企业", "排放口", "参数", "基线排放量(kg)",
+                d_headers = ["企业", "排放口", "参数", "基线(日均排放量 kg)",
+                             "参与天数", "排放量合计(kg)",
                              "最近实测(kg)", "趋势", "趋势率(%)",
                              "基线置信度", "基线方式/时间周期"] + \
                             [f"{d}排放量(kg)" for d in day_labels] + ["预警等级", "数据来源"]
@@ -5582,8 +5593,12 @@ class MainWindow(QMainWindow):
             else:  # daily
                 fd = p.get('future_daily', [])
                 fd_dates = p.get('future_dates', [])
+                _bv = p.get('baseline_value')
                 base = [p.get('ent_name', ''), p.get('subname', ''), p.get('param', ''),
-                        p.get('predicted'), p.get('last_actual'),
+                        # v5.76：基线列写纯日均值（与网页核对），预测值在后面的日期列
+                        _bv if _bv is not None else p.get('predicted'),
+                        p.get('baseline_days'), p.get('baseline_total'),
+                        p.get('last_actual'),
                         p.get('trend', ''), p.get('trend_rate', 0),
                         p.get('confidence', 0),
                         # v5.67：该行实际基线方式（含自定义时间段）
@@ -6964,10 +6979,29 @@ class MainWindow(QMainWindow):
             item1.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row_idx, 1, item1)
 
-            # ── 历史基线（当日加权趋势基线）──────────────────────────────
-            base_val = p.get('predicted')
+            # ── 历史基线（v5.76：纯日排放平均值，与网页查询同口径）──────────
+            # 旧版显示 predicted（基线×自学习偏差），与"选中时段日均"对不上；
+            # 现优先显示 baseline_value（未校准），预测列仍显示校准后的值。
+            _bl_val = p.get('baseline_value')
+            base_val = _bl_val if _bl_val is not None else p.get('predicted')
             item_b = QTableWidgetItem(self._fmt_pred_val(base_val))
             item_b.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if p.get('is_emission'):
+                _days = p.get('baseline_days')
+                _total = p.get('baseline_total')
+                _tip = [f"基线方式：{p.get('baseline_label', '') or '--'}"]
+                if _days:
+                    _tip.append(f"参与天数：{_days} 天")
+                if _total:
+                    _tip.append(f"排放量合计：{_total:.3f} kg")
+                    if _days:
+                        _tip.append(f"日均 = {_total:.3f} ÷ {_days} "
+                                    f"= {_total / _days:.3f} kg/天")
+                _tip.append("口径：参与时段内每日排放量（kg/天）的算术平均，"
+                            "与网页历史查询同口径")
+                if p.get('data_source'):
+                    _tip.append(f"数据来源：{p.get('data_source')}")
+                item_b.setToolTip("\n".join(_tip))
             table.setItem(row_idx, 2, item_b)
 
             # ── 最近实测列（v5.64：替代原「日均排放量」重复列）──────────

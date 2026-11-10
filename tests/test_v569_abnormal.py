@@ -148,7 +148,8 @@ class TestScanAll(unittest.TestCase):
         class FakeMulti:
             clients = {'测试企业': FakeClient()}
 
-        warnings = [{'datetime': '2026-11-07 07:30:00', 'ent_name': '测试企业',
+        from datetime import datetime as _dt, timedelta as _td
+        warnings = [{'datetime': (_dt.now() - _td(minutes=30)).strftime('%Y-%m-%d %H:%M:%S'), 'ent_name': '测试企业',
                      'subname': '排口1', 'param': '非甲烷总烃', 'value': 60,
                      'level': '红色预警', 'type': '实时预警'}]
         recs = scan_all(FakeMulti(), warnings, hours=24)

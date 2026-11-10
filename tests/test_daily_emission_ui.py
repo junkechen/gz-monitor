@@ -172,11 +172,12 @@ class TestDailyEmissionUI(unittest.TestCase):
         headers = [win.pred_table.horizontalHeaderItem(i).text()
                    for i in range(win.pred_table.columnCount())]
         self.assertEqual(headers[0], '企业/排放口')
-        self.assertEqual(headers[2], '历史基线')
-        # v5.49：新增日均排放量列
-        self.assertEqual(headers[3], '日均排放量(kg)')
-        self.assertEqual(headers[4], 'D+1')
-        self.assertEqual(headers[10], 'D+7')
+        self.assertTrue(headers[2].startswith('历史基线'), headers[2])
+        # v5.64：日均排放量列改为「最近实测(kg)」
+        self.assertEqual(headers[3], '最近实测(kg)')
+        # v5.63：逐日列显式标注 kg/天 口径
+        self.assertEqual(headers[4], 'D+1(kg)')
+        self.assertEqual(headers[10], 'D+7(kg)')
         self.assertEqual(headers[-3], '趋势')
         self.assertEqual(headers[-2], '置信度')
         self.assertEqual(headers[-1], '预警状态')
