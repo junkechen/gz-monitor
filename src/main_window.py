@@ -252,6 +252,7 @@ class PredictionWorker(QThread):
             # 注意流量是期间累计量，日均值无物理意义；排放量必须逐小时累加。
             from param_units import (
                 is_concentration_param, calc_emission_mass, FLOW_CODES,
+                extract_emission_mass,
             )
             _day_flow_code = None
             for vk in sorted(val_keys):
@@ -279,9 +280,17 @@ class PredictionWorker(QThread):
                         continue
                     _total = 0.0
                     _valid_h = 0
+                    _srv_hits = 0
                     for r in rows:
-                        _m = calc_emission_mass(
-                            r.get(vk), r.get(f'val_{_day_flow_code}'), _c)
+                        # v5.79：服务端小时行自带「排放量(kg)」时优先采用——
+                        # 官网该值按分钟积分（短时峰值远超小时均值×流量的结果），
+                        # 自行按小时重算会显著低估（实测 11 时 0.902 vs 0.1155）。
+                        _m = extract_emission_mass(r, _c, _day_flow_code)
+                        if _m is not None:
+                            _srv_hits += 1
+                        else:
+                            _m = calc_emission_mass(
+                                r.get(vk), r.get(f'val_{_day_flow_code}'), _c)
                         if _m is not None:
                             _total += _m
                             _valid_h += 1
@@ -289,6 +298,8 @@ class PredictionWorker(QThread):
                     # v5.77：记录该天有效小时数——整天/大半天缺数时不能把
                     # 排放量当作 0 计入日均（否则会把基准拉低）
                     agg[f'hours_{_c}'] = _valid_h
+                    # 记录取值来源，便于在日志中核对是否命中服务端排放量
+                    agg[f'emis_src_{_c}'] = 'server' if _srv_hits else 'calc'
             out.append(agg)
         return out
 
@@ -761,6 +772,7 @@ class PredictionWorker(QThread):
                         daily_dates = []
                         daily_flows = []    # 每日累计流量（用于预警反推浓度）
                         daily_hours = []    # v5.77：每日有效小时数（小时聚合来源）
+                        _emis_src = set()   # v5.79：排放量取值来源（server/calc）
                         for r in rows:
                             # 排放量取值优先级：
                             #   1) 小时聚合行已按日汇总的 emis_{code}（Σ小时排放）
@@ -814,6 +826,9 @@ class PredictionWorker(QThread):
                                     _flow_day = None
                                 daily_flows.append(_flow_day)
                                 daily_hours.append(_vh)
+                                if daily_source == '小时数据聚合':
+                                    _emis_src.add(
+                                        r.get(f'emis_src_{code}') or 'calc')
                         # v5.63：剔除"今天"这个未过完的日期——其排放量只累计了
                         # 几个小时，会把基线（上一天）严重拉低。保留前 2 天以上数据。
                         try:
@@ -935,6 +950,7 @@ class PredictionWorker(QThread):
                             f"[PRED_DAILY] {subname}/{param_name} 排放量(kg/天) "
                             f"天数={len(daily_values)} 最近一天={daily_values[-1]:.3f} "
                             f"日均基线={fc.get('baseline')} "
+                            f"排放量来源={'/'.join(sorted(_emis_src)) or daily_source} "
                             f"参与天数={fc.get('baseline_days')} "
                             f"合计={fc.get('baseline_total')} "
                             f"校准后={fc.get('predicted')} "

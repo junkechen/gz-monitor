@@ -85,8 +85,9 @@ def parse_export(path: str) -> Dict[str, Dict]:
     row_param = df.iloc[1]
     row_sub = df.iloc[2]
 
-    # 建立 参数 -> 排放量(t) 列索引
-    param_emis_col: Dict[str, int] = {}
+    # 建立 参数 -> (排放量列索引, 单位换算因子)
+    # 官网两种导出粒度：日数据子列为「排放量(t)」，小时数据子列为「排放量(kg)」
+    param_emis_col: Dict[str, tuple] = {}
     cur = ''
     for j in range(df.shape[1]):
         raw = row_param.iloc[j]
@@ -94,9 +95,11 @@ def parse_export(path: str) -> Dict[str, Dict]:
             cur = _norm_param(raw)
         sub = row_sub.iloc[j]
         if cur and isinstance(sub, str) and '排放量' in sub:
-            param_emis_col[cur] = j
+            low = sub.replace(' ', '').lower()
+            factor = _T_ON_KG if '(t)' in low or '（t）' in low else 1.0
+            param_emis_col[cur] = (j, factor)
     if not param_emis_col:
-        raise ValueError('未找到「排放量(t)」列，请确认导出文件包含排放量数据')
+        raise ValueError('未找到「排放量」列，请确认导出文件包含排放量数据')
 
     ent_col, sub_col, time_col = 0, 1, 2
     out: Dict[str, Dict] = {}
@@ -108,16 +111,20 @@ def parse_export(path: str) -> Dict[str, Dict]:
         subname = str(df.iat[r, sub_col] or '').strip()
         if not ent or not subname:
             continue
-        for param, col in param_emis_col.items():
-            t = _as_float(df.iat[r, col])
-            if t is None:
+        for param, (col, factor) in param_emis_col.items():
+            raw_v = _as_float(df.iat[r, col])
+            if raw_v is None:
                 continue
             key = f"{ent}|{subname}|{param}"
             rec = out.setdefault(key, {
                 'ent': ent, 'subname': subname, 'param': param,
-                'unit_src': 't', 'values_kg': {},
+                'unit_src': 't' if factor == _T_ON_KG else 'kg',
+                'values_kg': {}, 'rows': 0,
             })
-            rec['values_kg'][date] = round(t * _T_ON_KG, 6)
+            kg = raw_v * factor
+            # 小时粒度导出：同一日期多行 → 累加为日排放量（官网日值即 Σ 小时）
+            rec['values_kg'][date] = round(rec['values_kg'].get(date, 0.0) + kg, 6)
+            rec['rows'] = rec.get('rows', 0) + 1
 
     for rec in out.values():
         rec['dates'] = sorted(rec['values_kg'].keys())

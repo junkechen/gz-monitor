@@ -90,6 +90,55 @@ class TestStore(unittest.TestCase):
         self.assertEqual(self.store.get_series('X', 'Y', 'Z'), ([], []))
 
 
+HOUR_SAMPLE = os.path.join(
+    os.path.expanduser('~'), 'Downloads',
+    '历史数据_山东冠洲鼎鑫板材科技有限公司鼎鑫彩涂4#_2026-11-02+00+至+2026-11-02+23.xls')
+
+
+class TestHourlyExportAndServerEmission(unittest.TestCase):
+    """v5.79：官网日值 = Σ 小时排放量；小时行自带「排放量(kg)」须优先采用"""
+
+    def setUp(self):
+        if not os.path.exists(HOUR_SAMPLE):
+            self.skipTest('单日小时导出样例不存在')
+
+    def test_hourly_export_sums_to_daily(self):
+        parsed = wdi.parse_export(HOUR_SAMPLE)
+        key = next(k for k in parsed if '非甲烷总烃' in k)
+        rec = parsed[key]
+        self.assertEqual(rec['unit_src'], 'kg')      # 小时导出为 kg
+        self.assertEqual(rec.get('rows'), 24)
+        self.assertEqual(len(rec['dates']), 1)       # 同一天
+        self.assertAlmostEqual(rec['values_kg']['2026-11-02'], 1.822, places=3)
+        # 与日导出 0.00182 t = 1.82 kg 一致
+        self.assertAlmostEqual(rec['values_kg']['2026-11-02'], 1.82, delta=0.01)
+
+    def test_aggregate_prefers_server_emission(self):
+        import pandas as pd
+        from main_window import PredictionWorker
+        df = pd.read_excel(HOUR_SAMPLE, header=None)
+        rows = [{'DateTime': str(df.iat[r, 2]),
+                 'val_383': str(df.iat[r, 3]),
+                 'val_210': str(df.iat[r, 22]),
+                 'pf_383': str(df.iat[r, 6])} for r in range(3, 27)]
+        a = PredictionWorker._aggregate_hour_rows_to_daily(rows)[0]
+        self.assertEqual(a['emis_src_383'], 'server')
+        self.assertAlmostEqual(a['emis_383'], 1.822, places=3)
+        self.assertEqual(a['hours_383'], 24)
+
+    def test_aggregate_falls_back_to_calc(self):
+        import pandas as pd
+        from main_window import PredictionWorker
+        df = pd.read_excel(HOUR_SAMPLE, header=None)
+        rows = [{'DateTime': str(df.iat[r, 2]),
+                 'val_383': str(df.iat[r, 3]),
+                 'val_210': str(df.iat[r, 22])} for r in range(3, 27)]
+        a = PredictionWorker._aggregate_hour_rows_to_daily(rows)[0]
+        self.assertEqual(a['emis_src_383'], 'calc')
+        # 小时均值口径会低估（官网 1.82），说明服务端值优先的必要性
+        self.assertLess(a['emis_383'], 1.2)
+
+
 class TestWorkerPrefersImported(unittest.TestCase):
     """worker 日分支应优先使用导入的官网序列作为基准"""
 
