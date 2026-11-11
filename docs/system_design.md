@@ -1,5 +1,7 @@
 # GZ_Monitor 三项核心优化 — 架构设计 + 任务分解
 
+> 数据单位、换算与聚合口径见《数据逻辑说明》（docs/数据逻辑说明.md）。
+
 > 版本: v1.0 ｜ 架构师: Bob ｜ 输入: Alice 的 PRD（三项优化）＋ 代码探索
 > 代码基线: `src/main_window.py`（v5.18.1，~11,500 行）、`src/chart_widget.py`、`src/multi_account_api.py`、`src/config.py`
 > 技术栈: Python 3 + PyQt5 + matplotlib(Qt5Agg)，Windows 7 兼容。**不引入任何新重型依赖。**
