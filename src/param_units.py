@@ -140,13 +140,20 @@ def get_concentration_divisor(code) -> Optional[float]:
     return _CONCENTRATION_DIVISOR.get(unit)
 
 
-def calc_emission_rate(concentration, flow, code) -> Optional[float]:
+def calc_emission_rate(concentration, flow, code, hours: float = 1.0) -> Optional[float]:
     """
     计算期间排放量（kg）。
 
-    公式：排放量(kg) = 浓度 × 期间累计流量 / 分母
+    公式：排放量(kg) = 浓度 × 流量(m³/h) × 小时数 / 分母
       废气（mg/m³ × m³）：/1e6
       废水（mg/L  × m³）：/1e3
+
+    v5.80：服务端各粒度的「流量(m3)」均为 **m³/h（瞬时/平均流量）**：
+      - 小时数据：×1h（数值即该小时累计风量）
+      - 日数据：日导出流量为日累计（≈24×小时值），×1 即可
+      - **分钟数据：必须 ×1/60**，否则排放量会被高估 60 倍
+        （实测官网分钟 00:00：1.81 mg/m³ × 119649 m³/h /60 /1e6 = 0.0036 kg，
+        与官网 0.004 kg 一致；不除 60 则为 0.2166 kg）
 
     与网页端口径一致：网页「排放量(kg)」列用期间累计流量，
     实测 4/4 匹配（SO2 13.7×127021/1e6=1.74 kg 等）。
@@ -156,8 +163,9 @@ def calc_emission_rate(concentration, flow, code) -> Optional[float]:
 
     Args:
         concentration: 浓度值（实测或折算）
-        flow:          期间累计流量（m³）
+        flow:          流量（m³/h 或该时段累计 m³，见上文）
         code:          浓度参数的 code（决定换算分母）
+        hours:         时间系数。分钟数据传 1/60，小时/日数据传 1.0
 
     Returns:
         排放量 kg；任一输入无效或该参数不可计算时返回 None。
@@ -172,7 +180,9 @@ def calc_emission_rate(concentration, flow, code) -> Optional[float]:
         return None
     if c != c or f != f:          # NaN 检查
         return None
-    return (c * f) / divisor
+    if hours is None or hours <= 0:
+        hours = 1.0
+    return (c * f * float(hours)) / divisor
 
 
 # 语义化别名：明确表示「期间排放质量(kg)」

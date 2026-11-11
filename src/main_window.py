@@ -4675,6 +4675,8 @@ class MainWindow(QMainWindow):
         # index: -1=分钟, 1=小时, 2=日, 3=月  （API 不直接支持季度/年，用月数据后端聚合）
         index_map = {0: -1, 1: 1, 2: 2, 3: 3, 4: 3, 5: 3}
         index = index_map.get(tt_idx, 1)
+        # v5.80：服务端「流量(m3)」为 m³/h，分钟数据算排放量须 ×1/60
+        self._history_time_scale = (1.0 / 60.0) if tt_idx == 0 else 1.0
         time_type_label = ["分钟数据", "小时数据", "日数据", "月数据", "季度数据", "年数据"][tt_idx]
 
         # v5.18: 日/月数据服务端不支持(index=2/3返回空)，改为查小时数据后客户端聚合
@@ -5321,11 +5323,23 @@ class MainWindow(QMainWindow):
                         QTableWidgetItem(_fmt_val(row.get(f"cvt_{code}"))))
                     c += 1
                 if with_emis:
-                    # 排放量：服务端字段优先，取不到再按 实测浓度×累计流量 计算。
+                    # 排放量：优先用小时聚合行已算好的 emis_（Σ逐时，含服务端
+                    # 权威值），其次服务端字段，最后按 实测浓度×流量 计算。
                     # v5.51：用实测值（网页端口径），不用折算值。
-                    emis = extract_emission_mass(row, code)
+                    # v5.80：分钟数据须把 m³/h 折算成该分钟风量（×1/60）。
+                    emis = None
+                    _raw_e = row.get(f'emis_{code}')
+                    if _raw_e not in (None, '', '--'):
+                        try:
+                            emis = float(_raw_e)
+                        except (ValueError, TypeError):
+                            emis = None
+                    if emis is None:
+                        emis = extract_emission_mass(row, code)
                     if emis is None and val not in (None, '', '--'):
-                        emis = calc_emission_rate(val, _row_flow(row), code)
+                        emis = calc_emission_rate(
+                            val, _row_flow(row), code,
+                            hours=self.__dict__.get('_history_time_scale', 1.0))
                     self.history_table.setItem(
                         row_idx, c, QTableWidgetItem(format_emission_rate(emis)))
         self.history_table.setUpdatesEnabled(True)
@@ -5434,9 +5448,16 @@ class MainWindow(QMainWindow):
                     record[mkey] = val
                     if is_concentration_param(code):
                         mass = None
-                        if flow_code and val != "":
+                        _raw_e = row.get(f'emis_{code}')
+                        if _raw_e not in (None, '', '--'):
+                            try:
+                                mass = float(_raw_e)
+                            except (ValueError, TypeError):
+                                mass = None
+                        if mass is None and flow_code and val != "":
                             mass = calc_emission_mass(
-                                val, row.get(f"val_{flow_code}"), code)
+                                val, row.get(f"val_{flow_code}"), code,
+                                hours=self.__dict__.get('_history_time_scale', 1.0))
                         record[f"{name}排放量(kg)"] = (
                             round(mass, 4) if mass is not None else "")
                 records.append(record)
