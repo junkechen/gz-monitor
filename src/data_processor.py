@@ -1009,7 +1009,9 @@ def predict_daily_emission(hour_values: List[float],
                            baseline_mode: str = 'auto',
                            accumulate_feedback: bool = False,
                            apply_correction: bool = True,
-                           horizon_type: str = '日排放量') -> dict:
+                           horizon_type: str = '日排放量',
+                           baseline_override: float = None,
+                           baseline_override_label: str = '') -> dict:
     """
     基于历史每日排放量预测未来每日排放量。
 
@@ -1106,8 +1108,17 @@ def predict_daily_emission(hour_values: List[float],
     if baseline_mode == 'custom' and _CUSTOM_BASELINE.get('range_enabled'):
         _base_vals, _base_dates = vals_full, dates_full
     _baseline_detail = {}
-    baseline, baseline_label = _compute_daily_baseline(
-        _base_vals, _base_dates, baseline_mode, _baseline_detail)
+    if baseline_override is not None:
+        # v5.78：外部指定基线（如「官网导入日数据」的日均），直接采用，
+        # 不再套用 上一天/工作日 组合规则，保证与网页口径一致
+        baseline = float(baseline_override)
+        baseline_label = baseline_override_label or '指定基线'
+        _baseline_detail = {'value': baseline, 'label': baseline_label,
+                            'days': len(_base_vals),
+                            'total': round(sum(_base_vals), 4)}
+    else:
+        baseline, baseline_label = _compute_daily_baseline(
+            _base_vals, _base_dates, baseline_mode, _baseline_detail)
 
     # ── 3. 日环比趋势率（线性回归，仅 R²≥0.25 时采信）──────────────────────
     trend_rate = 0.0

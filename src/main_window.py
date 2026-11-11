@@ -33,6 +33,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# v5.78：服务端日数据接口(index=2)可用性（None=未探测 / False=不可用）
+# 实测该接口在本服务端始终返回空，探测一次后本运行期直接走小时聚合。
+_DAILY_API_AVAILABLE = None
+
 
 # ── v5.58 自定义基线配置持久化（用户自主设置，独立于预测算法）─────────────
 def _baseline_custom_path() -> str:
@@ -670,15 +674,30 @@ class PredictionWorker(QThread):
                     _start_str = _start.strftime('%Y-%m-%d 00:00')
                     _end_str = _end.strftime('%Y-%m-%d 23:59')
 
-                    # 日数据缓存 TTL 较长（10 分钟）：日数据不会分钟级变化
-                    cache_key = f"{subid}_daily_{days_back}_{codes}{'_corrected' if use_corrected else ''}"
-                    result = _get_cached(
-                        cache_key, 600,
-                        lambda *a, **kw: self._query_history_safe(client, *a, **kw),
-                        subid, subtype_code, codes, _start_str, _end_str,
-                        index=2, use_corrected=use_corrected, page=1, rows=1000)
-                    rows = result.get('rows', []) or []
+                    # v5.78：服务端 index=2（日数据）实测一直返回空（历史 258 次），
+                    # 本运行期一旦确认不可用就不再重复请求，直接走小时聚合，减少等待。
+                    global _DAILY_API_AVAILABLE
+                    rows = []
                     daily_source = '日数据'
+                    if _DAILY_API_AVAILABLE is False:
+                        logger.debug(
+                            f"[PRED_WORKER] {subname}: 已知日数据接口不可用，"
+                            f"跳过 index=2 查询")
+                    else:
+                        # 日数据缓存 TTL 较长（10 分钟）：日数据不会分钟级变化
+                        cache_key = f"{subid}_daily_{days_back}_{codes}{'_corrected' if use_corrected else ''}"
+                        result = _get_cached(
+                            cache_key, 600,
+                            lambda *a, **kw: self._query_history_safe(client, *a, **kw),
+                            subid, subtype_code, codes, _start_str, _end_str,
+                            index=2, use_corrected=use_corrected, page=1, rows=1000)
+                        rows = result.get('rows', []) or []
+                        if not rows and _DAILY_API_AVAILABLE is None:
+                            _DAILY_API_AVAILABLE = False
+                            logger.info(
+                                "[PRED_WORKER] 服务端日数据接口(index=2)返回空，"
+                                "本运行期改用小时数据聚合（官网日数据可通过"
+                                "「导入官网日数据」功能直接采用）")
 
                     # ── v5.47 兜底：日数据为空/不足时，用小时数据聚合为日均值 ──
                     # 部分排口（尤其 VOCs/废水）服务端不落日数据，仅有小时数据。
@@ -840,6 +859,28 @@ class PredictionWorker(QThread):
                             except Exception:  # noqa
                                 pass
 
+                        # v5.78：优先使用「官网导出日数据」导入的日排放量（t→kg）。
+                        # 官网日数据含短时峰值/人工补录，只有直接采用才能与网页
+                        # 逐日一致；小时聚合作为兜底。
+                        try:
+                            from web_daily_import import get_store as _gw
+                            _wv, _wd = _gw().get_series(
+                                ent_name, subname, param_name,
+                                _start.strftime('%Y-%m-%d'),
+                                _end.strftime('%Y-%m-%d'))
+                        except Exception:
+                            _wv, _wd = [], []
+                        if len(_wv) >= 3:
+                            daily_values = [float(v) for v in _wv]
+                            daily_dates = list(_wd)
+                            daily_flows = [None] * len(daily_values)
+                            daily_hours = [24] * len(daily_values)
+                            daily_source = '官网导入'
+                            logger.info(
+                                f"[PRED_DAILY] {subname}/{param_name}: "
+                                f"使用官网导入日排放量 {len(_wv)} 天"
+                                f"（合计 {sum(daily_values):.3f} kg）")
+
                         # 至少需要 3 天历史才有外推意义
                         if len(daily_values) < 3:
                             reason = (f"{subname}/{param_name}：历史排放量仅 "
@@ -872,7 +913,15 @@ class PredictionWorker(QThread):
                             baseline_mode=self._baseline_mode,
                             accumulate_feedback=True,
                             apply_correction=True,
-                            horizon_type='日排放量')
+                            horizon_type='日排放量',
+                            # v5.78：官网导入的序列直接取日均作基准，
+                            # 不再套用「上一天+工作日」组合
+                            baseline_override=(
+                                sum(daily_values) / len(daily_values)
+                                if daily_source == '官网导入' else None),
+                            baseline_override_label=(
+                                f'官网导入日均({len(daily_values)}天)'
+                                if daily_source == '官网导入' else ''))
                         if fc.get('predicted') is None:
                             continue
 
@@ -2618,6 +2667,18 @@ class MainWindow(QMainWindow):
         self.export_pred_btn.setToolTip("将当前预测结果导出为 Excel（含未来逐日/逐时预测）")
         self.export_pred_btn.clicked.connect(self._export_prediction)
         pred_layout.addWidget(self.export_pred_btn)
+
+        pred_layout.addSpacing(10)
+
+        # v5.78：导入官网导出的历史数据（排放量 t → kg），作为日预测基准
+        self.import_web_daily_btn = QPushButton("📄 导入官网日数据")
+        self.import_web_daily_btn.setMinimumWidth(140)
+        self.import_web_daily_btn.setToolTip(
+            "选择官网「历史数据」导出的 Excel(.xls/.xlsx)，"
+            "软件读取「排放量(t)」列并换算为 kg，作为日排放量预测基准，"
+            "可与网页逐日核对")
+        self.import_web_daily_btn.clicked.connect(self._import_web_daily)
+        pred_layout.addWidget(self.import_web_daily_btn)
 
         pred_layout.addSpacing(10)
 
@@ -5433,6 +5494,35 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             QMessageBox.warning(self, "导出失败", f"导出时发生错误:\n{str(e)}")
+
+    def _import_web_daily(self):
+        """v5.78：导入官网导出的历史数据，排放量(t)→kg 作为日预测基准
+
+        官网日数据页面可直接查询/导出，但客户端接口 `index=2` 始终返回空，
+        小时聚合又会被平滑/缺数影响。导入后基准即等于官网日均，可逐日核对。
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择官网导出的历史数据文件", "",
+            "Excel 文件 (*.xls *.xlsx);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            from web_daily_import import import_file, get_store
+            n = import_file(path)
+            total = get_store().matched_count()
+            QMessageBox.information(
+                self, "导入完成",
+                f"已解析 {n} 个「日期-参数」排放量数据点，"
+                f"当前共 {total} 组「企业/排口/参数」序列。\n\n"
+                "排放量已按 1 t = 1000 kg 换算。\n"
+                "重新点击「🚀 开始预测」后，日排放量基准将直接使用官网数据，"
+                "可与网页逐日核对。")
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "导入失败",
+                f"缺少解析依赖：{e}\n官网导出的 .xls 需要 xlrd 库。")
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"无法解析该文件：\n{e}")
 
     def _export_prediction(self):
         """v5.58 导出最近一次预测结果到 Excel（含自学习/基线信息）。
