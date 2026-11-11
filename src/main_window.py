@@ -274,12 +274,17 @@ class PredictionWorker(QThread):
                     if _c == _day_flow_code or not is_concentration_param(_c):
                         continue
                     _total = 0.0
+                    _valid_h = 0
                     for r in rows:
                         _m = calc_emission_mass(
                             r.get(vk), r.get(f'val_{_day_flow_code}'), _c)
                         if _m is not None:
                             _total += _m
+                            _valid_h += 1
                     agg[f'emis_{_c}'] = _total if _total > 0 else None
+                    # v5.77：记录该天有效小时数——整天/大半天缺数时不能把
+                    # 排放量当作 0 计入日均（否则会把基准拉低）
+                    agg[f'hours_{_c}'] = _valid_h
             out.append(agg)
         return out
 
@@ -736,6 +741,7 @@ class PredictionWorker(QThread):
                         daily_values = []   # 每日排放量（kg）
                         daily_dates = []
                         daily_flows = []    # 每日累计流量（用于预警反推浓度）
+                        daily_hours = []    # v5.77：每日有效小时数（小时聚合来源）
                         for r in rows:
                             # 排放量取值优先级：
                             #   1) 小时聚合行已按日汇总的 emis_{code}（Σ小时排放）
@@ -750,10 +756,24 @@ class PredictionWorker(QThread):
                                     except (ValueError, TypeError):
                                         mass = None
                             if mass is None:
-                                mass = extract_emission_mass(r, code)
+                                mass = extract_emission_mass(r, code, flow_code)
                             if mass is None:
                                 mass = calc_emission_mass(
                                     r.get(val_key), r.get(f'val_{flow_code}'), code)
+                            # v5.77：小时聚合来源需校验该天有效小时数——
+                            # 完全缺数（0 或极少小时）的 0 值不能计入日均，
+                            # 否则会把基准拉低。正数视为已监测的真实排��。
+                            _vh = None
+                            if daily_source == '小时数据聚合' and mass is not None:
+                                try:
+                                    _vh = int(float(r.get(f'hours_{code}', 0)))
+                                except (ValueError, TypeError):
+                                    _vh = None
+                                if mass == 0 and _vh is not None and _vh < 12:
+                                    logger.debug(
+                                        f"[PRED_DAILY] {subname}/{param_name}: "
+                                        f"{r.get('DateTime')} 有效小时仅 {_vh} 且排放为0，跳过")
+                                    continue
                             # v5.76：0 排放是有效的真实值（停产/达标零排放），
                             # 应计入日均；只排除无数据（None）
                             if mass is not None and mass >= 0:
@@ -774,6 +794,7 @@ class PredictionWorker(QThread):
                                 if _flow_day is not None and _flow_day <= 0:
                                     _flow_day = None
                                 daily_flows.append(_flow_day)
+                                daily_hours.append(_vh)
                         # v5.63：剔除"今天"这个未过完的日期——其排放量只累计了
                         # 几个小时，会把基线（上一天）严重拉低。保留前 2 天以上数据。
                         try:
@@ -783,11 +804,41 @@ class PredictionWorker(QThread):
                                 daily_values.pop()
                                 daily_dates.pop()
                                 daily_flows.pop()
+                                daily_hours.pop()
                                 logger.debug(
                                     f"[PRED_WORKER] {subname}/{param_name}: "
                                     f"剔除未过完的当天数据，保留 {len(daily_values)} 天")
                         except Exception:  # noqa
                             pass
+
+                        # v5.77：小时聚合来源下，剔除"有效小时很少且排放量远低于
+                        # 中位数"的天——这类天典型是缺数，会把日均显著拉低。
+                        if (daily_source == '小时数据聚合'
+                                and len(daily_values) >= 4):
+                            try:
+                                import statistics as _st
+                                _med = _st.median(daily_values)
+                                if _med > 0:
+                                    _keep = [
+                                        (v, d, f, h) for v, d, f, h in zip(
+                                            daily_values, daily_dates,
+                                            daily_flows, daily_hours)
+                                        if (h is None or h >= 18
+                                            or v >= _med * 0.3)
+                                    ]
+                                    if len(_keep) >= 3:
+                                        dropped = len(daily_values) - len(_keep)
+                                        if dropped > 0:
+                                            daily_values = [x[0] for x in _keep]
+                                            daily_dates = [x[1] for x in _keep]
+                                            daily_flows = [x[2] for x in _keep]
+                                            daily_hours = [x[3] for x in _keep]
+                                            logger.debug(
+                                                f"[PRED_WORKER] {subname}/{param_name}: "
+                                                f"剔除 {dropped} 个缺数天，"
+                                                f"保留 {len(daily_values)} 天")
+                            except Exception:  # noqa
+                                pass
 
                         # 至少需要 3 天历史才有外推意义
                         if len(daily_values) < 3:
@@ -6999,6 +7050,8 @@ class MainWindow(QMainWindow):
                                     f"= {_total / _days:.3f} kg/天")
                 _tip.append("口径：参与时段内每日排放量（kg/天）的算术平均，"
                             "与网页历史查询同口径")
+                _tip.append("注：官网导出「排放量」单位为吨(t)，1 t = 1000 kg，"
+                            "换算后即可逐日对照")
                 if p.get('data_source'):
                     _tip.append(f"数据来源：{p.get('data_source')}")
                 item_b.setToolTip("\n".join(_tip))

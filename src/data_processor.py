@@ -1070,8 +1070,11 @@ def predict_daily_emission(hour_values: List[float],
 
     vals = [p[0] for p in pairs]
     n = len(vals)
+    # v5.77：保留完整序列用于「历史基准」。官网日排放量含短时峰值（如某天
+    # 5.97 kg 而平时 1 kg），IQR 会把真实峰值当异常剔除，导致基准低于官网。
+    vals_full, dates_full = list(vals), [p[1] for p in pairs]
 
-    # ── 1. 异常值过滤（与小时预测一致，仅在数据量足够时启用）───────────────
+    # ── 1. 异常值过滤（仅用于趋势/预测，不影响基准展示）───────────────────
     if n >= 7:
         sv = sorted(vals)
         q1 = sv[len(sv) // 4]
@@ -1096,9 +1099,15 @@ def predict_daily_emission(hour_values: List[float],
                               horizon_type)
 
     # ── 2. 基线（v5.58 可选：默认 上一天 + 前10个工作日）──────────────────
+    # v5.77：自定义时间段核对口径用**完整序列**（含真实峰值天），与官网
+    # 「排放量(t)×1000」一致；其余模式仍用 IQR 过滤后的序列，避免偶发尖峰
+    # 影响上一天/工作日均值。
+    _base_vals, _base_dates = vals, dates
+    if baseline_mode == 'custom' and _CUSTOM_BASELINE.get('range_enabled'):
+        _base_vals, _base_dates = vals_full, dates_full
     _baseline_detail = {}
     baseline, baseline_label = _compute_daily_baseline(
-        vals, dates, baseline_mode, _baseline_detail)
+        _base_vals, _base_dates, baseline_mode, _baseline_detail)
 
     # ── 3. 日环比趋势率（线性回归，仅 R²≥0.25 时采信）──────────────────────
     trend_rate = 0.0

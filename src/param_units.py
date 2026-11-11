@@ -179,17 +179,24 @@ def calc_emission_rate(concentration, flow, code) -> Optional[float]:
 calc_emission_mass = calc_emission_rate
 
 
-def extract_emission_mass(row: dict, code) -> Optional[float]:
+def extract_emission_mass(row: dict, code, flow_code=None) -> Optional[float]:
     """
     从服务端行数据中读取排放量（kg）——服务端权威值优先。
 
-    网页端表格含「排放量(kg)」列，说明服务端**可能**直接返回该字段。
-    接口文档未记录字段名，故按 EMISSION_FIELD_CANDIDATES 枚举候选，
-    命中且值有效则返回；否则返回 None（调用方回退到计算值）。
+    网页端表格含「排放量(t)」列（注意导出为吨，1 t = 1000 kg），说明服务端
+    **可能**直接返回该字段。接口文档未记录字段名，故按
+    EMISSION_FIELD_CANDIDATES 枚举候选，命中且值有效则返回；
+    否则返回 None（调用方回退到计算值）。
+
+    v5.77：服务端字段单位不固定（t 或 kg）。传入 flow_code 时，用
+    「浓度 × 流量 / 分母」的 kg 值做量级校验：
+      - 读数与换算值同量级（比值 0.1~10）→ 视为 kg，原样返回；
+      - 读数比换算值小约 1000 倍（比值 1e-4~1e-2）→ 视为吨，×1000。
 
     Args:
-        row:  服务端返回的一行数据（dict）
-        code: 参数代码
+        row:       服务端返回的一行数据（dict）
+        code:      参数代码
+        flow_code: 流量参数代码（可选，用于单位归一化校验）
 
     Returns:
         排放量 kg；未找到字段或值无效时返回 None。
@@ -199,6 +206,7 @@ def extract_emission_mass(row: dict, code) -> Optional[float]:
     c = normalize_code(code)
     if not c:
         return None
+    raw = None
     for pattern in EMISSION_FIELD_CANDIDATES:
         key = pattern.format(code=c)
         if key not in row:
@@ -212,8 +220,20 @@ def extract_emission_mass(row: dict, code) -> Optional[float]:
             continue
         if fv != fv:              # NaN
             continue
-        return fv
-    return None
+        raw = fv
+        break
+    if raw is None:
+        return None
+
+    # v5.77：单位归一化（t → kg）
+    if flow_code:
+        kg = calc_emission_rate(row.get(f'val_{c}'),
+                                row.get(f'val_{normalize_code(flow_code)}'), c)
+        if kg is not None and kg > 0:
+            ratio = raw / kg
+            if 1e-4 <= ratio <= 1e-2:      # 服务端以吨返回
+                return raw * 1000.0
+    return raw
 
 
 def find_flow_code(code_list) -> Optional[str]:
