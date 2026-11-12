@@ -23,3 +23,7 @@ logs/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# 运行时生成的数据产物（非源码）
+data/abnormal_records.json
+data/pred_calibration.json
