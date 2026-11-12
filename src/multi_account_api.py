@@ -14,6 +14,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 from config import BASE_URL, AES_KEY, AES_IV
+from api_client import bare_date
 
 
 def _get_log_dir() -> str:
@@ -1039,7 +1040,14 @@ class GZApiClient:
             {"total": 总条数, "rows": 数据列表, "error": 错误信息}
         """
         import urllib.parse
-        
+
+        # v5.83：日数据(index=2)必须用裸日期 yyyy-MM-dd。
+        # 带 ' 00:00'/' 23:59' 时间后缀时服务端返回空——这是 v5.78
+        # 误判「日接口恒空」的真正根因（小时接口恰好容忍时间后缀）。
+        if index == 2:
+            start = bare_date(start)
+            end = bare_date(end)
+
         encoded_codes = urllib.parse.quote(codes)
         show_upload = 1 if use_corrected else 0
         body = (

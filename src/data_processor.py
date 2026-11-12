@@ -1172,6 +1172,10 @@ def predict_daily_emission(hour_values: List[float],
         for d in range(1, horizon_days + 1):
             bias_d, conf_scale_d = _calib_correction(horizon_type, d)
             v = max(0.0, raw_daily[d - 1] * bias_d)
+            # v5.83：校准修正后重新封顶——偏差系数可能把已封顶值
+            # 再推高越过 threshold×1.5（遗留缺陷，test_i_threshold_cap 一直未过）
+            if threshold is not None and threshold > 0:
+                v = min(v, threshold * 1.5)
             future_daily.append(round(v, 4))
             if d - 1 < len(confidences):
                 confidences[d - 1] = round(

@@ -34,7 +34,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # v5.78：服务端日数据接口(index=2)可用性（None=未探测 / False=不可用）
-# 实测该接口在本服务端始终返回空，探测一次后本运行期直接走小时聚合。
+# v5.83 更正：该接口并非恒空——v5.78 误判的根因是查询参数带了时间后缀
+# （' 00:00'/' 23:59'），日接口只接受裸日期。api_client 已修复，此处
+# 探测逻辑保留为防御（万一服务端再度异常，自动降级小时聚合）。
 _DAILY_API_AVAILABLE = None
 
 
@@ -685,8 +687,9 @@ class PredictionWorker(QThread):
                     _start_str = _start.strftime('%Y-%m-%d 00:00')
                     _end_str = _end.strftime('%Y-%m-%d 23:59')
 
-                    # v5.78：服务端 index=2（日数据）实测一直返回空（历史 258 次），
-                    # 本运行期一旦确认不可用就不再重复请求，直接走小时聚合，减少等待。
+                    # v5.83 更正：index=2 日接口可用（v5.78 误判为恒空，根因是
+                    # 查询参数带时间后缀；api_client 现已剥离后缀，传裸日期）。
+                    # 探测逻辑保留为防御：万一服务端返回空，降级小时聚合。
                     global _DAILY_API_AVAILABLE
                     rows = []
                     daily_source = '日数据'
@@ -4679,7 +4682,9 @@ class MainWindow(QMainWindow):
         self._history_time_scale = (1.0 / 60.0) if tt_idx == 0 else 1.0
         time_type_label = ["分钟数据", "小时数据", "日数据", "月数据", "季度数据", "年数据"][tt_idx]
 
-        # v5.18: 日/月数据服务端不支持(index=2/3返回空)，改为查小时数据后客户端聚合
+        # v5.18: 日/月数据曾因带时间后缀返回空(index=2/3)，改为查小时数据后客户端聚合
+        # v5.83：根因已修（api_client 对 index=2 剥离时间后缀），预测基准已改回
+        # 服务端日数据；历史页维持小时聚合口径不变（月数据接口未验证，保持现状）
         _original_index = index
         if index >= 2:
             index = 1  # 用小时数据
@@ -5535,8 +5540,10 @@ class MainWindow(QMainWindow):
     def _import_web_daily(self):
         """v5.78：导入官网导出的历史数据，排放量(t)→kg 作为日预测基准
 
-        官网日数据页面可直接查询/导出，但客户端接口 `index=2` 始终返回空，
-        小时聚合又会被平滑/缺数影响。导入后基准即等于官网日均，可逐日核对。
+        v5.83 更正：客户端日接口(index=2)已可用（裸日期），但服务端日行只有
+        「日均浓度×日累计流量」，官网日「排放量」是分钟级积分——NMHC 等波动
+        大的参数在峰值天会明显高于浓度×流量（实测 11-02 达 1.67 倍）。因此
+        导入官网日数据仍是唯一能与官网逐日完全一致的基准来源。
         """
         path, _ = QFileDialog.getOpenFileName(
             self, "选择官网导出的历史数据文件", "",

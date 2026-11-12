@@ -20,6 +20,15 @@ def aes_encrypt(text: str) -> str:
     return ct.hex()
 
 
+def bare_date(s: str) -> str:
+    """v5.83：日数据接口(index=2)只接受裸日期 yyyy-MM-dd。
+
+    带 ' 00:00'/' 23:59' 等时间后缀时服务端返回空（小时接口恰好容忍
+    时间后缀，因此 v5.78 曾误判日接口恒空）。
+    """
+    return str(s).split(' ')[0]
+
+
 class GZApiClient:
     """GZ安环API客户端"""
 
@@ -434,6 +443,12 @@ class GZApiClient:
         """
         try:
             import urllib.parse
+            # v5.83：日数据(index=2)必须用裸日期 yyyy-MM-dd。
+            # 带 ' 00:00'/' 23:59' 时间后缀时服务端返回空——这是 v5.78
+            # 误判「日接口恒空」的真正根因（小时接口恰好容忍时间后缀）。
+            if index == 2:
+                start = bare_date(start)
+                end = bare_date(end)
             encoded_codes = urllib.parse.quote(codes)
             show_upload = 1 if use_corrected else 0
             body = (
