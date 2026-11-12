@@ -259,7 +259,14 @@ def extract_emission_mass(row: dict, code, flow_code=None) -> Optional[float]:
                                 row.get(f'val_{normalize_code(flow_code)}'), c)
         if kg is not None and kg > 0:
             ratio = raw / kg
-            if 1e-4 <= ratio <= 1e-2:      # 服务端以吨返回
+            # v5.85：吨判定窗口由 [1e-4, 1e-2] 放宽到 [1e-4, 1e-1]。
+            # 服务端日粒度 ex_ 恒为「吨」，与 val×flow/1e6 的 kg 估算值之比
+            # 正常约 1e-3；但个别天（如 11-07）日均浓度 val_383 失真（1.09 实为
+            # ~11.78 mg/m³），导致 kg 估算值被压低、比值升到 ~1.08e-2，旧上限
+            # 1e-2 把它误判为「已是 kg」，5.97 kg 被读成 0.006 kg（低估近千倍）。
+            # 合法 kg 值的比值约 1（0.1~10），与吨区间（<1e-1）天然分离，
+            # 故上限放到 1e-1 既兜住失真天，又不会把真 kg 误乘 1000。
+            if 1e-4 <= ratio <= 1e-1:      # 服务端以吨返回
                 return raw * 1000.0
     return raw
 
