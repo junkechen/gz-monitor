@@ -109,6 +109,7 @@ EMISSION_UNIT = 'kg'
 # 接口文档未记录字段名（仅提到顶层 pf_flow），故按可能性排序枚举候选，
 # 命中即采用服务端权威值，未命中则回退到客户端计算。
 EMISSION_FIELD_CANDIDATES: tuple = (
+    'ex_{code}',      # 服务端「排放量」权威字段（小时为 kg、日为 t，下方自动吨→kg）
     'pf_{code}',      # 与顶层 pf_flow 同前缀，最可能
     'pfl_{code}',
     'flow_{code}',
@@ -241,6 +242,8 @@ def extract_emission_mass(row: dict, code, flow_code=None) -> Optional[float]:
         except (ValueError, TypeError):
             continue
         if fv != fv:              # NaN
+            continue
+        if fv <= 0:               # 空排放字段（分钟粒度常返回 "0"）→ 跳过，回退到计算值
             continue
         raw = fv
         break
