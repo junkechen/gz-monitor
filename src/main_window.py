@@ -5546,14 +5546,24 @@ class MainWindow(QMainWindow):
         try:
             from web_daily_import import import_file, get_store
             n = import_file(path)
-            total = get_store().matched_count()
-            QMessageBox.information(
-                self, "导入完成",
-                f"已解析 {n} 个「日期-参数」排放量数据点，"
-                f"当前共 {total} 组「企业/排口/参数」序列。\n\n"
-                "排放量已按 1 t = 1000 kg 换算。\n"
-                "重新点击「🚀 开始预测」后，日排放量基准将直接使用官网数据，"
-                "可与网页逐日核对。")
+            store = get_store()
+            total = store.matched_count()
+            partial = getattr(store, 'last_import_partial', 0)
+            tip = (f"已解析 {n} 个「日期-参数」排放量数据点，"
+                   f"当前共 {total} 组「企业/排口/参数」序列。\n\n"
+                   "排放量已按 1 t = 1000 kg 换算。\n")
+            if partial:
+                # v5.82：部分天（如仅 00-06、07-23）只有半天数据，混入
+                # 日均会显著拉低基准，故只记录、不参与基准，并明确告知用户。
+                tip += (f"注意：已忽略 {partial} 个不完整日（小时/分钟导出"
+                        f"未覆盖全天，例如只有 00-06 或 07-23），"
+                        f"避免半天数据拉低日均基准；这些数值仍保留可供查看。\n"
+                        f"需要完整日排放量，请在官网导出「日数据」。\n")
+            if n == 0:
+                tip += "本次未新增完整日数据，基准保持不变。\n"
+            tip += ("\n重新点击「🚀 开始预测」后，日排放量基准将直接使用"
+                    "官网数据，可与网页逐日核对。")
+            QMessageBox.information(self, "导入完成", tip)
         except ImportError as e:
             QMessageBox.critical(
                 self, "导入失败",

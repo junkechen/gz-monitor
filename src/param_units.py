@@ -35,6 +35,18 @@ GZ安环监测系统 - 监测参数单位表与排放量计算
   3. 服务端可能直接返回排放量字段（网页有「排放量(kg)」列），
      故优先 extract_emission_mass() 读取，取不到再按上式计算。
 
+**v5.82 补充：两套数据源的「流量」含义不同，勿混用（4 份冠洲导出实测）**：
+  A. 服务端 API（实时/历史/分钟）：流量为 m³/h（瞬时/平均风量）。
+     分钟粒度须传 hours=1/60 折算成该分钟桶体积（v5.80）。
+  B. 官网「历史数据」导出 xls：流量(m3) 列的语义**不统一**——
+     废气小时值 ≈ m³/h、日值 = 日累计（≈24×小时），
+     废水 10 分钟桶却是该桶累计体积（实测 4 m³：
+     4.65 mg/L × 4 /1000 = 0.0186 kg ≈ 官网 0.019 kg）。
+     因此导入路径**不重算**，直接采用导出文件的「排放量」列
+     （web_daily_import.parse_export），只有服务端 API 才用本模块的公式。
+  废水口（总排口：COD/氨氮，mg/L）分母 1000；
+  废气口（VOCs总排口：非甲烷总烃等，mg/m³）分母 1e6，日导出(t)=kg/1000。
+
 只有"浓度类"参数（单位为 mg/m³ 或 mg/L）才可计算排放量；
 pH、温度、压力、流速、含氧量、湿度、流量本身 均不可计算。
 """
@@ -233,7 +245,10 @@ def extract_emission_mass(row: dict, code, flow_code=None) -> Optional[float]:
         raw = fv
         break
     if raw is None:
-        return None
+        # v5.82：候选字段名全部未命中时用「关键词 + 量级」自动发现。
+        # 旧版此处直接 return None，导致 detect_server_emission 永远不可达
+        # （它恰好是为「字段名未知」这个场景准备的）。
+        return detect_server_emission(row, c, flow_code)
 
     # v5.77：单位归一化（t → kg）
     if flow_code:
@@ -244,6 +259,55 @@ def extract_emission_mass(row: dict, code, flow_code=None) -> Optional[float]:
             if 1e-4 <= ratio <= 1e-2:      # 服务端以吨返回
                 return raw * 1000.0
     return raw
+
+
+# v5.82：服务端排放量字段名未知时的"关键词 + 量级"双重校验自动发现。
+# 仅当字段名含以下关键词、且数值与公式换算值同量级（0.5~2 倍）时才采纳，
+# 避免把标准值(50)、状态值等误当排放量。
+_EMISSION_KEY_HINTS = (
+    'emis', 'pf_', 'pf{', 'ex_', 'emission', 'pollut',
+    'discharg', 'mass', 'output',
+)
+
+
+def detect_server_emission(row: dict, code, flow_code=None) -> Optional[float]:
+    """自动发现服务端行内的排放量字段（kg），未命中返回 None。
+
+    官网导出的历史数据每行都带「排放量(kg)」列（由分钟数据积分而来），
+    说明服务端确实能给出该值，但接口返回的字段名未知。命中条件：
+      1) 字段名含排放量相关关键词；
+      2) 数值与「浓度×流量/分母」同量级（0.5~2 倍），否则视为非排放量字段。
+    """
+    if not isinstance(row, dict):
+        return None
+    c = normalize_code(code)
+    if not c:
+        return None
+    calc = None
+    if flow_code:
+        calc = calc_emission_rate(row.get(f'val_{c}'),
+                                  row.get(f'val_{normalize_code(flow_code)}'), c)
+    for k, v in row.items():
+        kl = str(k).lower()
+        if not any(h in kl for h in _EMISSION_KEY_HINTS):
+            continue
+        if kl.startswith('val_') or kl.startswith('state_') or kl.startswith('status_'):
+            continue
+        try:
+            fv = float(v)
+        except (ValueError, TypeError):
+            continue
+        if fv != fv or fv <= 0:
+            continue
+        if calc and calc > 0:
+            # v5.82：放宽到 0.1~10 倍。官网小时排放量按分钟积分得到，
+            # 与「小时平均浓度 × 小时流量」可能差数倍（v5.79 实测 11 时
+            # 0.902 kg vs 公式 0.1155 kg，7.8 倍），旧的 0.5~2 倍会
+            # 把正确的服务端值误杀；50 这类标准值仍会被排除（数百倍）。
+            if not (0.1 <= fv / calc <= 10.0):
+                continue
+        return fv
+    return None
 
 
 def find_flow_code(code_list) -> Optional[str]:
@@ -344,6 +408,7 @@ __all__ = [
     'FLOW_CODES',
     'EMISSION_UNIT',
     'EMISSION_FIELD_CANDIDATES',
+    'detect_server_emission',
     'normalize_code',
     'get_param_unit',
     'is_concentration_param',

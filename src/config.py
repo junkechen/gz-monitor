@@ -50,7 +50,7 @@ VERSION3_MANAGE_PASS = "3C323@" # 版本三：自由管理账户
 # 注意：本常量用于「更新变化介绍」弹窗与版本自增发布脚本（tools/build_release.py），
 # 与 get_app_version()/LoginDialog.version 里的 v1/v2/v3（账户管理模式）是两回事。
 # 修改版本号请统一改这里（或运行发布脚本自动递增），不要硬编码到别处。
-APP_RELEASE_VERSION = "5.81"
+APP_RELEASE_VERSION = "5.82"
 
 # ── 默认预警阈值（支持上下限）─────────────────────────────────────────────
 # 格式：单个浮点数 = 只有上限；(lower, upper) 元组 = 下限+上限
