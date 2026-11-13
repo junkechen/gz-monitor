@@ -45,13 +45,20 @@ def write_text(path, text):
 
 
 def bump_version(ver):
-    """v5.53 -> v5.54（仅补丁号递增）"""
+    """补丁号 +1，保持原有段数：两段式 5.85 -> 5.86（项目实际约定），
+    三段式 5.85.1 -> 5.85.2 亦兼容。
+
+    旧实现把两段式版本号缺的第三段默认为 "0"，导致 5.85 -> 5.85.1，
+    与全程 5.XX 两段式版本（tag v5.85、spec GZ_Monitor_v5.85_*.spec）不符。
+    """
     m = re.match(r"^v?(\d+)\.(\d+)(?:\.(\d+))?$", ver.strip())
     if not m:
         raise ValueError(f"无法解析版本号: {ver}")
-    major, minor, patch = m.group(1), m.group(2), m.group(3) or "0"
-    patch = str(int(patch) + 1)
-    return f"{major}.{minor}.{patch}"
+    major, minor, patch = m.group(1), m.group(2), m.group(3)
+    if patch is None:
+        # 两段式：递增末段（即补丁位），仍是两段式
+        return f"{major}.{int(minor) + 1}"
+    return f"{major}.{minor}.{int(patch) + 1}"
 
 
 def get_current_version():
@@ -104,11 +111,17 @@ def prepend_changelog(new_ver, title_suffix, body):
 
 
 def make_spec(new_ver, template_spec):
-    """基于最新模板 spec 生成版本化 spec，仅替换 EXE 名与注释版本。"""
+    """基于最新模板 spec 生成版本化 spec，仅替换 EXE 名与注释版本。
+
+    EXE 名用正则替换「任意版本」而非固定占位：模板版本随每次发布递增，
+    旧实现写死 GZ_Monitor_v5.53_Win7，模板升到 v5.85 后 replace 完全不命中，
+    会把旧版 EXE 名原样带进新 spec（构建出错名 exe）。
+    """
     tmpl = read_text(template_spec)
-    tmpl = tmpl.replace("GZ_Monitor_v5.53_Win7", f"GZ_Monitor_v{new_ver}_Win7")
-    tmpl = re.sub(r"^# v\d+\.\d+ GZ_Monitor onefile spec",
-                  f"# v{new_ver} GZ_Monitor onefile spec",
+    tmpl = re.sub(r"GZ_Monitor_v[\d.]+_Win7",
+                  f"GZ_Monitor_v{new_ver}_Win7", tmpl)
+    tmpl = re.sub(r"^# v[\d.]+",
+                  f"# v{new_ver}",
                   tmpl, count=1, flags=re.MULTILINE)
     # 确保 CHANGELOG.md 被打包（供「更新变化介绍」对话框读取）
     if "CHANGELOG.md" not in tmpl:
