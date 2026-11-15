@@ -30,6 +30,7 @@ class OutletGroup {
   final String status;
   final List<OutletParam> params;
   final Set<String> itemCodes;
+  final String entName; // 所属企业（多账号合并时由客户端打标）
   OutletGroup({
     required this.subid,
     required this.subname,
@@ -38,11 +39,16 @@ class OutletGroup {
     required this.status,
     required this.params,
     required this.itemCodes,
+    this.entName = '',
   });
 
   bool get isWater => isWaterType(subtypeText);
   String get subtypeCode => subtypeCodeOf(subtypeText);
   String get displayName => codeName(subtypeCode) == null ? subtypeText : subtypeText;
+  /// 唯一键：subid 在不同企业间可能重复
+  String get uniqueKey => entName.isEmpty ? subid : '$subid|$entName';
+  String get displayLabel =>
+      entName.isEmpty ? subname : '$entName · $subname';
 }
 
 String? _f2s(dynamic v) {
@@ -79,6 +85,7 @@ class GzApi {
   late final Dio dio;
   bool loggedIn = false;
   String? enterpriseName;
+  final Set<String> knownSubids = {}; // 本账号实时数据中出现过的排口（供路由）
 
   GzApi() {
     dio = Dio(BaseOptions(
@@ -207,8 +214,8 @@ class GzApi {
 
   bool _ensureLoggedIn() => loggedIn;
 
-  /// 获取实时数据，解析为按排口分组的列表
-  Future<List<OutletGroup>> fetchRealtimeGroups() async {
+  /// 获取实时数据，解析为按排口分组的列表（entName 由多账号管理器传入打标）
+  Future<List<OutletGroup>> fetchRealtimeGroups({String? entName}) async {
     if (!_ensureLoggedIn()) throw Exception('未登录或会话已过期');
     final ts = DateTime.now().millisecondsSinceEpoch.toString();
     await dio.get(
@@ -270,6 +277,9 @@ class GzApi {
       ));
       if (code != null && code.isNotEmpty) (g['codes'] as Set<String>).add(code);
     }
+    knownSubids
+      ..clear()
+      ..addAll(map.keys);
     return map.values.map((g) => OutletGroup(
           subid: g['subid'] as String,
           subname: g['subname'] as String,
@@ -278,6 +288,7 @@ class GzApi {
           status: g['status'] as String,
           params: g['params'] as List<OutletParam>,
           itemCodes: g['codes'] as Set<String>,
+          entName: entName ?? '',
         )).toList();
   }
 

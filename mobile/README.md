@@ -6,20 +6,21 @@
 
 | 功能 | 说明 |
 |---|---|
-| 企业登录 | 内置 5 个企业账号，自动完成滑块验证（AES-256-CBC + NCC 缺口求解，同桌面端） |
-| 实时数据 | 全部排口实时浓度/限值/超标状态，下拉刷新，超标红色高亮 |
-| 历史查询 | 任意排口 × 日/小时粒度 × 日期范围，逐条浓度列表 + **排放量合计** |
+| 多账号合并登录 | 内置 5 个企业账号，勾选后一键全部登录（账号间随机 2-5s 间隔防风控，确定性失败跳过重试），多企业数据合并展示 |
+| 实时数据 | 全部企业全部排口实时浓度/限值/超标状态，按企业分组展示，下拉刷新 + 60s 自动刷新开关，超标红色高亮 |
+| 预警 | 移植桌面端三类规则：**阈值超标**（本地上下限 + 服务端 CBBS 标记）、**同值检测**（废气 30min/废水 180min）、**急剧变化**（急升/急降，10min 去重），底部导航红色角标 + 新预警 SnackBar，预警持久化（重启不丢失，上限 300 条） |
+| 历史查询 | 跨企业任意排口 × 日/小时粒度 × 日期范围，逐条浓度列表 + **排放量合计**（subid 自动路由到对应账号会话） |
 | 排放量口径 | 日数据 `ex_` 吨→kg（×1000）与小时数据 `ex_` kg 直读，与官网导出同口径（桌面端 v5.85 修复） |
 
 ## 手机端适配
 
 - 竖屏锁定、Material 3 暗色主题（沿用桌面端配色）、中文本地化（日期选择器）
-- 底部导航（实时数据 / 历史查询）、卡片式列表替代宽表格、下拉刷新
+- 底部三导航（实时数据 / 预警 / 历史查询）、卡片式列表替代宽表格、下拉刷新
 - 触屏友好的日期选择器与点击目标；`usesCleartextTraffic` 允许 http 明文接口
 
 ## 构建与分发
 
-- 产物：`dist/GZ_Monitor_Mobile_v1.0.0.apk`（约 55 MB，直接安装）
+- 产物：`dist/GZ_Monitor_Mobile_v1.1.0.apk`（约 55 MB，直接安装）
 - 源码：本目录（`lib/` Dart 代码，`android/` 仅改 label/cleartext/权限）
 
 ### 构建步骤（Windows）
@@ -40,30 +41,35 @@ robocopy 'D:\xiaolongxia\新建文件夹\20260328112826\mobile' 'D:\GZMobile' /E
 # 2. 构建
 cd D:\GZMobile; flutter build apk --release
 # 3. 拷回产物
-copy D:\GZMobile\build\app\outputs\flutter-apk\app-release.apk ..\dist\GZ_Monitor_Mobile_v1.0.0.apk
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-release.apk ..\dist\GZ_Monitor_Mobile_v1.1.0.apk
 ```
 
 已做镜像配置：Gradle wrapper 走腾讯镜像（`gradle-wrapper.properties`），Maven 依赖走阿里云镜像（`settings.gradle.kts` / `build.gradle.kts`）。
 
-## 协议冒烟测试
+## 测试
 
 ```bash
 cd D:\GZMobile
-dart run tool/smoke.dart   # 真实服务端：登录→实时→历史→排放量
+dart run tool/smoke.dart          # 真实服务端：多账号登录→合并实时→跨企业历史→排放量
+flutter test test/smoke_test.dart # 预警引擎：超标/同值/急变/去重/持久化（离线）
 ```
 
-2026-11-16 实测：鼎鑫账号登录成功；3 个排口实时正常；鼎鑫彩涂4#/彩涂1-3# 日数据吨→kg 合计与官网导出一致。
+2026-11-16 实测（v1.1.0）：2 账号登录成功；5 排口/2 企业合并正常；跨企业日数据 7 天排放量 13.030 kg；预警引擎 6 项单测全过。
 
 ## 目录
 
 ```
-lib/core/constants.dart      服务端地址/AES 密钥/账号/代码映射（对齐桌面端 config.py）
+lib/core/constants.dart      服务端地址/AES 密钥/账号/代码映射/预警阈值（对齐桌面端 config.py）
 lib/core/gz_api.dart         登录(4步)/实时/历史 + 排放量计算（对齐 multi_account_api.py v5.85）
 lib/core/slider_solver.dart  滑块 NCC 求解（对齐 slider_solver.py）
-lib/pages/                   登录 / 主页 / 实时 / 历史
-tool/smoke.dart              全链路冒烟测试
+lib/core/account_manager.dart 多账号会话管理：顺序登录/数据合并/subid 路由
+lib/core/warning_engine.dart 预警引擎：超标/同值/急变规则 + 持久化
+lib/pages/                   登录 / 主页 / 实时 / 预警 / 历史
+tool/smoke.dart              真实服务端全链路冒烟测试（dart run）
+test/smoke_test.dart         预警引擎单元测试（flutter test）
 ```
 
 ## 版本
 
+- v1.1.0（2026-11-16）：多账号合并登录与数据合并；新增预警功能（阈值超标/同值检测/急剧变化，角标与持久化）；历史查询跨企业路由。
 - v1.0.0（2026-11-16）：首个 APK，对齐桌面端 v5.85 数据口径。

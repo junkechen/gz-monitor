@@ -1,13 +1,14 @@
-// 历史查询页：排口选择 + 日/小时粒度 + 日期范围 + 排放量合计（v5.85 吨→kg 口径）
+// 历史查询页：多企业排口选择 + 日/小时粒度 + 日期范围 + 排放量合计（v5.85 吨→kg 口径）
 import 'package:flutter/material.dart';
 
+import '../core/account_manager.dart';
 import '../core/constants.dart';
 import '../core/gz_api.dart';
 
 class HistoryPage extends StatefulWidget {
-  final GzApi api;
+  final AccountManager manager;
   final List<OutletGroup>? outlets;
-  const HistoryPage({super.key, required this.api, this.outlets});
+  const HistoryPage({super.key, required this.manager, this.outlets});
   @override
   State<HistoryPage> createState() => _HistoryPageState();
 }
@@ -40,7 +41,8 @@ class _HistoryPageState extends State<HistoryPage>
 
   Future<void> _loadOutlets() async {
     try {
-      final g = await widget.api.fetchRealtimeGroups();
+      final g = await widget.manager.fetchMergedRealtime();
+      widget.manager.buildRoutes();
       if (!mounted) return;
       setState(() {
         _outlets = g;
@@ -102,7 +104,11 @@ class _HistoryPageState extends State<HistoryPage>
       _dataDays = 0;
     });
     try {
-      final res = await widget.api.queryHistory(
+      final client = widget.manager.clientFor(_sel!.subid);
+      if (client == null || !client.loggedIn) {
+        throw Exception('该排口所属企业未登录或会话已过期');
+      }
+      final res = await client.queryHistory(
         subid: _sel!.subid,
         subtype: _sel!.subtypeCode,
         codes: _codes.join(','),
@@ -215,7 +221,8 @@ class _HistoryPageState extends State<HistoryPage>
               items: _outlets
                   .map((g) => DropdownMenuItem(
                         value: g,
-                        child: Text('${g.subname}（${g.subtypeText}）',
+                        child: Text(
+                            '${g.entName.isEmpty ? "" : "${g.entName} · "}${g.subname}（${g.subtypeText}）',
                             overflow: TextOverflow.ellipsis),
                       ))
                   .toList(),

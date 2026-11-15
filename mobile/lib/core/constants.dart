@@ -45,3 +45,48 @@ String subtypeCodeOf(String subType) =>
     isWaterType(subType) ? kWaterSubtype : kGasSubtype;
 
 String? codeName(String code) => kCodeToName[code];
+
+// ── 预警配置（与桌面端 DEFAULT_WARN_THRESHOLDS 等对齐）────────────────────
+// [下限, 上限]，null 表示该侧不设限
+const Map<String, List<double?>> kWarnThresholds = {
+  '非甲烷总烃': [null, 50.0],
+  '烟气温度': [null, 200.0],
+  '烟气流量': [null, 99999.0],
+  '烟气含氧量': [3.0, 21.0],
+  '二氧化硫': [null, 100.0],
+  '氮氧化物': [null, 200.0],
+  '颗粒物': [null, 30.0],
+  '化学需氧量': [null, 200.0],
+  'pH值': [6.0, 9.0],
+  '流量': [null, 99999.0],
+  '废水流量': [null, 99999.0],
+  '氨氮': [null, 15.0],
+};
+
+// 连续同值超过该分钟数触发预警（废气30分钟，废水180分钟）
+const Map<String, int> kSameValueMinutes = {
+  '非甲烷总烃': 30,
+  '二氧化硫': 30,
+  '氮氧化物': 30,
+  '颗粒物': 30,
+  '化学需氧量': 180,
+  '氨氮': 180,
+  'pH值': 180,
+};
+
+// 单次变化超过该百分比触发急剧上升/下降预警
+const Map<String, double> kRapidChangePct = {
+  '非甲烷总烃': 50.0,
+  '二氧化硫': 50.0,
+  '氮氧化物': 50.0,
+  '颗粒物': 50.0,
+  '化学需氧量': 30.0,
+  '氨氮': 30.0,
+  'pH值': 20.0,
+};
+
+// 实时页自动刷新间隔（与桌面端 DEFAULT_REFRESH_INTERVAL 一致）
+const int kAutoRefreshSeconds = 60;
+
+// 急剧变化预警去重窗口（分钟）——同参数同类型预警后 10 分钟内不重复报
+const int kRapidDedupeMinutes = 10;

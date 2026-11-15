@@ -1,24 +1,46 @@
-// 主页：底部导航（实时数据 / 历史查询）
+// 主页：底部导航（实时数据 / 预警 / 历史查询），预警角标
 import 'package:flutter/material.dart';
 
+import '../core/account_manager.dart';
 import '../core/gz_api.dart';
+import '../core/warning_engine.dart';
 import 'realtime_page.dart';
 import 'history_page.dart';
+import 'warning_page.dart';
 
 class HomePage extends StatefulWidget {
-  final GzApi api;
-  final String enterpriseName;
-  const HomePage({super.key, required this.api, required this.enterpriseName});
+  final AccountManager manager;
+  const HomePage({super.key, required this.manager});
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
   int _tab = 0;
-  List<OutletGroup>? _outlets; // 实时数据解析出的排口（供历史页选择）
+  List<OutletGroup>? _outlets; // 合并后的排口（供历史页选择）
+  final WarningEngine _engine = WarningEngine();
+
+  @override
+  void initState() {
+    super.initState();
+    _engine.load();
+  }
 
   void _onOutletsLoaded(List<OutletGroup> g) {
     _outlets = g;
+  }
+
+  void _onWarnings(List<WarningItem> fresh) {
+    if (!mounted) return;
+    setState(() {});
+    if (fresh.isNotEmpty && _tab != 1) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('⚠ 新增 ${fresh.length} 条预警：'
+            '${fresh.first.param} ${fresh.first.type.label}'),
+        backgroundColor: const Color(0xFF7A2E2E),
+        duration: const Duration(seconds: 3),
+      ));
+    }
   }
 
   Future<void> _logout() async {
@@ -26,7 +48,8 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('退出登录'),
-        content: Text('确定退出「${widget.enterpriseName}」吗？'),
+        content: Text(
+            '确定退出全部 ${widget.manager.clientCount} 个企业账号吗？\n预警记录将保留在本机。'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -38,7 +61,7 @@ class _HomePageState extends State<HomePage> {
       ),
     );
     if (ok == true && mounted) {
-      widget.api.loggedIn = false;
+      widget.manager.logoutAll();
       Navigator.of(context).popUntil((r) => r.isFirst);
     }
   }
@@ -47,8 +70,11 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.enterpriseName,
-            overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 17)),
+        title: Text(
+          'GZ安环监测 · ${widget.manager.loggedInNames.length} 企业',
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 17),
+        ),
         actions: [
           IconButton(icon: const Icon(Icons.logout), onPressed: _logout,
               tooltip: '退出登录'),
@@ -57,19 +83,40 @@ class _HomePageState extends State<HomePage> {
       body: IndexedStack(
         index: _tab,
         children: [
-          RealtimePage(api: widget.api, onOutletsLoaded: _onOutletsLoaded),
-          HistoryPage(api: widget.api, outlets: _outlets),
+          RealtimePage(
+            manager: widget.manager,
+            engine: _engine,
+            onOutletsLoaded: _onOutletsLoaded,
+            onWarnings: _onWarnings,
+          ),
+          WarningPage(engine: _engine),
+          HistoryPage(manager: widget.manager, outlets: _outlets),
         ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
         onDestinationSelected: (i) => setState(() => _tab = i),
-        destinations: const [
-          NavigationDestination(
+        destinations: [
+          const NavigationDestination(
               icon: Icon(Icons.monitor_heart_outlined),
               selectedIcon: Icon(Icons.monitor_heart),
               label: '实时数据'),
           NavigationDestination(
+            icon: Badge(
+              isLabelVisible: _engine.activeCount > 0,
+              label: Text('${_engine.activeCount}'),
+              backgroundColor: const Color(0xFFF85149),
+              child: const Icon(Icons.notification_important_outlined),
+            ),
+            selectedIcon: Badge(
+              isLabelVisible: _engine.activeCount > 0,
+              label: Text('${_engine.activeCount}'),
+              backgroundColor: const Color(0xFFF85149),
+              child: const Icon(Icons.notification_important),
+            ),
+            label: '预警',
+          ),
+          const NavigationDestination(
               icon: Icon(Icons.query_stats_outlined),
               selectedIcon: Icon(Icons.query_stats),
               label: '历史查询'),
