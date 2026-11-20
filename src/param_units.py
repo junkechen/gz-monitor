@@ -297,11 +297,22 @@ def detect_server_emission(row: dict, code, flow_code=None) -> Optional[float]:
     if flow_code:
         calc = calc_emission_rate(row.get(f'val_{c}'),
                                   row.get(f'val_{normalize_code(flow_code)}'), c)
+    # v5.86 数据一致性修复：
+    #   1) 服务端排放量字段一律带当前 code 后缀（ex_{code}/orgex_{code}/...），
+    #      必须精确匹配。旧版扫描全行，停产行 ex_{code}=0/orgex_{code}=0 时会
+    #      命中同行 ex_210（烟气流量 5381/5792）当排放量返回——历史表格里
+    #      「非甲烷总烃排放量(kg)」列显示成流量值即由此而来。
+    #   2) 缺少有效「浓度×流量」基准(calc<=0)时无法做量级校验，返回 None
+    #      让调用方回退到公式计算（浓度 0 → 排放量 0），绝不采信未校验字段。
+    if not calc or calc <= 0:
+        return None
     for k, v in row.items():
         kl = str(k).lower()
         if not any(h in kl for h in _EMISSION_KEY_HINTS):
             continue
         if kl.startswith('val_') or kl.startswith('state_') or kl.startswith('status_'):
+            continue
+        if not kl.endswith('_' + c):
             continue
         try:
             fv = float(v)
@@ -309,13 +320,12 @@ def detect_server_emission(row: dict, code, flow_code=None) -> Optional[float]:
             continue
         if fv != fv or fv <= 0:
             continue
-        if calc and calc > 0:
-            # v5.82：放宽到 0.1~10 倍。官网小时排放量按分钟积分得到，
-            # 与「小时平均浓度 × 小时流量」可能差数倍（v5.79 实测 11 时
-            # 0.902 kg vs 公式 0.1155 kg，7.8 倍），旧的 0.5~2 倍会
-            # 把正确的服务端值误杀；50 这类标准值仍会被排除（数百倍）。
-            if not (0.1 <= fv / calc <= 10.0):
-                continue
+        # v5.82：放宽到 0.1~10 倍。官网小时排放量按分钟积分得到，
+        # 与「小时平均浓度 × 小时流量」可能差数倍（v5.79 实测 11 时
+        # 0.902 kg vs 公式 0.1155 kg，7.8 倍），旧的 0.5~2 倍会
+        # 把正确的服务端值误杀；50 这类标准值仍会被排除（数百倍）。
+        if not (0.1 <= fv / calc <= 10.0):
+            continue
         return fv
     return None
 

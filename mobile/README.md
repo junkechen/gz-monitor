@@ -20,7 +20,16 @@
 
 ## 构建与分发
 
-- 产物：`dist/GZ_Monitor_Mobile_v1.1.0.apk`（约 55 MB，直接安装）
+按 ABI 拆分 + 混淆剥离符号，避免 55MB 的全 ABI 胖包。手机只需按架构装对应分包：
+
+| 产物 | 架构 | 体积 | 适用 |
+|---|---|---|---|
+| `dist/GZ_Monitor_Mobile_v1.1.0_arm64-v8a.apk` | arm64-v8a | 18 MB | **推荐**，2017 年后绝大多数手机 |
+| `dist/GZ_Monitor_Mobile_v1.1.0_armeabi-v7a.apk` | armeabi-v7a | 16 MB | 早期 32 位安卓机 |
+
+（x86_64 模拟器包仅调试用，未分发。）最低 Android 7.0（API 24）。
+优化手段：① `--split-per-abi` 只打单一架构 native 库；② `--obfuscate --split-debug-info` 混淆 Dart 代码并剥离符号；③ 移除未使用的 cupertino_icons；④ 图标 tree-shaking。相比全 ABI 单包（55.5MB）缩减约 67%。
+
 - 源码：本目录（`lib/` Dart 代码，`android/` 仅改 label/cleartext/权限）
 
 ### 构建步骤（Windows）
@@ -28,8 +37,8 @@
 ```bash
 cd mobile
 flutter pub get
-flutter build apk --release
-# 产物 build/app/outputs/flutter-apk/app-release.apk
+flutter build apk --release --split-per-abi --obfuscate --split-debug-info=build/app/symbols
+# 产物 build/app/outputs/flutter-apk/app-{armeabi-v7a,arm64-v8a,x86_64}-release.apk
 ```
 
 **注意：仓库路径含中文（`新建文件夹`），Gradle/`gen_snapshot` 无法在非 ASCII 路径构建。**
@@ -38,10 +47,11 @@ flutter build apk --release
 ```powershell
 # 1. 同步源码到 ASCII 工作区
 robocopy 'D:\xiaolongxia\新建文件夹\20260328112826\mobile' 'D:\GZMobile' /E /XD build .dart_tool
-# 2. 构建
-cd D:\GZMobile; flutter build apk --release
-# 3. 拷回产物
-copy D:\GZMobile\build\app\outputs\flutter-apk\app-release.apk ..\dist\GZ_Monitor_Mobile_v1.1.0.apk
+# 2. 构建（ABI 分包 + 混淆）
+cd D:\GZMobile; flutter build apk --release --split-per-abi --obfuscate --split-debug-info=build/app/symbols
+# 3. 拷回产物（两个手机架构）
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-arm64-v8a-release.apk ..\dist\GZ_Monitor_Mobile_v1.1.0_arm64-v8a.apk
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-armeabi-v7a-release.apk ..\dist\GZ_Monitor_Mobile_v1.1.0_armeabi-v7a.apk
 ```
 
 已做镜像配置：Gradle wrapper 走腾讯镜像（`gradle-wrapper.properties`），Maven 依赖走阿里云镜像（`settings.gradle.kts` / `build.gradle.kts`）。
@@ -71,5 +81,5 @@ test/smoke_test.dart         预警引擎单元测试（flutter test）
 
 ## 版本
 
-- v1.1.0（2026-11-16）：多账号合并登录与数据合并；新增预警功能（阈值超标/同值检测/急剧变化，角标与持久化）；历史查询跨企业路由。
+- v1.1.0（2026-11-16）：多账号合并登录与数据合并；新增预警功能（阈值超标/同值检测/急剧变化，角标与持久化）；历史查询跨企业路由；APK 按 ABI 拆分 + 混淆，单包体积 55MB→16~18MB。
 - v1.0.0（2026-11-16）：首个 APK，对齐桌面端 v5.85 数据口径。
