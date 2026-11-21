@@ -4686,9 +4686,14 @@ class MainWindow(QMainWindow):
         # v5.83：根因已修（api_client 对 index=2 剥离时间后缀），预测基准已改回
         # 服务端日数据；历史页维持小时聚合口径不变（月数据接口未验证，保持现状）
         _original_index = index
-        if index >= 2:
-            index = 1  # 用小时数据
-            print(f"[DEBUG] 日/月查询改为小时数据聚合: original_index={_original_index}")
+        # v5.89 数据来源原则：历史数据一律以官网服务端返回为准，禁止本地重算。
+        # 日/月数据直接查服务端 index=2/3（服务端已提供权威 val_/ex_ 字段，
+        # 且会对维护/标记数据修正，见 2026-11-21 实测：10-23 小时脏值 1.88亿，
+        # 服务端日数据 ex_220=0.00130t 已修正）。
+        # 旧版强制转小时数据再本地聚合成日，会把小时脏数据 Σ 进去，且用
+        # 「浓度均值×流量均值」等本地推导替代服务端权威排放量——现已废弃。
+        # 季度/年仍由月数据后端聚合（服务端无对应粒度接口）。
+        print(f"[DEBUG] 历史查询 index={index}（直接使用服务端数据，不本地重算）")
 
         # 构造时间字符串
         start_date = self.start_date.date().toString("yyyy-MM-dd")
@@ -4793,11 +4798,10 @@ class MainWindow(QMainWindow):
             print(f"[DEBUG] 历史数据查询完成: start={start}, end={end}, index={index}")
             print(f"[DEBUG] 服务端 total={total}, 实际获取={len(all_rows)} 条")
 
-            # v5.18: 日/月数据客户端聚合（从小时数据聚合）
-            if _original_index >= 2 and all_rows:
-                all_rows = self._aggregate_hour_to_day_month(all_rows, codes, _original_index)
-                total = len(all_rows)
-                print(f"[DEBUG] 聚合后 index={_original_index} 共 {len(all_rows)} 条")
+            # v5.89 数据来源原则：历史数据（分钟/小时/日/月）一律直接采用
+            # 服务端返回值，不再本地重算。季度/年因服务端无对应粒度接口，
+            # 由下方 _aggregate_to_quarter_or_year 基于月数据聚合（唯一例外）。
+            print(f"[DEBUG] 历史数据 {len(all_rows)} 条直接采用服务端原值（未本地重算）")
             # 日/月/年查询调试：打印第一行数据的DateTime和前3个字段
             if all_rows:
                 _sample = all_rows[0]
@@ -5273,6 +5277,8 @@ class MainWindow(QMainWindow):
         # v5.63：改为按数据可用性挑选（492 无值时自动用 494/495），
         # 否则总排口这类多流量参数排口排放量整列为 '--'
         flow_code = pick_flow_code(rows, code_list) or find_flow_code(code_list)
+        # v5.89：供排放量列回退时的量级校验（正常走服务端 ex_，此处仅兜底）
+        self._history_flow_code = flow_code
 
         # v5.65：表头改写为「参数名+字段(单位)」的清晰形式，
         # 例如「非甲烷总烃实测(mg/m³)」「非甲烷总烃排放量(kg)」，
@@ -5374,23 +5380,33 @@ class MainWindow(QMainWindow):
                         QTableWidgetItem(_fmt_val(row.get(f"cvt_{code}"))))
                     c += 1
                 if with_emis:
-                    # 排放量：优先用小时聚合行已算好的 emis_（Σ逐时，含服务端
-                    # 权威值），其次服务端字段，最后按 实测浓度×流量 计算。
-                    # v5.51：用实测值（网页端口径），不用折算值。
-                    # v5.80：分钟数据须把 m³/h 折算成该分钟风量（×1/60）。
+                    # v5.89 数据来源原则：历史排放量一律取服务端权威值，禁止本地重算。
+                    # 服务端 ex_{code}：小时/分钟=kg 直读；日/月=吨（×1000→kg）。
+                    # 单位换算（t→kg）不是"重算"，只是单位归一，与官网口径一致。
+                    _tt = getattr(self, '_history_time_type_label', '')
+                    _is_day_or_month = _tt in ('日数据', '月数据', '季度数据', '年数据')
                     emis = None
-                    _raw_e = row.get(f'emis_{code}')
-                    if _raw_e not in (None, '', '--'):
+                    _ex = row.get(f'ex_{code}')
+                    if _ex not in (None, '', '--'):
                         try:
-                            emis = float(_raw_e)
+                            _ev = float(_ex)
+                            if _ev > 0:
+                                # 日/月服务端 ex_ 为吨 → kg；小时/分钟已是 kg
+                                emis = _ev * 1000.0 if _is_day_or_month else _ev
                         except (ValueError, TypeError):
                             emis = None
+                    # 仅当服务端 ex_ 确实缺失时（如季度/年聚合行无 ex_），
+                    # 才回退到服务端或gex_ / 聚合 emis_；仍不自行用浓度×流量重算。
                     if emis is None:
-                        emis = extract_emission_mass(row, code)
-                    if emis is None and val not in (None, '', '--'):
-                        emis = calc_emission_rate(
-                            val, _row_flow(row), code,
-                            hours=self.__dict__.get('_history_time_scale', 1.0))
+                        emis = extract_emission_mass(row, code,
+                                                     getattr(self, '_history_flow_code', None))
+                    if emis is None:
+                        _raw_e = row.get(f'emis_{code}')
+                        if _raw_e not in (None, '', '--'):
+                            try:
+                                emis = float(_raw_e)
+                            except (ValueError, TypeError):
+                                emis = None
                     self.history_table.setItem(
                         row_idx, c, QTableWidgetItem(format_emission_rate(emis)))
         self.history_table.setUpdatesEnabled(True)
@@ -5478,12 +5494,14 @@ class MainWindow(QMainWindow):
             code_list = [c.strip() for c in codes_str.split(',') if c.strip()]
             from data_processor import CODE_TO_NAME
             from param_units import (
-                get_param_unit, calc_emission_mass, is_concentration_param,
+                get_param_unit, is_concentration_param, extract_emission_mass,
                 pick_flow_code,
             )
             code_to_display = {code: CODE_TO_NAME.get(code, code) for code in code_list}
-            # v5.65：导出与界面口径一致——浓度列标单位，并补充排放量(kg)列
+            # v5.89：导出与界面同源——排放量直接取服务端 ex_，不本地重算。
             flow_code = pick_flow_code(all_rows, code_list)
+            _export_tt = getattr(self, '_history_time_type_label', '')
+            _export_day_or_month = _export_tt in ('日数据', '月数据', '季度数据', '年数据')
 
             # 构建数据记录
             records = []
@@ -5498,19 +5516,21 @@ class MainWindow(QMainWindow):
                     mkey = f"{name}实测({unit})" if unit else f"{name}实测"
                     record[mkey] = val
                     if is_concentration_param(code):
+                        # v5.89：历史排放量一律取服务端权威值，禁止本地重算。
+                        # 服务端 ex_{code}：日/月=吨(×1000→kg)、小时/分钟=kg。
                         mass = None
-                        _raw_e = row.get(f'emis_{code}')
-                        if _raw_e not in (None, '', '--'):
+                        _ex = row.get(f'ex_{code}')
+                        if _ex not in (None, '', '--'):
                             try:
-                                mass = float(_raw_e)
+                                _ev = float(_ex)
+                                if _ev > 0:
+                                    mass = _ev * 1000.0 if _export_day_or_month else _ev
                             except (ValueError, TypeError):
                                 mass = None
-                        if mass is None and flow_code and val != "":
-                            mass = calc_emission_mass(
-                                val, row.get(f"val_{flow_code}"), code,
-                                hours=self.__dict__.get('_history_time_scale', 1.0))
+                        if mass is None:
+                            mass = extract_emission_mass(row, code, flow_code)
                         record[f"{name}排放量(kg)"] = (
-                            round(mass, 4) if mass is not None else "")
+                            round(mass, 6) if mass is not None else "")
                 records.append(record)
 
             df = pd.DataFrame(records)
