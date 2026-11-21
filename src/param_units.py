@@ -104,6 +104,12 @@ FLOW_CODES: frozenset = frozenset({'210', '492', '494'})
 # 排放量单位（期间质量）
 EMISSION_UNIT = 'kg'
 
+# v5.88：单时段排放量合理性硬上限（kg）。
+# 废气极端：浓度 1000 mg/m³ × 流量 1e6 m³ / 1e6 = 1000 kg；
+# 废水极端：浓度 1000 mg/L × 流量 1e6 m³ / 1000 = 1e6 kg。
+# 取 1e7 kg 作兜底，只拦截服务端脏数据（实测异常值 1.88e8），正常值远低于此。
+_EMISSION_SANITY_CAP_KG = 1e7
+
 # ── 服务端排放量字段候选名 ──────────────────────────────────────────────────
 # 网页端表格有「排放量(kg)」列，说明服务端**可能**直接返回该值。
 # 接口文档未记录字段名（仅提到顶层 pf_flow），故按可能性排序枚举候选，
@@ -268,6 +274,19 @@ def extract_emission_mass(row: dict, code, flow_code=None) -> Optional[float]:
             # 故上限放到 1e-1 既兜住失真天，又不会把真 kg 误乘 1000。
             if 1e-4 <= ratio <= 1e-1:      # 服务端以吨返回
                 return raw * 1000.0
+            # v5.88：脏数据防护——服务端 ex_ 与「浓度×流量」估算值严重背离
+            # （比值 > 1e4）时视为脏数据。典型：定期维护/故障时流量为空但
+            # ex_ 字段残留上一状态巨值（实测 10-23 13时 ex_220=188402703，
+            # 流量空），旧版直接采信导致日排放量被污染到 1.88 亿 kg。
+            if ratio > 1e4:
+                return None
+        # v5.88：流量无效（空/0）时服务端 ex_ 不可信，丢弃脏值回退到公式
+        # （公式因无流量返回 None → 该小时不计入日 Σ，与官网合理展示一致）。
+        elif raw > _EMISSION_SANITY_CAP_KG:
+            return None
+    # v5.88：无流量 code 时的绝对量级上限（废气/废水单时段排放量物理上限）
+    elif raw > _EMISSION_SANITY_CAP_KG:
+        return None
     return raw
 
 
