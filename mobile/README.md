@@ -24,8 +24,8 @@
 
 | 产物 | 架构 | 体积 | 适用 |
 |---|---|---|---|
-| `dist/GZ_Monitor_Mobile_v1.1.0_arm64-v8a.apk` | arm64-v8a | 18 MB | **推荐**，2017 年后绝大多数手机 |
-| `dist/GZ_Monitor_Mobile_v1.1.0_armeabi-v7a.apk` | armeabi-v7a | 16 MB | 早期 32 位安卓机 |
+| `dist/GZ_Monitor_Mobile_v1.2.0_arm64-v8a.apk` | arm64-v8a | 18 MB | **推荐**，2017 年后绝大多数手机 |
+| `dist/GZ_Monitor_Mobile_v1.2.0_armeabi-v7a.apk` | armeabi-v7a | 16 MB | 早期 32 位安卓机 |
 
 （x86_64 模拟器包仅调试用，未分发。）最低 Android 7.0（API 24）。
 优化手段：① `--split-per-abi` 只打单一架构 native 库；② `--obfuscate --split-debug-info` 混淆 Dart 代码并剥离符号；③ 移除未使用的 cupertino_icons；④ 图标 tree-shaking。相比全 ABI 单包（55.5MB）缩减约 67%。
@@ -50,8 +50,8 @@ robocopy 'D:\xiaolongxia\新建文件夹\20260328112826\mobile' 'D:\GZMobile' /E
 # 2. 构建（ABI 分包 + 混淆）
 cd D:\GZMobile; flutter build apk --release --split-per-abi --obfuscate --split-debug-info=build/app/symbols
 # 3. 拷回产物（两个手机架构）
-copy D:\GZMobile\build\app\outputs\flutter-apk\app-arm64-v8a-release.apk ..\dist\GZ_Monitor_Mobile_v1.1.0_arm64-v8a.apk
-copy D:\GZMobile\build\app\outputs\flutter-apk\app-armeabi-v7a-release.apk ..\dist\GZ_Monitor_Mobile_v1.1.0_armeabi-v7a.apk
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-arm64-v8a-release.apk ..\dist\GZ_Monitor_Mobile_v1.2.0_arm64-v8a.apk
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-armeabi-v7a-release.apk ..\dist\GZ_Monitor_Mobile_v1.2.0_armeabi-v7a.apk
 ```
 
 已做镜像配置：Gradle wrapper 走腾讯镜像（`gradle-wrapper.properties`），Maven 依赖走阿里云镜像（`settings.gradle.kts` / `build.gradle.kts`）。
@@ -79,7 +79,14 @@ tool/smoke.dart              真实服务端全链路冒烟测试（dart run）
 test/smoke_test.dart         预警引擎单元测试（flutter test）
 ```
 
+## 数据来源原则（重要）
+
+- **历史数据**：一律取官网服务端返回的权威字段 `ex_{code}`（日/月为吨→kg、小时为 kg 直读），**禁止本地计算/推导/重算**（官网会对维护/标记数据修正，本地重算会把脏值算进去）。
+- **预测/预警**：允许基于已获取的数据做必要计算。
+- 与桌面端 v5.89 同口径。
+
 ## 版本
 
+- v1.2.0（2026-11-21）：历史排放量改为服务端 `ex_` 权威值直读，去掉 dayEmissionKg 的本地重算回退，加脏数据上限防护；与桌面端 v5.89 数据来源原则一致。
 - v1.1.0（2026-11-16）：多账号合并登录与数据合并；新增预警功能（阈值超标/同值检测/急剧变化，角标与持久化）；历史查询跨企业路由；APK 按 ABI 拆分 + 混淆，单包体积 55MB→16~18MB。
 - v1.0.0（2026-11-16）：首个 APK，对齐桌面端 v5.85 数据口径。

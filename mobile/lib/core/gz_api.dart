@@ -345,25 +345,26 @@ class GzApi {
   }
 }
 
-// ── 排放量计算（与桌面端 v5.85 口径一致）───────────────────────────────────
+// ── 排放量：历史数据一律取服务端权威值，禁止本地重算（与桌面端 v5.89 一致）──
+// 原则：历史数据以官网服务端返回为准；本地计算/推导只用于预测阶段。
+// 单位换算（t→kg）不是重算，只是单位归一，与官网口径一致。
 
-/// 日粒度：ex_{code} 单位为吨 → kg；无 ex 时回退 浓度×流量×小时数/1e6
+/// 服务端排放量硬上限（kg）：单时段排放量物理上限，拦截维护/故障残留脏值
+const double kEmissionSanityCapKg = 1e7;
+
+/// 日粒度：服务端 ex_{code} 单位为吨 → kg。无 ex 返回 0（不本地重算）。
 double dayEmissionKg(Map row, String code, String? flowCode) {
   final ex = _toDouble(row['ex_$code']);
-  if (ex != null && ex > 0) return ex * 1000.0;
-  final v = _toDouble(row['val_$code']);
-  final fl = flowCode == null ? null : _toDouble(row['val_$flowCode']);
-  if (v != null && v > 0 && fl != null && fl > 0) {
-    final hc = _toDouble(row['hourcount_$code']) ?? 24.0;
-    return v * fl * hc / 1e6;
-  }
-  return 0.0;
+  if (ex == null || ex <= 0) return 0.0;
+  if (ex > kEmissionSanityCapKg * 1000) return 0.0; // 脏数据防护（t 单位）
+  return ex * 1000.0;
 }
 
-/// 小时粒度：ex_{code} 单位已是 kg
+/// 小时/分钟粒度：服务端 ex_{code} 单位已是 kg，直读。无 ex 返回 0。
 double hourEmissionKg(Map row, String code) {
   final ex = _toDouble(row['ex_$code']);
-  return (ex != null && ex > 0) ? ex : 0.0;
+  if (ex == null || ex <= 0 || ex > kEmissionSanityCapKg) return 0.0;
+  return ex;
 }
 
 String fmtNum(num? v, {int digits = 3}) {

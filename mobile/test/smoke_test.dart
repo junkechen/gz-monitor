@@ -141,4 +141,22 @@ void main() {
     expect(engine.items, isEmpty);
     expect(engine.activeCount, 0);
   });
+
+  test('历史排放量：服务端 ex_ 权威值直读，禁止本地重算', () {
+    // 日数据：服务端 ex_ 为吨 → kg；无 ex 返回 0（不回退浓度×流量）
+    final dayRow = {'ex_316': '0.00609', 'val_316': '9.77', 'val_494': '623'};
+    expect(dayEmissionKg(dayRow, '316', '494'), closeTo(6.09, 0.001),
+        reason: '日排放量 = 服务端 ex_ 吨值 ×1000');
+    final noEx = {'val_316': '9.77', 'val_494': '623'};
+    expect(dayEmissionKg(noEx, '316', '494'), 0.0,
+        reason: '无服务端 ex_ 时返回 0，禁止用浓度×流量本地重算');
+    // 小时数据：服务端 ex_ 为 kg 直读
+    final hourRow = {'ex_383': '0.011', 'val_383': '1.98', 'val_210': '5000'};
+    expect(hourEmissionKg(hourRow, '383'), closeTo(0.011, 0.0001),
+        reason: '小时排放量 = 服务端 ex_ kg 值直读');
+    // 脏数据防护：维护时段残留的异常巨值不得采信
+    final dirty = {'ex_220': '188402703'};
+    expect(hourEmissionKg(dirty, '220'), 0.0,
+        reason: '超过硬上限的脏排放量返回 0');
+  });
 }
