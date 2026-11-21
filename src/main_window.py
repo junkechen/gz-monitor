@@ -4915,11 +4915,27 @@ class MainWindow(QMainWindow):
         return aggregated
 
     def _aggregate_hour_to_day_month(self, rows, codes_str, target_index):
-        """将小时数据聚合为日(index=2)/月(index=3)数据，取均值"""
+        """将小时数据聚合为日(index=2)/月(index=3)数据（官网口径）。
+
+        v5.87 数据一致性修复——官网口径（经服务端日数据 ex_ 字段与官网导出
+        xls 逐日交叉验证，2026-11-21）：
+          · 浓度类参数：取小时值**均值**（日均浓度）
+          · 流量参数(210/492/494/495)：取小时值**求和**（期间累计量 m³）
+            实测 Σ小时val_494=623=服务端日数据val_494；Σ小时val_210=699920
+            =日数据val_210，证实流量为求和口径（旧版取均值，低估 24 倍）。
+          · 排放量 emis_{code}：Σ逐小时排放量（小时 ex_ 为 kg，与服务端日
+            数据 ex_×1000 一致：Σ小时ex_383=1.822kg≈日ex_383 0.00182t）。
+        旧版对所有字段一律取均值且不算 emis_，导致历史表格排放量列回退到
+        「浓度均值×流量均值/1000」=0.253kg，而官网/服务端为 6.09kg（24 倍差）。
+        """
         from collections import defaultdict
         import re
 
         code_list = [c.strip() for c in codes_str.split(',') if c.strip()]
+        from param_units import (
+            is_concentration_param, calc_emission_mass, FLOW_CODES,
+            extract_emission_mass,
+        )
 
         def get_group_key(dt_str):
             """从 DateTime 提取分组 key"""
@@ -4938,11 +4954,17 @@ class MainWindow(QMainWindow):
             if key:
                 groups[key].append(row)
 
-        # 对每组计算均值
+        # 对每组聚合：浓度取均值、流量求和、排放量求和
         aggregated = []
         for group_key in sorted(groups.keys()):
             group_rows = groups[group_key]
             agg_row = {'DateTime': group_key}
+            # 先确定本排口的流量 code（用于排放量计算与流量求和展示）
+            flow_code = None
+            for c in code_list:
+                if c in FLOW_CODES:
+                    flow_code = c
+                    break
             for code in code_list:
                 vk = f"val_{code}"
                 vals = []
@@ -4953,7 +4975,14 @@ class MainWindow(QMainWindow):
                             vals.append(float(v))
                         except (ValueError, TypeError):
                             pass
-                agg_row[vk] = round(sum(vals) / len(vals), 4) if vals else None
+                if not vals:
+                    agg_row[vk] = None
+                elif code in FLOW_CODES:
+                    # 流量：期间累计量 → 求和（与服务端日数据一致）
+                    agg_row[vk] = round(sum(vals), 4)
+                else:
+                    # 浓度/其他：取均值
+                    agg_row[vk] = round(sum(vals) / len(vals), 4)
                 # 保留标准值和状态（取第一行的）
                 sk = f"stand_{code}"
                 if sk in group_rows[0]:
@@ -4961,6 +4990,23 @@ class MainWindow(QMainWindow):
                 stk = f"state_{code}"
                 if stk in group_rows[0]:
                     agg_row[stk] = group_rows[0].get(stk)
+            # 计算 emis_{code} = Σ逐小时排放量（与 _aggregate_hour_rows_to_daily 同口径）
+            if flow_code:
+                for c in code_list:
+                    if c == flow_code or not is_concentration_param(c):
+                        continue
+                    total = 0.0
+                    hits = 0
+                    for r in group_rows:
+                        m = extract_emission_mass(r, c, flow_code)
+                        if m is None:
+                            m = calc_emission_mass(
+                                r.get(f'val_{c}'), r.get(f'val_{flow_code}'), c)
+                        if m is not None:
+                            total += m
+                            hits += 1
+                    agg_row[f'emis_{c}'] = total if total > 0 else None
+                    agg_row[f'hours_{c}'] = hits
             aggregated.append(agg_row)
 
         return aggregated
