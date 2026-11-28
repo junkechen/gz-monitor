@@ -7,6 +7,7 @@ GZ安环监测系统 - 预警系统
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from typing import Dict, Callable, Optional, List, Tuple
 import json
@@ -77,7 +78,6 @@ class WarningSystem:
         # ── 同值检测机制 ────────────────────────────────────────────────────
         # _same_value_history: {(ent_name, subname, param): [(timestamp, value), ...]}
         # 每条记录包含时间戳和值，按实际时间窗口判断同值
-        from collections import deque
         self._same_value_history: Dict[Tuple[str, str, str], deque] = {}
         self._same_value_max = 500  # 最大保留条数（足够覆盖4小时，按1分钟1条计算）
 
@@ -102,6 +102,32 @@ class WarningSystem:
         self.sound_enabled = enabled
         if not enabled:
             self.stop_alert()
+
+    @staticmethod
+    def _norm_param_name(param: dict) -> str:
+        """归一化参数名（v5.90 关键修复）。
+
+        实时接口 C0001_ITEM_NAME 带单位后缀且大小写不一（实测：
+        「氨氮(mg/L)」「化学需氧量(mg/L)」「PH」「非甲烷总烃(mg/m3)」「碳氢化合物(总烃)(mg/m3)」），
+        而 IMPORTANT_PARAMS / 阈值配置 / 同值与急剧变化配置均为无单位名
+        （「氨氮」「pH值」「非甲烷总烃」…）。旧版直接用原始名匹配集合，
+        全部不命中 → 实时预警从未执行任何检测（2026-11-28 氨氮持续上升无提醒的根因）。
+
+        归一化策略：优先用监测项代码反查 CODE_TO_NAME（最可靠）；
+        无代码时剥离「(」起的单位后缀并去除空白。
+        """
+        code = param.get('code')
+        if code not in (None, ''):
+            try:
+                c = str(int(float(code)))
+                from data_processor import CODE_TO_NAME
+                if c in CODE_TO_NAME:
+                    return CODE_TO_NAME[c]
+            except (ValueError, TypeError):
+                pass
+        import re
+        name = str(param.get('name', ''))
+        return re.sub(r'\s*\(.*$', '', name).strip()
 
     def set_sound_type(self, sound_type: str):
         """设置声音类型：'beep1' | 'beep2' | 'beep3'"""
@@ -217,8 +243,11 @@ class WarningSystem:
                 if value is None:
                     continue
 
+                # v5.90：参数名归一化（实时接口名带单位后缀，须归一后匹配配置）
+                norm_name = self._norm_param_name(param)
+
                 # 只预警重要参数
-                if param_name not in self.IMPORTANT_PARAMS:
+                if norm_name not in self.IMPORTANT_PARAMS:
                     continue
 
                 if not isinstance(value, (int, float)):
@@ -228,12 +257,12 @@ class WarningSystem:
                         continue
 
                 # 用于预警记录的关键key（包含企业名避免冲突）
-                warn_key = f"{ent_name}|{subname}_{param_name}"
-                hist_key = (ent_name, subname, param_name)
+                warn_key = f"{ent_name}|{subname}_{norm_name}"
+                hist_key = (ent_name, subname, norm_name)
 
                 # ══ 预警类型1：超标预警（上下限） ══════════════════════════════
                 from data_processor import get_warning_level
-                level = get_warning_level(value, param_name, thresholds)
+                level = get_warning_level(value, norm_name, thresholds)
 
                 if level != "正常":
                     new_warnings.add(warn_key)
@@ -249,18 +278,18 @@ class WarningSystem:
                     warnings_detail.append({
                         'subname': subname,
                         'ent_name': ent_name,
-                        'param': param_name,
+                        'param': norm_name,
                         'value': value,
                         'level': level,
-                        'threshold': thresholds.get(param_name, 'N/A'),
+                        'threshold': thresholds.get(norm_name, 'N/A'),
                         'datetime': now_str,
                         'type': 'realtime'
                     })
                     self._add_to_history(warnings_detail[-1])
 
                 # ══ 预警类型2：同值检测（基于实际时间窗口）═══════════════════════
-                if param_name in SAME_VALUE_THRESHOLDS:
-                    max_same_minutes = SAME_VALUE_THRESHOLDS[param_name]  # 时间窗口（分钟）
+                if norm_name in SAME_VALUE_THRESHOLDS:
+                    max_same_minutes = SAME_VALUE_THRESHOLDS[norm_name]  # 时间窗口（分钟）
 
                     if hist_key not in self._same_value_history:
                         self._same_value_history[hist_key] = deque(maxlen=self._same_value_max)
@@ -295,7 +324,7 @@ class WarningSystem:
                                         warnings_detail.append({
                                             'subname': subname,
                                             'ent_name': ent_name,
-                                            'param': param_name,
+                                            'param': norm_name,
                                             'value': value,
                                             'level': same_level,
                                             'threshold': f"连续{max_same_minutes}分钟同值",
@@ -313,8 +342,8 @@ class WarningSystem:
                     self._same_value_history[hist_key].append((time.time(), value))
 
                 # ══ 预警类型3：急剧变化检测 ══════════════════════════════════
-                if param_name in RAPID_CHANGE_THRESHOLDS:
-                    change_pct = RAPID_CHANGE_THRESHOLDS[param_name]  # 百分比
+                if norm_name in RAPID_CHANGE_THRESHOLDS:
+                    change_pct = RAPID_CHANGE_THRESHOLDS[norm_name]  # 百分比
 
                     # 检查冷却状态
                     cooldown = self._rapid_change_debounce.get(hist_key, 0)
@@ -335,7 +364,7 @@ class WarningSystem:
                                     warnings_detail.append({
                                         'subname': subname,
                                         'ent_name': ent_name,
-                                        'param': param_name,
+                                        'param': norm_name,
                                         'value': value,
                                         'level': rapid_level,
                                         'threshold': f"变化{change:.0f}%（>{change_pct}%）",
@@ -423,10 +452,12 @@ class WarningSystem:
                 continue
 
             # ── 防抖计数：跟踪该 (排放口, 参数) 连续出现预警的次数 ───────────
-            # 之前已有计数 + 本轮计数，达到阈值才触发
+            # v5.90 修复：旧版把 this_count（恒 0）写回 this_round_counts，
+            # 且本轮内从未 +1，prev_count 永远无法积累 → 防抖永不通过，
+            # 预测预警从未触发过。正确语义：本轮第 N 次 + 之前轮次累计。
             prev_count = self._pred_warn_counts.get(key2, 0)
-            this_count = this_round_counts.get(key2, 0) + prev_count
-            this_round_counts[key2] = this_count
+            this_round_counts[key2] = this_round_counts.get(key2, 0) + 1
+            this_count = this_round_counts[key2] + prev_count
 
             if this_count < self._pred_debounce_needed:
                 # 尚未达到防抖阈值：记录本次，但不触发声音/写历史
@@ -437,6 +468,7 @@ class WarningSystem:
             # ── 迟滞机制：防止边界值在预警等级间反复跳动 ───────────────────
             # 升级（正常→预警）：需要超过阈值+3%才确认
             # 降级（预警→正常）：需要低于阈值-3%才确认（需原始等级，非effective_level）
+            effective_level = level  # v5.90：先初始化，旧版在下方迟滞逻辑引用时未定义（NameError 被上层吞掉，预测预警从未生效）
             prev_lvl = self._pred_last_level.get(key2, '正常')
             lvl_order = {"正常": 0, "黄色预警": 1, "橙色预警": 2, "红色预警": 3}
             prev_order = lvl_order.get(prev_lvl, 0)
@@ -462,7 +494,6 @@ class WarningSystem:
                 self._pred_last_level[key2] = '正常'
 
             # ── 低置信度降级：<0.30 的预测等级最高为橙色 ───────────────────
-            effective_level = level
             if confidence < 0.30:
                 level_order = {"正常": 0, "黄色预警": 1, "橙色预警": 2, "红色预警": 3}
                 if level_order.get(level, 0) > level_order.get("橙色预警", 0):

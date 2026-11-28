@@ -7,6 +7,8 @@ GZ安环监测系统 - API通信模块
 import requests
 import time
 import json
+import os
+import sys  # v5.90：get_realtime_data 日志分支引用 sys.frozen/sys.executable，旧版未导入（NameError 被上层吞掉，实时数据恒为空）
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 

@@ -29,6 +29,12 @@ def _headers(thermal: bool):
     w = mw.MainWindow.__new__(mw.MainWindow)
     w.history_table = QTableWidget()
     w._history_is_thermal_power = thermal
+    # v5.89 起 _display_history_table 读取 _history_time_type_label /
+    # _history_flow_code（getattr 兜底）；未初始化实例上 PyQt5 属性查找
+    # 抛 RuntimeError 而非 AttributeError，getattr 默认值不生效，
+    # 故测试需显式补齐（真实运行中 MainWindow.__init__ 后均有值）。
+    w._history_time_type_label = '小时数据'
+    w._history_flow_code = None
     w._display_history_table(list(ROWS), [], CODES)
     return [w.history_table.horizontalHeaderItem(i).text()
             for i in range(w.history_table.columnCount())]
