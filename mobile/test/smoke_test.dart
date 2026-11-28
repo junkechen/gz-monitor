@@ -2,7 +2,10 @@
 // 真实服务端网络链路验证见 tool/smoke.dart（dart run）
 // 运行：flutter test test/smoke_test.dart -r expanded
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gz_monitor_mobile/core/constants.dart';
 import 'package:gz_monitor_mobile/core/gz_api.dart';
+import 'package:gz_monitor_mobile/core/push_service.dart';
+import 'package:gz_monitor_mobile/core/warn_config.dart';
 import 'package:gz_monitor_mobile/core/warning_engine.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -199,6 +202,79 @@ void main() {
         [syntheticGroup(subid: '1716', params: [p('5.0')])], now: _t(185));
     expect(fresh.where((w) => w.type == WarnType.sameValue).length, 1,
         reason: '同值 185 分钟 ≥ 氨氮 180 分钟窗口');
+  });
+
+  // ── v1.4.0：自定义阈值 / 配置持久化 / 推送文本 ─────────────────────────
+
+  test('自定义阈值覆盖默认：氨氮上限改为 5，8.9 也超标', () {
+    final engine = WarningEngine();
+    engine.customThresholds = {
+      '氨氮': [null, 5.0]
+    };
+    final g = syntheticGroup(
+      subid: '1716',
+      params: [OutletParam(name: '氨氮(mg/L)', code: '311', value: '8.9', std: '12', isExceed: false)],
+    );
+    final fresh = engine.ingest([g], now: _t(0));
+    expect(fresh.where((w) => w.type == WarnType.exceed).length, 1,
+        reason: '默认上限 15 不超标，但自定义上限 5 应超标');
+    expect(fresh.first.detail, contains('超过限值 5.0'));
+    // 自定义下限也生效：pH 下限自定义为 7，6.5 低于下限
+    final engine2 = WarningEngine();
+    engine2.customThresholds = {
+      'pH值': [7.0, 9.0]
+    };
+    final g2 = syntheticGroup(
+      subid: '1716',
+      params: [OutletParam(name: 'PH', code: '302', value: '6.5', std: '', isExceed: false)],
+    );
+    final fresh2 = engine2.ingest([g2], now: _t(0));
+    expect(fresh2.where((w) => w.type == WarnType.exceed).length, 1);
+    expect(fresh2.first.detail, contains('低于下限 7.0'));
+  });
+
+  test('配置持久化往返：自定义阈值/声音/推送字段 + 恢复默认回退', () async {
+    final cfg = WarnConfig();
+    cfg.customThresholds = {
+      '氨氮': [null, 5.0],
+      'pH值': [5.0, 10.0]
+    };
+    cfg.soundOn = false;
+    cfg.pushplusToken = 'tk';
+    cfg.pushplusTopic = 'tp';
+    await cfg.save();
+    final cfg2 = await WarnConfig.load();
+    expect(cfg2.customThresholds['氨氮']![1], 5.0);
+    expect(cfg2.thresholdFor('pH值'), [5.0, 10.0]);
+    expect(cfg2.thresholdFor('化学需氧量'), kWarnThresholds['化学需氧量'],
+        reason: '未覆盖参数回退默认');
+    expect(cfg2.soundOn, false);
+    expect(cfg2.pushplusToken, 'tk');
+    expect(cfg2.pushplusTopic, 'tp');
+    expect(cfg2.pushReady, true);
+    cfg2.customThresholds.remove('氨氮');
+    expect(cfg2.thresholdFor('氨氮'), kWarnThresholds['氨氮'], reason: '移除覆盖后恢复默认');
+  });
+
+  test('推送文本排版：8 条截断 + 超出计数', () {
+    final items = List.generate(
+        10,
+        (i) => WarningItem(
+            key: 'k$i',
+            type: WarnType.exceed,
+            entName: '企业',
+            subid: '1',
+            subname: '排口$i',
+            param: '氨氮',
+            value: '16.0',
+            detail: '超过限值 15',
+            time: _t(0)));
+    final text = formatWarningsText(items);
+    expect(text, contains('【超标】'));
+    expect(text, contains('排口0'));
+    expect(text, contains('排口7'));
+    expect(text, isNot(contains('排口8')), reason: '第 9 条起截断');
+    expect(text, contains('另有 2 条'));
   });
 
   test('历史排放量：服务端 ex_ 权威值直读，禁止本地重算', () {

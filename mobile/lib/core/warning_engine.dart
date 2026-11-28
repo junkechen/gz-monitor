@@ -104,6 +104,10 @@ class WarningEngine {
   final Map<String, _Obs> _obs = {};
   int changeSerial = 0; // 每次新增预警自增，驱动角标动画
 
+  /// v1.4.0：自定义阈值覆盖（键=归一化参数名，值=[下限, 上限]）。
+  /// 由 WarnConfig.customThresholds 注入；命中覆盖默认 kWarnThresholds。
+  Map<String, List<double?>> customThresholds = {};
+
   int get activeCount => _active.length;
 
   static const _prefItems = 'warn_items_v1';
@@ -196,8 +200,10 @@ class WarningEngine {
         // （氨氮(mg/L)、PH…），直接用原名查表全部不命中，检测被静默跳过
         final name = normParamName(p.code, p.name);
 
-        // 1) 阈值上下限（本地规则）+ 服务端超标标记（CBBS）
-        final th = kWarnThresholds[name];
+        // 1) 阈值上下限（自定义覆盖优先，v1.4.0）+ 服务端超标标记（CBBS）
+        final th = customThresholds.containsKey(name)
+            ? customThresholds[name]
+            : kWarnThresholds[name];
         final bool overLocal = th != null &&
             ((th[0] != null && v < th[0]!) || (th[1] != null && v > th[1]!));
         final exceedKey = 'exceed|$keyBase';

@@ -3,9 +3,13 @@ import 'package:flutter/material.dart';
 
 import '../core/account_manager.dart';
 import '../core/gz_api.dart';
+import '../core/notify_service.dart';
+import '../core/push_service.dart';
+import '../core/warn_config.dart';
 import '../core/warning_engine.dart';
 import 'realtime_page.dart';
 import 'history_page.dart';
+import 'settings_page.dart';
 import 'warning_page.dart';
 
 class HomePage extends StatefulWidget {
@@ -19,11 +23,18 @@ class _HomePageState extends State<HomePage> {
   int _tab = 0;
   List<OutletGroup>? _outlets; // 合并后的排口（供历史页选择）
   final WarningEngine _engine = WarningEngine();
+  WarnConfig _cfg = WarnConfig();
 
   @override
   void initState() {
     super.initState();
     _engine.load();
+    WarnConfig.load().then((cfg) {
+      _cfg = cfg;
+      _engine.customThresholds = cfg.customThresholds;
+    });
+    NotifyService.init();
+    NotifyService.requestPermission(); // Android 13+ 通知权限
   }
 
   void _onOutletsLoaded(List<OutletGroup> g) {
@@ -33,6 +44,11 @@ class _HomePageState extends State<HomePage> {
   void _onWarnings(List<WarningItem> fresh) {
     if (!mounted) return;
     setState(() {});
+    if (fresh.isNotEmpty) {
+      // v1.4.0：系统通知（提示音可关）+ 微信推送，失败均不阻断
+      NotifyService.showWarnings(fresh, sound: _cfg.soundOn);
+      PushService.send(_cfg, fresh);
+    }
     if (fresh.isNotEmpty && _tab != 1) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text('⚠ 新增 ${fresh.length} 条预警：'
@@ -76,6 +92,17 @@ class _HomePageState extends State<HomePage> {
           style: const TextStyle(fontSize: 17),
         ),
         actions: [
+          IconButton(
+              icon: const Icon(Icons.settings_outlined),
+              tooltip: '预警设置',
+              onPressed: () async {
+                await Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => SettingsPage(engine: _engine),
+                ));
+                // 设置页可能改了推送/声音配置，回来重读
+                _cfg = await WarnConfig.load();
+                _engine.customThresholds = _cfg.customThresholds;
+              }),
           IconButton(icon: const Icon(Icons.logout), onPressed: _logout,
               tooltip: '退出登录'),
         ],
