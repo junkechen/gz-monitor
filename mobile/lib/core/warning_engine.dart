@@ -71,6 +71,27 @@ class WarningItem {
       );
 }
 
+/// v1.3.0：参数名归一化（与桌面端 v5.90 _norm_param_name 对齐）。
+///
+/// 实时接口 C0001_ITEM_NAME 带单位后缀且大小写不一（实测：「氨氮(mg/L)」
+/// 「PH」「化学需氧量(mg/L)」「非甲烷总烃(mg/m3)」「碳氢化合物(总烃)(mg/m3)」），
+/// 而 kWarnThresholds / kSameValueMinutes / kRapidChangePct 均为无单位键
+/// （「氨氮」「pH值」「非甲烷总烃」…）。旧版直接用原始名查表，全部不命中 →
+/// 本地阈值/同值/急变三类检测全部跳过（2026-11-28 冠洲氨氮持续上升
+/// 无主动提醒的根因，与桌面端同源）。
+///
+/// 归一化策略：优先用监测项代码反查 kCodeToName（最可靠，code 已经
+/// _normIdCode 规整数值格式）；无映射时剥离「(」起的单位后缀并去空白。
+String normParamName(String code, String rawName) {
+  if (code.isNotEmpty) {
+    final byCode = codeName(code);
+    if (byCode != null) return byCode;
+  }
+  final stripped = rawName.replaceAll(RegExp(r'\s*\(.*$'), '').trim();
+  if (stripped.isNotEmpty) return stripped;
+  return rawName.isNotEmpty ? rawName : code;
+}
+
 class _Obs {
   double? lastValue;
   DateTime? sameSince; // 同值起始时刻
@@ -171,7 +192,9 @@ class WarningEngine {
         if (v == null || v == -9999) continue;
         final keyBase = '${g.subid}|${p.code}';
         seenKeys.add(keyBase);
-        final name = p.name.isNotEmpty ? p.name : (codeName(p.code) ?? p.code);
+        // v1.3.0：归一化后再查阈值/同值/急变配置——实时名带单位后缀
+        // （氨氮(mg/L)、PH…），直接用原名查表全部不命中，检测被静默跳过
+        final name = normParamName(p.code, p.name);
 
         // 1) 阈值上下限（本地规则）+ 服务端超标标记（CBBS）
         final th = kWarnThresholds[name];

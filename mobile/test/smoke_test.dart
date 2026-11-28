@@ -142,6 +142,65 @@ void main() {
     expect(engine.activeCount, 0);
   });
 
+  // ── v1.3.0：真实接口参数名（带单位后缀）回归 ─────────────────────────
+  // 旧版直接用 C0001_ITEM_NAME 原始名查阈值表，「氨氮(mg/L)」「PH」等
+  // 全部不命中 → 本地预警静默失效（与桌面端 v5.90 同源 bug）。
+
+  test('参数名归一化：code 优先反查，无 code 剥括号后缀', () {
+    expect(normParamName('311', '氨氮(mg/L)'), '氨氮');
+    expect(normParamName('302', 'PH'), 'pH值', reason: 'PH 原名大小写不符，须 code 反查');
+    expect(normParamName('383', '非甲烷总烃(mg/m3)'), '非甲烷总烃');
+    expect(normParamName('220', '碳氢化合物(总烃)(mg/m3)'), '碳氢化合物总烃',
+        reason: '双括号名必须走 code 反查，剥括号会剥成「碳氢化合物」');
+    expect(normParamName('', '氨氮(mg/L)'), '氨氮', reason: '无 code 时剥单位后缀');
+    expect(normParamName('999', '某未知参数(mg/L)'), '某未知参数');
+  });
+
+  test('真实参数名：氨氮(mg/L) 16.0 触发本地超标（阈值 15）', () {
+    final engine = WarningEngine();
+    final g = syntheticGroup(
+      subid: '1716',
+      params: [OutletParam(name: '氨氮(mg/L)', code: '311', value: '16.0', std: '15', isExceed: false)],
+    );
+    final fresh = engine.ingest([g], now: _t(0));
+    expect(fresh.where((w) => w.type == WarnType.exceed).length, 1,
+        reason: '带单位后缀的实时名也必须命中本地阈值（旧版静默跳过）');
+    expect(fresh.first.param, '氨氮', reason: '预警记录参数名为归一化后的无单位名');
+    // PH 走 code 反查 pH值，10.2 > 上限 9
+    final g2 = syntheticGroup(
+      subid: '1716',
+      params: [OutletParam(name: 'PH', code: '302', value: '10.2', std: '', isExceed: false)],
+    );
+    final fresh2 = engine.ingest([g2], now: _t(1));
+    expect(fresh2.where((w) => w.type == WarnType.exceed).length, 1);
+    expect(fresh2.first.param, 'pH值');
+  });
+
+  test('真实参数名：氨氮 3.01→8.9 触发急剧上升（196%）', () {
+    // 2026-11-28 冠洲废水总排口实测阶梯上升片段
+    final engine = WarningEngine();
+    OutletParam p(String v) =>
+        OutletParam(name: '氨氮(mg/L)', code: '311', value: v, std: '12', isExceed: false);
+    engine.ingest([syntheticGroup(subid: '1716', params: [p('3.01')])], now: _t(0));
+    final fresh = engine.ingest(
+        [syntheticGroup(subid: '1716', params: [p('8.90')])], now: _t(60));
+    expect(fresh.where((w) => w.type == WarnType.rapidRise).length, 1,
+        reason: '(8.9-3.01)/3.01≈196% ≥ 氨氮 30% 阈值，应触发急剧上升');
+    expect(fresh.first.param, '氨氮');
+    expect(fresh.first.detail, contains('3.01 → 8.9'));
+  });
+
+  test('真实参数名：氨氮(mg/L) 同值持续 185 分钟触发同值预警', () {
+    final engine = WarningEngine();
+    OutletParam p(String v) =>
+        OutletParam(name: '氨氮(mg/L)', code: '311', value: v, std: '', isExceed: false);
+    engine.ingest([syntheticGroup(subid: '1716', params: [p('5.0')])], now: _t(0));
+    final fresh = engine.ingest(
+        [syntheticGroup(subid: '1716', params: [p('5.0')])], now: _t(185));
+    expect(fresh.where((w) => w.type == WarnType.sameValue).length, 1,
+        reason: '同值 185 分钟 ≥ 氨氮 180 分钟窗口');
+  });
+
   test('历史排放量：服务端 ex_ 权威值直读，禁止本地重算', () {
     // 日数据：服务端 ex_ 为吨 → kg；无 ex 返回 0（不回退浓度×流量）
     final dayRow = {'ex_316': '0.00609', 'val_316': '9.77', 'val_494': '623'};

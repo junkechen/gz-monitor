@@ -24,8 +24,8 @@
 
 | 产物 | 架构 | 体积 | 适用 |
 |---|---|---|---|
-| `dist/GZ_Monitor_Mobile_v1.2.0_arm64-v8a.apk` | arm64-v8a | 18 MB | **推荐**，2017 年后绝大多数手机 |
-| `dist/GZ_Monitor_Mobile_v1.2.0_armeabi-v7a.apk` | armeabi-v7a | 16 MB | 早期 32 位安卓机 |
+| `dist/GZ_Monitor_Mobile_v1.3.0_arm64-v8a.apk` | arm64-v8a | 18 MB | **推荐**，2017 年后绝大多数手机 |
+| `dist/GZ_Monitor_Mobile_v1.3.0_armeabi-v7a.apk` | armeabi-v7a | 16 MB | 早期 32 位安卓机 |
 
 （x86_64 模拟器包仅调试用，未分发。）最低 Android 7.0（API 24）。
 优化手段：① `--split-per-abi` 只打单一架构 native 库；② `--obfuscate --split-debug-info` 混淆 Dart 代码并剥离符号；③ 移除未使用的 cupertino_icons；④ 图标 tree-shaking。相比全 ABI 单包（55.5MB）缩减约 67%。
@@ -50,8 +50,8 @@ robocopy 'D:\xiaolongxia\新建文件夹\20260328112826\mobile' 'D:\GZMobile' /E
 # 2. 构建（ABI 分包 + 混淆）
 cd D:\GZMobile; flutter build apk --release --split-per-abi --obfuscate --split-debug-info=build/app/symbols
 # 3. 拷回产物（两个手机架构）
-copy D:\GZMobile\build\app\outputs\flutter-apk\app-arm64-v8a-release.apk ..\dist\GZ_Monitor_Mobile_v1.2.0_arm64-v8a.apk
-copy D:\GZMobile\build\app\outputs\flutter-apk\app-armeabi-v7a-release.apk ..\dist\GZ_Monitor_Mobile_v1.2.0_armeabi-v7a.apk
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-arm64-v8a-release.apk ..\dist\GZ_Monitor_Mobile_v1.3.0_arm64-v8a.apk
+copy D:\GZMobile\build\app\outputs\flutter-apk\app-armeabi-v7a-release.apk ..\dist\GZ_Monitor_Mobile_v1.3.0_armeabi-v7a.apk
 ```
 
 已做镜像配置：Gradle wrapper 走腾讯镜像（`gradle-wrapper.properties`），Maven 依赖走阿里云镜像（`settings.gradle.kts` / `build.gradle.kts`）。
@@ -65,6 +65,7 @@ flutter test test/smoke_test.dart # 预警引擎：超标/同值/急变/去重/�
 ```
 
 2026-11-16 实测（v1.1.0）：2 账号登录成功；5 排口/2 企业合并正常；跨企业日数据 7 天排放量 13.030 kg；预警引擎 6 项单测全过。
+2026-11-28（v1.3.0）：预警引擎 11 项单测全过（含 4 项真实接口参数名回归）；`flutter analyze` 无问题。
 
 ## 目录
 
@@ -87,6 +88,7 @@ test/smoke_test.dart         预警引擎单元测试（flutter test）
 
 ## 版本
 
+- v1.3.0（2026-11-28）：**修复本地预警从未真正生效**（与桌面端 v5.90 同源 bug）：实时接口参数名带单位后缀（`氨氮(mg/L)`、`PH`、`非甲烷总烃(mg/m3)`），与阈值表无单位键不匹配 → 本地阈值/同值/急变检测全部静默跳过（仅剩服务端 CBBS 标记兜底）。新增 `normParamName()` 归一化（code 优先反查 `kCodeToName`，无映射剥括号后缀）；新增 4 项真实参数名回归测试。
 - v1.2.0（2026-11-21）：历史排放量改为服务端 `ex_` 权威值直读，去掉 dayEmissionKg 的本地重算回退，加脏数据上限防护；与桌面端 v5.89 数据来源原则一致。
 - v1.1.0（2026-11-16）：多账号合并登录与数据合并；新增预警功能（阈值超标/同值检测/急剧变化，角标与持久化）；历史查询跨企业路由；APK 按 ABI 拆分 + 混淆，单包体积 55MB→16~18MB。
 - v1.0.0（2026-11-16）：首个 APK，对齐桌面端 v5.85 数据口径。
